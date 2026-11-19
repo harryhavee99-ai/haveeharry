@@ -137,6 +137,11 @@ async function createServer() {
   });
   app.use('/media/music', express.static(MUSIC_DIR));
 
+  // Lightweight JSON health endpoint used by uploader to confirm server readiness
+  app.get('/api/health', (_req, res) => {
+    res.json({ ok: true, ts: Date.now() });
+  });
+
   // System capabilities & storage info
   app.get('/api/system/capabilities', async (_req, res) => {
     try {
@@ -247,40 +252,53 @@ async function createServer() {
 
   // Resumable Upload — Step 2: Receive binary chunk (supports both POST and PUT for universal proxy compatibility)
   const rawChunkParser = express.raw({ type: '*/*', limit: '20mb' });
-  const handleUploadChunk: express.RequestHandler = (req, res) => {
-    const project = store.getProject(req.params.projectId);
-    if (!project) return res.status(404).json({ error: 'Upload session not found.' });
+  const handleUploadChunk: express.RequestHandler = async (req, res) => {
+    try {
+      const project = store.getProject(req.params.projectId);
+      if (!project) return res.status(404).json({ error: 'Upload session not found.' });
 
-    const chunkIndex = Number(req.params.index);
-    if (!Number.isInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= project.totalChunks) {
-      return res.status(400).json({ error: 'Invalid chunk index.' });
+      const chunkIndex = Number(req.params.index);
+      if (!Number.isInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= project.totalChunks) {
+        return res.status(400).json({ error: 'Invalid chunk index.' });
+      }
+
+      const body = req.body as Buffer;
+      if (!Buffer.isBuffer(body) || body.length === 0) {
+        return res.status(400).json({ error: 'Empty chunk payload received.' });
+      }
+
+      const chunkDir = path.join(store.getProjectDir(project.id), 'chunks');
+      await fs.promises.mkdir(chunkDir, { recursive: true });
+      const chunkPath = path.join(chunkDir, `part_${String(chunkIndex).padStart(6, '0')}`);
+      await fs.promises.writeFile(chunkPath, body);
+
+      if (!project.uploadedChunks.includes(chunkIndex)) {
+        project.uploadedChunks.push(chunkIndex);
+      }
+      project.uploadProgress = Math.min(
+        99,
+        Math.round((project.uploadedChunks.length / project.totalChunks) * 100)
+      );
+      // Persist DB checkpoint on first chunk, every 8 chunks, and last chunk to avoid disk thrashing
+      if (
+        chunkIndex === 0 ||
+        project.uploadedChunks.length % 8 === 0 ||
+        project.uploadedChunks.length === project.totalChunks
+      ) {
+        store.upsertProject(project);
+      }
+
+      res.json({
+        received: chunkIndex,
+        uploadedCount: project.uploadedChunks.length,
+        totalChunks: project.totalChunks,
+        uploadProgress: project.uploadProgress,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to store uploaded chunk.';
+      console.error('Chunk upload error:', err);
+      res.status(500).json({ error: message });
     }
-
-    const body = req.body as Buffer;
-    if (!Buffer.isBuffer(body) || body.length === 0) {
-      return res.status(400).json({ error: 'Empty chunk payload received.' });
-    }
-
-    const chunkDir = path.join(store.getProjectDir(project.id), 'chunks');
-    fs.mkdirSync(chunkDir, { recursive: true });
-    const chunkPath = path.join(chunkDir, `part_${String(chunkIndex).padStart(6, '0')}`);
-    fs.writeFileSync(chunkPath, body);
-
-    if (!project.uploadedChunks.includes(chunkIndex)) {
-      project.uploadedChunks.push(chunkIndex);
-    }
-    project.uploadProgress = Math.min(
-      99,
-      Math.round((project.uploadedChunks.length / project.totalChunks) * 100)
-    );
-    store.upsertProject(project);
-
-    res.json({
-      received: chunkIndex,
-      uploadedCount: project.uploadedChunks.length,
-      totalChunks: project.totalChunks,
-      uploadProgress: project.uploadProgress,
-    });
   };
   app.post('/api/uploads/:projectId/chunk/:index', rawChunkParser, handleUploadChunk);
   app.put('/api/uploads/:projectId/chunk/:index', rawChunkParser, handleUploadChunk);
@@ -902,9 +920,13 @@ async function createServer() {
       ? Number(process.argv[portFlagIdx + 1])
       : undefined;
   const PORT = Number(cliPort || process.env.PORT || 3000);
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`ClipGenius AI server running at http://0.0.0.0:${PORT}`);
   });
+  // Keep Node's keep-alive timeout above Nginx/Cloud Run proxy timeouts to prevent 502 -> warmup HTML 200 races
+  httpServer.keepAliveTimeout = 65_000;
+  httpServer.headersTimeout = 70_000;
+  httpServer.requestTimeout = 0;
 }
 
 createServer().catch((err) => {

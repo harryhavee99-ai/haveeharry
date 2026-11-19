@@ -76,7 +76,7 @@ class Store {
 
   public save(): void {
     ensureDirs();
-    const tmpPath = `${DB_PATH}.tmp`;
+    const tmpPath = `${DB_PATH}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
     fs.writeFileSync(tmpPath, JSON.stringify(this.state, null, 2), 'utf-8');
     fs.renameSync(tmpPath, DB_PATH);
   }

@@ -9,45 +9,162 @@ import type {
   SystemCapabilities,
 } from '../../shared/types.ts';
 
-function parseReadableError(status: number, text: string, fallback: string): string {
+class ApiResponseError extends Error {
+  status: number;
+  code: 'warmup' | 'auth' | 'missing_chunk' | 'not_found' | 'validation' | 'server';
+  missingChunk?: number;
+
+  constructor(
+    message: string,
+    opts: {
+      status: number;
+      code: ApiResponseError['code'];
+      missingChunk?: number;
+    }
+  ) {
+    super(message);
+    this.name = 'ApiResponseError';
+    this.status = opts.status;
+    this.code = opts.code;
+    this.missingChunk = opts.missingChunk;
+  }
+}
+
+function classifyResponseError(
+  status: number,
+  text: string,
+  fallback: string,
+  responseUrl?: string
+): ApiResponseError {
   const trimmed = text.trim();
+  const lower = trimmed.toLowerCase();
+
   if (trimmed) {
     try {
-      const parsed = JSON.parse(trimmed) as { error?: unknown; message?: unknown };
-      if (parsed && typeof parsed.error === 'string' && parsed.error.trim()) {
-        return parsed.error.trim();
+      const parsed = JSON.parse(trimmed) as {
+        error?: unknown;
+        message?: unknown;
+        missingChunk?: unknown;
+      };
+      const msg =
+        typeof parsed?.error === 'string' && parsed.error.trim()
+          ? parsed.error.trim()
+          : typeof parsed?.message === 'string' && parsed.message.trim()
+            ? parsed.message.trim()
+            : fallback || `Request failed (${status})`;
+
+      if (typeof parsed?.missingChunk === 'number') {
+        return new ApiResponseError(msg, {
+          status,
+          code: 'missing_chunk',
+          missingChunk: parsed.missingChunk,
+        });
       }
-      if (parsed && typeof parsed.message === 'string' && parsed.message.trim()) {
-        return parsed.message.trim();
+      if (status === 404) {
+        return new ApiResponseError(msg, { status, code: 'not_found' });
       }
+      if (status === 400) {
+        return new ApiResponseError(msg, { status, code: 'validation' });
+      }
+      return new ApiResponseError(msg, { status, code: 'server' });
     } catch {
-      // Not JSON — check if it's an HTML proxy/warmup page
-      if (trimmed.startsWith('<!') || trimmed.toLowerCase().includes('<html')) {
-        if (status === 413) return 'Upload chunk exceeded proxy size limit (413).';
-        if (status === 502 || status === 503 || status === 504) {
-          return 'Server is waking up or temporarily busy. Retrying automatically...';
+      const isHtml = trimmed.startsWith('<!') || lower.includes('<html');
+      if (isHtml) {
+        if (
+          lower.includes('cookie check') ||
+          lower.includes('applet-auth-bridge') ||
+          lower.includes('403 forbidden') ||
+          (responseUrl && responseUrl.includes('__cookie_check')) ||
+          status === 403
+        ) {
+          return new ApiResponseError(
+            'Session cookie verification expired. Please refresh this tab once and retry the upload.',
+            { status, code: 'auth' }
+          );
         }
-        if (status === 403) return 'Session authentication expired. Please refresh the page and retry.';
-        return `Server returned an unexpected HTML response (${status}).`;
+        if (
+          lower.includes('starting server') ||
+          lower.includes('warming up') ||
+          status === 502 ||
+          status === 503 ||
+          status === 504 ||
+          status === 200
+        ) {
+          return new ApiResponseError(
+            'Backend server is waking up or restarting — retrying automatically...',
+            { status, code: 'warmup' }
+          );
+        }
+        if (status === 413) {
+          return new ApiResponseError('Upload chunk exceeded proxy size limit (413).', {
+            status,
+            code: 'server',
+          });
+        }
+        return new ApiResponseError(
+          `Server temporarily returned an HTML page (${status}) instead of JSON.`,
+          { status, code: 'warmup' }
+        );
       }
-      return trimmed.slice(0, 240);
+      return new ApiResponseError(trimmed.slice(0, 240), {
+        status,
+        code: status === 404 ? 'not_found' : status === 400 ? 'validation' : 'server',
+      });
     }
   }
-  return fallback || `Request failed (${status})`;
+
+  return new ApiResponseError(fallback || `Request failed (${status})`, {
+    status,
+    code: status === 404 ? 'not_found' : status === 400 ? 'validation' : 'server',
+  });
 }
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(parseReadableError(res.status, text, `Request failed (${res.status})`));
+  const method = (init?.method || 'GET').toUpperCase();
+  const maxAttempts = method === 'GET' ? 4 : 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const res = await fetch(url, {
+      credentials: 'include',
+      ...init,
+    });
+    const text = await res.text();
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+
+    if (!res.ok) {
+      const apiErr = classifyResponseError(res.status, text, `Request failed (${res.status})`, res.url);
+      if (apiErr.code === 'warmup' && attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 1200 * attempt));
+        continue;
+      }
+      throw apiErr;
+    }
+
+    if (!text) return null as T;
+
+    // Detect Nginx 200 warmup.html / __cookie_check.html / SPA HTML masquerading as 200 OK
+    const looksHtml =
+      contentType.includes('text/html') ||
+      text.trimStart().startsWith('<!') ||
+      text.trimStart().toLowerCase().startsWith('<html');
+
+    if (looksHtml) {
+      const apiErr = classifyResponseError(res.status, text, 'Unexpected HTML response.', res.url);
+      if (apiErr.code === 'warmup' && attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 1200 * attempt));
+        continue;
+      }
+      throw apiErr;
+    }
+
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw classifyResponseError(res.status, text, 'Invalid JSON response from server.', res.url);
+    }
   }
-  if (!text) return null as T;
-  try {
-    return JSON.parse(text) as T;
-  } catch {
-    throw new Error(parseReadableError(res.status, text, 'Invalid server response.'));
-  }
+
+  throw new Error('Server is temporarily unavailable. Please try again.');
 }
 
 export const api = {
@@ -280,10 +397,31 @@ export function createResumableUploader(params: {
       };
     });
 
+  const waitForServerReady = async (): Promise<void> => {
+    for (let i = 0; i < 12; i++) {
+      if (cancelled || paused) return;
+      try {
+        const healthRes = await fetch('/api/health', {
+          method: 'GET',
+          credentials: 'include',
+          cache: 'no-store',
+        });
+        const ct = (healthRes.headers.get('content-type') || '').toLowerCase();
+        if (healthRes.ok && ct.includes('application/json')) {
+          return;
+        }
+      } catch {
+        // still waking up
+      }
+      emit('uploading', undefined, 'Waiting for backend server to finish waking up...');
+      await sleepCancellable(Math.min(5000, 1200 + i * 500));
+    }
+  };
+
   const retryJsonCall = async <T,>(
     label: string,
     fn: () => Promise<T>,
-    maxAttempts = 6
+    maxAttempts = 10
   ): Promise<T> => {
     let lastErr: Error | null = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -302,16 +440,19 @@ export function createResumableUploader(params: {
       } catch (err) {
         if (cancelled || paused) throw err;
         lastErr = err instanceof Error ? err : new Error(String(err));
-        // Do not endlessly retry clear 400 validation errors
-        if (
-          lastErr.message.includes('Unsupported video format') ||
-          lastErr.message.includes('exceeds the') ||
-          lastErr.message.includes('could not be decoded')
-        ) {
-          throw lastErr;
+        if (err instanceof ApiResponseError) {
+          // Do not retry hard validation, auth, or missing_chunk (handled specially by caller)
+          if (err.code === 'validation' || err.code === 'auth' || err.code === 'missing_chunk') {
+            throw err;
+          }
+          if (err.code === 'warmup') {
+            emit('uploading', undefined, 'Server waking up — resuming upload automatically...');
+            await waitForServerReady();
+            continue;
+          }
         }
         if (attempt < maxAttempts) {
-          const delay = Math.min(8000, 1000 * Math.pow(1.8, attempt - 1));
+          const delay = Math.min(8000, 1000 * Math.pow(1.6, attempt - 1));
           emit('uploading', undefined, `${label} — retrying (${attempt}/${maxAttempts})...`);
           await sleepCancellable(delay);
         }
@@ -337,6 +478,107 @@ export function createResumableUploader(params: {
     projectId = initRes.projectId;
   };
 
+  const uploadSingleChunk = async (chunkIdx: number): Promise<'ok' | 'paused' | 'cancelled' | 'reset_session'> => {
+    const start = chunkIdx * CHUNK_SIZE;
+    const end = Math.min(file.size, start + CHUNK_SIZE);
+    const blob = file.slice(start, end);
+
+    let lastErr: Error | null = null;
+    const MAX_CHUNK_ATTEMPTS = 15;
+
+    for (let attempt = 1; attempt <= MAX_CHUNK_ATTEMPTS; attempt++) {
+      if (cancelled) return 'cancelled';
+      if (paused) return 'paused';
+
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        emit('uploading', undefined, 'Network offline — waiting to reconnect automatically...');
+        await waitForOnline();
+        if (cancelled) return 'cancelled';
+        if (paused) return 'paused';
+        emit('uploading', undefined, 'Reconnected — resuming upload...');
+      }
+
+      try {
+        activeAbort = new AbortController();
+        const res = await fetch(`/api/uploads/${projectId}/chunk/${chunkIdx}`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: blob,
+          signal: activeAbort.signal,
+        });
+        const txt = await res.text();
+        const ct = (res.headers.get('content-type') || '').toLowerCase();
+
+        if (!res.ok) {
+          if (res.status === 404 && sessionRecoveries < 2) {
+            return 'reset_session';
+          }
+          const apiErr = classifyResponseError(
+            res.status,
+            txt,
+            `Chunk ${chunkIdx + 1} failed (${res.status})`,
+            res.url
+          );
+          if (apiErr.code === 'auth' || apiErr.code === 'validation') {
+            throw apiErr;
+          }
+          if (apiErr.code === 'warmup') {
+            emit('uploading', undefined, 'Server waking up — waiting before retrying chunk...');
+            await waitForServerReady();
+            continue;
+          }
+          throw apiErr;
+        }
+
+        // CRITICAL: Verify the 200 response is genuine JSON confirming THIS chunk (not Nginx 200 warmup.html or cookie_check.html!)
+        const looksHtml =
+          ct.includes('text/html') ||
+          txt.trimStart().startsWith('<!') ||
+          txt.trimStart().toLowerCase().startsWith('<html');
+        if (looksHtml) {
+          const apiErr = classifyResponseError(res.status, txt, 'Unexpected HTML response.', res.url);
+          if (apiErr.code === 'auth') {
+            throw apiErr;
+          }
+          emit('uploading', undefined, 'Server restarting — waiting to continue chunk upload...');
+          await waitForServerReady();
+          continue;
+        }
+
+        let ack: { received?: number } | null = null;
+        try {
+          ack = JSON.parse(txt) as { received?: number };
+        } catch {
+          throw new Error(`Invalid confirmation for chunk ${chunkIdx + 1}.`);
+        }
+        if (!ack || ack.received !== chunkIdx) {
+          throw new Error(`Server did not confirm chunk ${chunkIdx + 1}.`);
+        }
+
+        return 'ok';
+      } catch (err) {
+        if (cancelled) return 'cancelled';
+        if (paused) return 'paused';
+        if (err instanceof ApiResponseError && (err.code === 'auth' || err.code === 'validation')) {
+          throw err;
+        }
+        lastErr = err instanceof Error ? err : new Error(String(err));
+        if (attempt < MAX_CHUNK_ATTEMPTS) {
+          const backoffMs = Math.min(10000, 1000 * Math.pow(1.5, attempt - 1));
+          emit(
+            'uploading',
+            undefined,
+            `Connection hiccup on chunk ${chunkIdx + 1} — retrying (${attempt}/${MAX_CHUNK_ATTEMPTS})...`
+          );
+          await sleepCancellable(backoffMs);
+        }
+      }
+    }
+
+    throw lastErr || new Error(`Chunk ${chunkIdx + 1} upload failed after multiple retries.`);
+  };
+
   const runLoop = async (): Promise<ProjectRecord | null> => {
     paused = false;
     runStartedAt = Date.now();
@@ -360,62 +602,9 @@ export function createResumableUploader(params: {
           return null;
         }
 
-        const start = nextChunk * CHUNK_SIZE;
-        const end = Math.min(file.size, start + CHUNK_SIZE);
-        const blob = file.slice(start, end);
-
-        let chunkSuccess = false;
-        let sessionResetNeeded = false;
-        let lastErr: Error | null = null;
-        const MAX_CHUNK_ATTEMPTS = 12;
-
-        for (let attempt = 1; attempt <= MAX_CHUNK_ATTEMPTS; attempt++) {
-          if (cancelled || paused) break;
-
-          if (typeof navigator !== 'undefined' && !navigator.onLine) {
-            emit('uploading', undefined, 'Network offline — waiting to reconnect automatically...');
-            await waitForOnline();
-            if (cancelled || paused) break;
-            emit('uploading', undefined, 'Reconnected — resuming upload...');
-          }
-
-          try {
-            activeAbort = new AbortController();
-            const res = await fetch(`/api/uploads/${projectId}/chunk/${nextChunk}`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/octet-stream' },
-              body: blob,
-              signal: activeAbort.signal,
-            });
-            if (!res.ok) {
-              const txt = await res.text();
-              if (res.status === 404 && sessionRecoveries < 2) {
-                sessionResetNeeded = true;
-                break;
-              }
-              throw new Error(
-                parseReadableError(res.status, txt, `Chunk ${nextChunk + 1} failed (${res.status})`)
-              );
-            }
-            chunkSuccess = true;
-            break;
-          } catch (err) {
-            if (cancelled || paused) break;
-            lastErr = err instanceof Error ? err : new Error(String(err));
-            if (attempt < MAX_CHUNK_ATTEMPTS) {
-              const backoffMs = Math.min(10000, 1000 * Math.pow(1.6, attempt - 1));
-              emit(
-                'uploading',
-                undefined,
-                `Connection hiccup on chunk ${nextChunk + 1} — retrying (${attempt}/${MAX_CHUNK_ATTEMPTS})...`
-              );
-              await sleepCancellable(backoffMs);
-            }
-          }
-        }
-
-        if (cancelled) return null;
-        if (paused) {
+        const outcome = await uploadSingleChunk(nextChunk);
+        if (outcome === 'cancelled') return null;
+        if (outcome === 'paused') {
           if (runStartedAt > 0) {
             cumulativeElapsedMs += Date.now() - runStartedAt;
             runStartedAt = 0;
@@ -423,36 +612,75 @@ export function createResumableUploader(params: {
           emit('paused');
           return null;
         }
-
-        if (sessionResetNeeded) {
+        if (outcome === 'reset_session') {
           sessionRecoveries++;
           projectId = null;
           nextChunk = 0;
           uploadedBytes = 0;
           emit('uploading', undefined, 'Server restarted — re-establishing upload session automatically...');
+          await waitForServerReady();
           await initSession();
           emit('uploading');
           continue;
         }
 
-        if (!chunkSuccess) {
-          throw lastErr || new Error(`Chunk ${nextChunk + 1} upload failed after multiple retries.`);
-        }
-
-        uploadedBytes = end;
+        uploadedBytes = Math.min(file.size, (nextChunk + 1) * CHUNK_SIZE);
         nextChunk++;
         emit('uploading');
       }
 
-      emit('assembling');
-      const completed = await retryJsonCall(
-        'Finalizing video',
-        () =>
-          requestJson<ProjectRecord>(`/api/uploads/${projectId}/complete`, {
-            method: 'POST',
-          }),
-        5
-      );
+      // Finalize upload — if server reports a specific missing chunk, repair it automatically and retry
+      let completed: ProjectRecord | null = null;
+      for (let finalizePass = 0; finalizePass < 5; finalizePass++) {
+        emit('assembling');
+        try {
+          completed = await retryJsonCall(
+            'Finalizing video',
+            () =>
+              requestJson<ProjectRecord>(`/api/uploads/${projectId}/complete`, {
+                method: 'POST',
+              }),
+            6
+          );
+          break;
+        } catch (err) {
+          if (
+            err instanceof ApiResponseError &&
+            err.code === 'missing_chunk' &&
+            typeof err.missingChunk === 'number'
+          ) {
+            emit(
+              'uploading',
+              undefined,
+              `Re-sending missing chunk ${err.missingChunk + 1} of ${totalChunks}...`
+            );
+            const repair = await uploadSingleChunk(err.missingChunk);
+            if (repair === 'cancelled') return null;
+            if (repair === 'paused') {
+              if (runStartedAt > 0) {
+                cumulativeElapsedMs += Date.now() - runStartedAt;
+                runStartedAt = 0;
+              }
+              emit('paused');
+              return null;
+            }
+            if (repair === 'reset_session') {
+              sessionRecoveries++;
+              projectId = null;
+              nextChunk = 0;
+              uploadedBytes = 0;
+              return runLoop();
+            }
+            continue;
+          }
+          throw err;
+        }
+      }
+
+      if (!completed) {
+        throw new Error('Failed to finalize video upload.');
+      }
+
       if (runStartedAt > 0) {
         cumulativeElapsedMs += Date.now() - runStartedAt;
         runStartedAt = 0;
