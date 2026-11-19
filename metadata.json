@@ -1,0 +1,8 @@
+{
+  "name": "SkaDoosh",
+  "description": "AI-powered automatic video clipping and short-form editing platform that transforms long-form videos into captioned, reframed, motion-graphic-enhanced clips.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
