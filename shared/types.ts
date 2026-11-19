@@ -225,6 +225,10 @@ export interface VideoMetadata {
 
 export interface ProjectRecord {
   id: string;
+  uploadId?: string;
+  processingJobId?: string;
+  failedStage?: string;
+  storageRef?: string;
   name: string;
   originalFilename: string;
   mimeType: string;

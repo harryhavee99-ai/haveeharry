@@ -14,6 +14,7 @@ import type {
   SystemCapabilities,
 } from './shared/types.ts';
 import { store, MUSIC_DIR, PROJECTS_DIR } from './server/store.ts';
+import { logBackendError, sanitizeErrorMessage } from './server/logger.ts';
 import { ensureMusicFileByName, getMusicTracks } from './server/music.ts';
 import { isGeminiConfigured } from './server/gemini.ts';
 import {
@@ -108,8 +109,16 @@ async function processRenderQueue(): Promise<void> {
         existingJob: job,
       });
     } catch (err) {
+      const safeErr = logBackendError({
+        projectId: item.projectId,
+        jobId: item.jobId,
+        stage: 'ffmpeg_render',
+        httpStatus: 500,
+        route: 'worker:processRenderQueue',
+        error: err,
+      });
       job.status = 'failed';
-      job.error = err instanceof Error ? err.message : String(err);
+      job.error = safeErr;
       store.upsertExportJob(job);
     }
   }
@@ -179,6 +188,47 @@ async function createServer() {
     res.json({ ...project, isRunning: isPipelineRunning(project.id) });
   });
 
+  // Real-time Server-Sent Events stream for project processing & export status
+  app.get('/api/projects/:id/events', (req, res) => {
+    const projectId = req.params.id;
+    const initial = store.getProject(projectId);
+    if (!initial) return res.status(404).json({ error: 'Project not found' });
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    let lastPayload = '';
+    const sendSnapshot = () => {
+      const current = store.getProject(projectId);
+      if (!current) {
+        res.write(`event: deleted\ndata: ${JSON.stringify({ projectId })}\n\n`);
+        res.end();
+        return;
+      }
+      const snapshot = JSON.stringify({
+        project: { ...current, isRunning: isPipelineRunning(projectId) },
+        exports: store.getExportJobs(projectId),
+      });
+      if (snapshot !== lastPayload) {
+        lastPayload = snapshot;
+        res.write(`event: update\ndata: ${snapshot}\n\n`);
+      }
+    };
+
+    sendSnapshot();
+    const interval = setInterval(sendSnapshot, 1200);
+    const heartbeat = setInterval(() => {
+      res.write(': heartbeat\n\n');
+    }, 15000);
+
+    req.on('close', () => {
+      clearInterval(interval);
+      clearInterval(heartbeat);
+    });
+  });
+
   app.delete('/api/projects/:id', (req, res) => {
     const ok = store.deleteProject(req.params.id);
     if (!ok) return res.status(404).json({ error: 'Project not found' });
@@ -208,6 +258,7 @@ async function createServer() {
 
     const settings = store.getSettings();
     const projectId = uuidv4();
+    const uploadId = uuidv4();
     const projectDir = store.getProjectDir(projectId);
     fs.mkdirSync(path.join(projectDir, 'chunks'), { recursive: true });
 
@@ -216,6 +267,7 @@ async function createServer() {
 
     const project: ProjectRecord = {
       id: projectId,
+      uploadId,
       name: path.basename(filename, ext),
       originalFilename: filename,
       mimeType: mimeType || 'video/mp4',
@@ -247,15 +299,62 @@ async function createServer() {
     };
 
     store.upsertProject(project);
-    res.json({ projectId, chunkSize: CHUNK_SIZE_BYTES, project });
+    res.json({ uploadId, projectId, chunkSize: CHUNK_SIZE_BYTES, project });
+  });
+
+  // Resumable Upload — Status & Disk Chunk Verification (enables exact resumption after interruption)
+  app.get('/api/uploads/:projectId/status', (req, res) => {
+    const project = store.getProject(req.params.projectId);
+    if (!project) return res.status(404).json({ error: 'Upload session not found.' });
+
+    const chunkDir = path.join(store.getProjectDir(project.id), 'chunks');
+    const verifiedOnDisk: number[] = [];
+    const missingChunks: number[] = [];
+
+    if (project.status === 'uploaded' || project.status === 'analyzing' || project.status === 'ready') {
+      for (let i = 0; i < project.totalChunks; i++) verifiedOnDisk.push(i);
+    } else {
+      for (let i = 0; i < project.totalChunks; i++) {
+        const partPath = path.join(chunkDir, `part_${String(i).padStart(6, '0')}`);
+        try {
+          if (fs.existsSync(partPath) && fs.statSync(partPath).size > 0) {
+            verifiedOnDisk.push(i);
+          } else {
+            missingChunks.push(i);
+          }
+        } catch {
+          missingChunks.push(i);
+        }
+      }
+      project.uploadedChunks = verifiedOnDisk;
+      project.uploadProgress = Math.min(
+        99,
+        Math.round((verifiedOnDisk.length / Math.max(1, project.totalChunks)) * 100)
+      );
+      store.upsertProject(project);
+    }
+
+    res.json({
+      uploadId: project.uploadId ?? project.id,
+      projectId: project.id,
+      status: project.status,
+      fileSize: project.fileSize,
+      totalChunks: project.totalChunks,
+      uploadedChunks: verifiedOnDisk,
+      missingChunks,
+      uploadProgress: project.uploadProgress,
+    });
   });
 
   // Resumable Upload — Step 2: Receive binary chunk (supports both POST and PUT for universal proxy compatibility)
   const rawChunkParser = express.raw({ type: '*/*', limit: '20mb' });
   const handleUploadChunk: express.RequestHandler = async (req, res) => {
+    const projectId = req.params.projectId;
+    let uploadId: string | undefined;
     try {
-      const project = store.getProject(req.params.projectId);
+      const project = store.getProject(projectId);
       if (!project) return res.status(404).json({ error: 'Upload session not found.' });
+      uploadId = project.uploadId;
 
       const chunkIndex = Number(req.params.index);
       if (!Number.isInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= project.totalChunks) {
@@ -270,10 +369,13 @@ async function createServer() {
       const chunkDir = path.join(store.getProjectDir(project.id), 'chunks');
       await fs.promises.mkdir(chunkDir, { recursive: true });
       const chunkPath = path.join(chunkDir, `part_${String(chunkIndex).padStart(6, '0')}`);
-      await fs.promises.writeFile(chunkPath, body);
+      const tempChunkPath = `${chunkPath}.${Date.now()}.tmp`;
+      await fs.promises.writeFile(tempChunkPath, body);
+      await fs.promises.rename(tempChunkPath, chunkPath);
 
       if (!project.uploadedChunks.includes(chunkIndex)) {
         project.uploadedChunks.push(chunkIndex);
+        project.uploadedChunks.sort((a, b) => a - b);
       }
       project.uploadProgress = Math.min(
         99,
@@ -289,28 +391,44 @@ async function createServer() {
       }
 
       res.json({
+        uploadId: project.uploadId ?? project.id,
         received: chunkIndex,
+        bytesReceived: body.length,
         uploadedCount: project.uploadedChunks.length,
         totalChunks: project.totalChunks,
         uploadProgress: project.uploadProgress,
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to store uploaded chunk.';
-      console.error('Chunk upload error:', err);
-      res.status(500).json({ error: message });
+      const safeErr = logBackendError({
+        projectId,
+        uploadId,
+        stage: `upload_chunk_${req.params.index}`,
+        httpStatus: 500,
+        route: `${req.method} /api/uploads/:projectId/chunk/:index`,
+        error: err,
+      });
+      res.status(500).json({ error: safeErr });
     }
   };
   app.post('/api/uploads/:projectId/chunk/:index', rawChunkParser, handleUploadChunk);
   app.put('/api/uploads/:projectId/chunk/:index', rawChunkParser, handleUploadChunk);
 
-  // Resumable Upload — Step 3: Assemble chunks, probe with FFprobe, extract thumbnail (idempotent & non-blocking)
+  // Resumable Upload — Step 3: Verify all chunks, stream-assemble, validate byte size & FFprobe, optional auto-analyze handoff
   app.post('/api/uploads/:projectId/complete', async (req, res) => {
     const project = store.getProject(req.params.projectId);
     if (!project) return res.status(404).json({ error: 'Upload session not found.' });
+    const autoAnalyze = Boolean((req.body as { autoAnalyze?: boolean } | undefined)?.autoAnalyze);
 
-    // Idempotency guard: if a previous /complete succeeded and client retried after a network blip, return it cleanly
-    if (project.status === 'uploaded' && project.sourcePath && fs.existsSync(project.sourcePath)) {
-      return res.json(project);
+    // Idempotency guard: if a previous /complete succeeded and client retried after a network blip, return cleanly
+    if (
+      (project.status === 'uploaded' || project.status === 'analyzing' || project.status === 'ready') &&
+      project.sourcePath &&
+      fs.existsSync(project.sourcePath)
+    ) {
+      if (autoAnalyze && project.status === 'uploaded' && isGeminiConfigured() && !isPipelineRunning(project.id)) {
+        void runAnalysisPipeline(project.id);
+      }
+      return res.json(store.getProject(project.id) ?? project);
     }
 
     try {
@@ -323,18 +441,23 @@ async function createServer() {
       const alreadyAssembled = fs.existsSync(targetPath) && fs.statSync(targetPath).size === project.fileSize;
 
       if (!alreadyAssembled) {
-        // Verify all chunks exist before assembling
+        // Verify ALL chunks exist and are non-empty on persistent disk before assembling
+        const missingChunks: number[] = [];
         for (let i = 0; i < project.totalChunks; i++) {
           const partPath = path.join(chunkDir, `part_${String(i).padStart(6, '0')}`);
-          if (!fs.existsSync(partPath)) {
-            return res.status(400).json({
-              error: `Missing upload chunk ${i + 1} of ${project.totalChunks}. Please resume upload.`,
-              missingChunk: i,
-            });
+          if (!fs.existsSync(partPath) || fs.statSync(partPath).size === 0) {
+            missingChunks.push(i);
           }
         }
+        if (missingChunks.length > 0) {
+          return res.status(400).json({
+            error: `Missing ${missingChunks.length} upload chunk${missingChunks.length === 1 ? '' : 's'} (first missing: chunk ${missingChunks[0] + 1} of ${project.totalChunks}). Please resume upload.`,
+            missingChunk: missingChunks[0],
+            missingChunks,
+          });
+        }
 
-        // Concatenate sequentially with explicit backpressure & zero MaxListeners buildup
+        // Stream-concatenate sequentially with explicit backpressure (zero multi-GB memory buffering)
         const writeStream = fs.createWriteStream(targetPath);
         const streamErr = new Promise<never>((_resolve, reject) => {
           writeStream.once('error', reject);
@@ -361,8 +484,26 @@ async function createServer() {
           ]);
         } catch (assembleErr) {
           writeStream.destroy();
+          fs.rmSync(targetPath, { force: true });
           throw assembleErr;
         }
+      }
+
+      // Verify assembled file size matches expected upload size before media probing
+      const assembledSize = fs.statSync(targetPath).size;
+      if (project.fileSize > 0 && assembledSize !== project.fileSize) {
+        fs.rmSync(targetPath, { force: true });
+        logBackendError({
+          projectId: project.id,
+          uploadId: project.uploadId,
+          stage: 'upload_assembly_verify',
+          httpStatus: 400,
+          route: 'POST /api/uploads/:projectId/complete',
+          error: new Error(`Assembled size mismatch: expected ${project.fileSize} bytes, got ${assembledSize} bytes`),
+        });
+        return res.status(400).json({
+          error: 'Assembled video file size did not match the uploaded file. Please resume or retry the upload.',
+        });
       }
 
       // Probe with FFprobe (handles MP4, MKV, MOV, WebM, HEVC, VFR, and missing header duration)
@@ -374,7 +515,7 @@ async function createServer() {
         });
       }
 
-      // Remove temporary chunk files only after assembly & FFprobe succeed
+      // Remove temporary chunk files only after assembly, size check & FFprobe succeed
       if (fs.existsSync(chunkDir)) {
         fs.rmSync(chunkDir, { recursive: true, force: true });
       }
@@ -480,6 +621,7 @@ async function createServer() {
       }
 
       project.sourcePath = targetPath;
+      project.storageRef = `local://projects/${project.id}/${targetFilename}`;
       project.sourceUrl = browserPreviewUrl;
       project.originalContainer = ext.replace('.', '').toUpperCase();
       project.thumbnailUrl = hasThumbnail ? `/media/projects/${project.id}/thumb.jpg` : undefined;
@@ -488,16 +630,29 @@ async function createServer() {
       project.uploadProgress = 100;
       project.status = 'uploaded';
       project.errorMessage = undefined;
+      project.failedStage = undefined;
       store.upsertProject(project);
 
-      res.json(project);
+      // Seamless Upload-to-Processing Handoff when autoAnalyze is enabled
+      if (autoAnalyze && isGeminiConfigured() && !isPipelineRunning(project.id)) {
+        void runAnalysisPipeline(project.id);
+      }
+
+      res.json(store.getProject(project.id) ?? project);
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to assemble uploaded video.';
-      console.error('Upload completion error:', err);
+      const safeErr = logBackendError({
+        projectId: project.id,
+        uploadId: project.uploadId,
+        stage: 'upload_complete',
+        httpStatus: 500,
+        route: 'POST /api/uploads/:projectId/complete',
+        error: err,
+      });
       project.status = 'failed';
-      project.errorMessage = message;
+      project.failedStage = 'upload_complete';
+      project.errorMessage = safeErr;
       store.upsertProject(project);
-      res.status(500).json({ error: message });
+      res.status(500).json({ error: safeErr });
     }
   });
 
@@ -509,6 +664,8 @@ async function createServer() {
 
   // Create real spoken sample video (Gemini TTS + FFmpeg) for immediate testing
   app.post('/api/projects/sample', async (req, res) => {
+    const projectId = uuidv4();
+    let createdStub = false;
     try {
       if (!isGeminiConfigured()) {
         return res.status(400).json({
@@ -517,10 +674,10 @@ async function createServer() {
       }
       const settings = store.getSettings();
       const bodyConfig = (req.body?.analysisConfig ?? {}) as Partial<AnalysisConfig>;
-      const projectId = uuidv4();
       const now = new Date().toISOString();
       const project: ProjectRecord = {
         id: projectId,
+        uploadId: uuidv4(),
         name: 'Creator Craft Podcast — Ep 42 (Spoken Test)',
         originalFilename: 'creator_craft_ep42.mp4',
         mimeType: 'video/mp4',
@@ -551,12 +708,21 @@ async function createServer() {
         updatedAt: now,
       };
       store.upsertProject(project);
+      createdStub = true;
       const completed = await createRealSampleVideoProject(project);
       res.json(completed);
     } catch (err) {
-      res.status(500).json({
-        error: err instanceof Error ? err.message : 'Failed to generate spoken sample video.',
+      if (createdStub) {
+        store.deleteProject(projectId);
+      }
+      const safeErr = logBackendError({
+        projectId,
+        stage: 'sample_generation',
+        httpStatus: 500,
+        route: 'POST /api/projects/sample',
+        error: err,
       });
+      res.status(500).json({ error: safeErr });
     }
   });
 
@@ -705,9 +871,14 @@ async function createServer() {
       });
       res.json(updated);
     } catch (err) {
-      res.status(500).json({
-        error: err instanceof Error ? err.message : 'Failed to regenerate clip.',
+      const safeErr = logBackendError({
+        projectId: req.params.id,
+        stage: 'clip_regenerate',
+        httpStatus: 500,
+        route: 'POST /api/projects/:id/clips/:clipId/regenerate',
+        error: err,
       });
+      res.status(500).json({ error: safeErr });
     }
   });
 
@@ -883,14 +1054,19 @@ async function createServer() {
   });
 
   // Always return JSON on Express body-parser / middleware errors under /api
-  app.use('/api', (err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  app.use('/api', (err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
     const status =
       typeof err === 'object' && err && 'status' in err && typeof (err as { status: unknown }).status === 'number'
         ? (err as { status: number }).status
         : 500;
-    const message = err instanceof Error ? err.message : 'Unexpected server error.';
+    const safeErr = logBackendError({
+      stage: 'api_middleware',
+      httpStatus: status,
+      route: `${req.method} ${req.originalUrl}`,
+      error: err,
+    });
     if (!res.headersSent) {
-      res.status(status).json({ error: message });
+      res.status(status).json({ error: sanitizeErrorMessage(safeErr) });
     }
   });
 

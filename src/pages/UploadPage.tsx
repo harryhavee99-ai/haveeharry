@@ -298,16 +298,18 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
                 <span className="tabular-nums">
                   {uploadInfo.retryNotice
                     ? uploadInfo.retryNotice
-                    : uploadInfo.state === 'assembling'
-                      ? 'Assembling video chunks and probing media streams with FFprobe...'
-                      : uploadInfo.state === 'paused'
-                        ? 'Upload paused — ready to resume from last chunk'
-                        : uploadInfo.state === 'error'
-                          ? `Upload interrupted: ${uploadInfo.error}`
-                          : `Streaming at ${formatBytes(uploadInfo.speedBytesPerSec)}/s`}
+                    : uploadInfo.state === 'verifying'
+                      ? 'Verifying uploaded chunks on server...'
+                      : uploadInfo.state === 'assembling'
+                        ? 'Finalizing video and probing media streams with FFprobe...'
+                        : uploadInfo.state === 'paused'
+                          ? 'Upload paused — click Resume Upload to continue from last verified chunk'
+                          : uploadInfo.state === 'error'
+                            ? `Upload interrupted: ${uploadInfo.error}`
+                            : `Uploading video at ${formatBytes(uploadInfo.speedBytesPerSec)}/s`}
                 </span>
                 <div className="flex items-center gap-2">
-                  {uploadInfo.state !== 'assembling' && (
+                  {uploadInfo.state !== 'assembling' && uploadInfo.state !== 'verifying' && (
                     <button
                       onClick={() => void handlePauseResume()}
                       className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg bg-[#0E1913] hover:bg-[#14241B] border border-[#D4AF37]/20 text-xs font-medium text-white"
@@ -318,7 +320,7 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
                         </>
                       ) : (
                         <>
-                          <Play className="w-3.5 h-3.5" /> Resume
+                          <Play className="w-3.5 h-3.5 text-[#10B981]" /> Resume Upload
                         </>
                       )}
                     </button>
@@ -603,7 +605,19 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
             </div>
           </div>
 
-          <div className="pt-2">
+          <div className="pt-2 space-y-3">
+            <label className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/15 cursor-pointer">
+              <span className="text-xs text-zinc-300">
+                Auto-start AI analysis &amp; clip generation when upload finishes
+              </span>
+              <input
+                type="checkbox"
+                checked={uploadState.autoAnalyze}
+                onChange={(e) => uploadManager.setAutoAnalyze(e.target.checked)}
+                className="w-4 h-4 accent-[#10B981] rounded cursor-pointer shrink-0"
+              />
+            </label>
+
             <button
               onClick={() => void handleAnalyze()}
               disabled={!uploadedProject || startingAnalysis}
@@ -614,7 +628,11 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
               ) : (
                 <Cpu className="w-4 h-4 text-[#FEF3C7]" />
               )}
-              {startingAnalysis ? 'Starting AI Pipeline...' : 'Analyze Video & Generate Clips'}
+              {startingAnalysis
+                ? 'Starting AI Pipeline...'
+                : uploadedProject?.status === 'analyzing'
+                  ? 'View Live AI Analysis'
+                  : 'Analyze Video & Generate Clips'}
             </button>
           </div>
         </div>

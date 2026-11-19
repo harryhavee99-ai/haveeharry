@@ -1,5 +1,5 @@
 import fs from 'fs';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { v4 as uuidv4 } from 'uuid';
 import type {
   ClipCategory,
@@ -9,7 +9,7 @@ import type {
   WordTiming,
 } from '../shared/types.ts';
 
-function getClient(): GoogleGenAI {
+function getClient(apiVersion: 'v1beta' | 'v1' = 'v1beta'): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
     throw new Error(
@@ -18,6 +18,7 @@ function getClient(): GoogleGenAI {
   }
   return new GoogleGenAI({
     apiKey,
+    apiVersion,
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -31,7 +32,33 @@ export function isGeminiConfigured(): boolean {
   return Boolean(key && key.trim().length > 10 && key !== 'MY_GEMINI_API_KEY');
 }
 
-async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
+function parseJsonSafely<T>(rawText: string | undefined, fallback: T): T {
+  const raw = (rawText ?? '').trim();
+  if (!raw) return fallback;
+  const cleaned = raw
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+  try {
+    return JSON.parse(cleaned) as T;
+  } catch {
+    // Attempt to extract first JSON object or array if model wrapped output in text
+    const objStart = cleaned.indexOf('{');
+    const arrStart = cleaned.indexOf('[');
+    const start =
+      objStart >= 0 && arrStart >= 0 ? Math.min(objStart, arrStart) : Math.max(objStart, arrStart);
+    if (start >= 0) {
+      const endChar = cleaned[start] === '[' ? ']' : '}';
+      const end = cleaned.lastIndexOf(endChar);
+      if (end > start) {
+        return JSON.parse(cleaned.slice(start, end + 1)) as T;
+      }
+    }
+    throw new Error('Malformed JSON returned by AI service.');
+  }
+}
+
+async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 4): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -39,17 +66,25 @@ async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
     } catch (err) {
       lastError = err;
       const msg = err instanceof Error ? err.message : String(err);
-      // Do not retry on invalid API key / permission denied / bad request
+      // Do not retry on invalid API key, permission denied, invalid request schema, or missing model
       if (
         msg.includes('API_KEY_INVALID') ||
         msg.includes('PERMISSION_DENIED') ||
+        msg.includes('INVALID_ARGUMENT') ||
+        msg.includes('NOT_FOUND') ||
+        msg.includes('401') ||
         msg.includes('403') ||
+        msg.includes('404') ||
         msg.includes('not configured')
       ) {
         throw err;
       }
       if (attempt < maxAttempts) {
-        await new Promise((r) => setTimeout(r, 1200 * attempt));
+        const isRateLimit = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED');
+        const baseDelay = isRateLimit ? 2500 : 1200;
+        const backoff = Math.min(20000, baseDelay * Math.pow(2, attempt - 1));
+        const jitter = Math.round(Math.random() * 400);
+        await new Promise((r) => setTimeout(r, backoff + jitter));
       }
     }
   }
@@ -115,9 +150,59 @@ export interface ChunkTranscriptionResult {
   segments: TranscriptSegment[];
 }
 
+function parseTimestampedTranscriptLines(
+  rawText: string,
+  chunkIndex: number,
+  chunkOffsetSeconds: number,
+  chunkDurationSeconds: number
+): TranscriptSegment[] {
+  const segments: TranscriptSegment[] = [];
+  const lines = rawText
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  const parseSec = (val: string): number => {
+    const clean = val.trim().replace(/s$/i, '');
+    if (clean.includes(':')) {
+      const parts = clean.split(':').map(Number);
+      if (parts.length === 2 && parts.every(Number.isFinite)) return parts[0] * 60 + parts[1];
+      if (parts.length === 3 && parts.every(Number.isFinite)) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    }
+    const n = Number(clean);
+    return Number.isFinite(n) ? n : NaN;
+  };
+
+  // Matches formats like: [0.0 - 5.2] Speaker 1: Hello world  OR  [00:00 - 00:05] Hello world
+  const lineRe = /^\[?\s*([0-9:.]+s?)\s*[-–—to]+\s*([0-9:.]+s?)\s*\]?\s*(?:([^:]{1,28}):\s*)?(.+)$/i;
+  for (const line of lines) {
+    const m = line.match(lineRe);
+    if (!m) continue;
+    const rawStart = parseSec(m[1]);
+    const rawEnd = parseSec(m[2]);
+    const speaker = (m[3] || 'Speaker 1').trim();
+    const text = m[4].trim();
+    if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd) || !text || text === '[NO_SPEECH]') continue;
+    const localStart = Math.max(0, Math.min(chunkDurationSeconds - 0.1, rawStart));
+    const localEnd = Math.max(localStart + 0.25, Math.min(chunkDurationSeconds, rawEnd));
+    const absStart = Number((chunkOffsetSeconds + localStart).toFixed(3));
+    const absEnd = Number((chunkOffsetSeconds + localEnd).toFixed(3));
+    segments.push({
+      id: uuidv4(),
+      start: absStart,
+      end: absEnd,
+      speaker,
+      text,
+      words: buildWordTimings(text, absStart, absEnd),
+      chunkIndex,
+    });
+  }
+  return segments;
+}
+
 /**
  * Transcribes a single audio chunk using Gemini 3.5 Transcribe (verbatim spoken speech)
- * + Gemini 4 Hydrogen structured timestamp alignment so captions strictly reflect actual spoken words.
+ * with fast single-pass timestamp parsing and Gemini 4 Hydrogen structured fallback alignment.
  */
 export async function transcribeAudioChunk(params: {
   audioPath: string;
@@ -126,7 +211,7 @@ export async function transcribeAudioChunk(params: {
   chunkDurationSeconds: number;
   language: string;
 }): Promise<ChunkTranscriptionResult> {
-  const ai = getClient();
+  const ai = getClient('v1beta');
   const audioBuffer = fs.readFileSync(params.audioPath);
   const base64Audio = audioBuffer.toString('base64');
 
@@ -137,28 +222,40 @@ export async function transcribeAudioChunk(params: {
         ? 'Transcribe the spoken Urdu/Hindi verbatim using Roman Urdu (Latin script) with natural punctuation and capitalization.'
         : `Transcribe the spoken audio verbatim in language code "${params.language}" with accurate punctuation and capitalization.`;
 
-  // Step 1: Verbatim speech-to-text pass via gemini-3.5-transcribe
+  // Step 1: Fast single-pass timestamped speech-to-text via gemini-3.5-transcribe
   let verbatimReference = '';
   try {
-    const transcribeRes = await withRetry(() =>
-      ai.models.generateContent({
-        model: 'gemini-3.5-transcribe',
-        contents: {
-          parts: [
-            {
-              inlineData: {
-                mimeType: 'audio/mp3',
-                data: base64Audio,
+    const t0 = Date.now();
+    const transcribeRes = await withRetry(
+      () =>
+        ai.models.generateContent({
+          model: 'gemini-3.5-transcribe',
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  mimeType: 'audio/mp3',
+                  data: base64Audio,
+                },
               },
-            },
-            {
-              text: `${languageDirective} Only transcribe words actually spoken in the audio. If there is silence or only music with no speech, respond with "[NO_SPEECH]".`,
-            },
-          ],
-        },
-      })
+              {
+                text: [
+                  `${languageDirective}`,
+                  `Audio duration is ${params.chunkDurationSeconds.toFixed(1)} seconds (0.0 to ${params.chunkDurationSeconds.toFixed(1)}).`,
+                  `Format each spoken sentence/phrase on its own line with exact timestamps in seconds like:`,
+                  `[0.0 - 4.5] Speaker 1: Exact spoken words here.`,
+                  `Only transcribe words actually spoken in the audio. If there is silence or only music with no speech, respond with "[NO_SPEECH]".`,
+                ].join('\n'),
+              },
+            ],
+          },
+        }),
+      2
     );
     verbatimReference = (transcribeRes.text ?? '').trim();
+    console.log(
+      `[Gemini] gemini-3.5-transcribe chunk ${params.chunkIndex} finished in ${Date.now() - t0}ms (${verbatimReference.length} chars)`
+    );
   } catch (err) {
     console.warn('gemini-3.5-transcribe fallback to gemini-4-hydrogen audio pass:', err);
   }
@@ -167,7 +264,23 @@ export async function transcribeAudioChunk(params: {
     return { detectedLanguage: params.language === 'auto' ? 'en' : params.language, segments: [] };
   }
 
-  // Step 2: Structured timestamped diarized alignment via gemini-4-hydrogen
+  // Fast path: if gemini-3.5-transcribe already returned clean timestamped segments, skip second heavy audio pass!
+  if (verbatimReference) {
+    const directSegments = parseTimestampedTranscriptLines(
+      verbatimReference,
+      params.chunkIndex,
+      params.chunkOffsetSeconds,
+      params.chunkDurationSeconds
+    );
+    if (directSegments.length > 0) {
+      return {
+        detectedLanguage: params.language === 'auto' ? 'en' : params.language,
+        segments: directSegments,
+      };
+    }
+  }
+
+  // Step 2: Structured timestamped diarized alignment via gemini-4-hydrogen (fallback when Step 1 had no timestamps)
   const prompt = [
     `You are a precision speech-to-text timestamp aligner.`,
     `This audio chunk is ${params.chunkDurationSeconds.toFixed(1)} seconds long (local timestamps from 0.0 to ${params.chunkDurationSeconds.toFixed(1)} seconds).`,
@@ -179,8 +292,9 @@ export async function transcribeAudioChunk(params: {
     `If there is no spoken dialogue in this audio chunk, return an empty segments array.`,
   ].join('\n\n');
 
-  const alignedRes = await withRetry(() =>
-    ai.models.generateContent({
+  const t1 = Date.now();
+  const parsed = await withRetry(async () => {
+    const alignedRes = await ai.models.generateContent({
       model: 'gemini-4-hydrogen',
       contents: {
         parts: [
@@ -194,6 +308,7 @@ export async function transcribeAudioChunk(params: {
         ],
       },
       config: {
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
         responseMimeType: 'application/json',
         responseSchema: {
           type: Type.OBJECT,
@@ -219,14 +334,16 @@ export async function transcribeAudioChunk(params: {
           required: ['detectedLanguage', 'segments'],
         },
       },
-    })
-  );
+    });
 
-  const rawJson = (alignedRes.text ?? '{}').trim();
-  const parsed = JSON.parse(rawJson) as {
-    detectedLanguage?: string;
-    segments?: Array<{ start: number; end: number; speaker: string; text: string }>;
-  };
+    return parseJsonSafely<{
+      detectedLanguage?: string;
+      segments?: Array<{ start: number; end: number; speaker: string; text: string }>;
+    }>(alignedRes.text, { detectedLanguage: params.language === 'auto' ? 'en' : params.language, segments: [] });
+  }, 3);
+  console.log(
+    `[Gemini] gemini-4-hydrogen alignment chunk ${params.chunkIndex} finished in ${Date.now() - t1}ms (${parsed.segments?.length ?? 0} segs)`
+  );
 
   const segments: TranscriptSegment[] = (parsed.segments ?? [])
     .filter((s) => s.text && s.text.trim().length > 0 && s.text.trim() !== '[NO_SPEECH]')
@@ -264,11 +381,11 @@ export async function analyzeKeyframesForFraming(
   keyframes: Array<{ time: number; filePath: string }>
 ): Promise<Array<{ time: number; speakerX: number; speakerY: number; description: string }>> {
   if (keyframes.length === 0) return [];
-  const ai = getClient();
+  const ai = getClient('v1beta');
 
-  // Sample up to 12 representative keyframes across the video to keep calls crisp
-  const step = Math.max(1, Math.floor(keyframes.length / 12));
-  const selected = keyframes.filter((_, i) => i % step === 0).slice(0, 12);
+  // Sample up to 6 representative keyframes across the video to keep multimodal latency crisp
+  const step = Math.max(1, Math.floor(keyframes.length / 6));
+  const selected = keyframes.filter((_, i) => i % step === 0).slice(0, 6);
 
   const parts: Array<{ inlineData: { mimeType: string; data: string } } | { text: string }> = [];
   selected.forEach((kf, idx) => {
@@ -291,11 +408,13 @@ export async function analyzeKeyframesForFraming(
   });
 
   try {
-    const res = await withRetry(() =>
-      ai.models.generateContent({
+    const t0 = Date.now();
+    const parsed = await withRetry(async () => {
+      const res = await ai.models.generateContent({
         model: 'gemini-4-hydrogen',
         contents: { parts },
         config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.ARRAY,
@@ -311,15 +430,21 @@ export async function analyzeKeyframesForFraming(
             },
           },
         },
-      })
-    );
-
-    const parsed = JSON.parse((res.text ?? '[]').trim()) as Array<{
-      frameIndex: number;
-      speakerX: number;
-      speakerY: number;
-      description: string;
-    }>;
+      });
+      const data = parseJsonSafely<
+        Array<{
+          frameIndex: number;
+          speakerX: number;
+          speakerY: number;
+          description: string;
+        }>
+      >(res.text, []);
+      if (!Array.isArray(data)) {
+        throw new Error('Keyframe framing response was not an array.');
+      }
+      return data;
+    }, 2);
+    console.log(`[Gemini] visual framing (${selected.length} frames) finished in ${Date.now() - t0}ms`);
 
     return parsed
       .filter((item) => item.frameIndex >= 0 && item.frameIndex < selected.length)
@@ -443,11 +568,12 @@ export async function selectHighlightsWithGemini(params: {
       .filter(Boolean)
       .join('\n\n');
 
-    const res = await withRetry(() =>
-      ai.models.generateContent({
+    const parsed = await withRetry(async () => {
+      const res = await ai.models.generateContent({
         model: 'gemini-4-hydrogen',
         contents: prompt,
         config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.ARRAY,
@@ -513,15 +639,20 @@ export async function selectHighlightsWithGemini(params: {
             },
           },
         },
-      })
-    );
+      });
+      const data = parseJsonSafely<SelectedHighlight[]>(res.text, []);
+      if (!Array.isArray(data)) {
+        throw new Error('Highlight selection response was not an array.');
+      }
+      return data;
+    });
 
-    const parsed = JSON.parse((res.text ?? '[]').trim()) as SelectedHighlight[];
     for (const item of parsed) {
       const clamp = (n: number) => Math.max(0, Math.min(100, Math.round(Number(n) || 70)));
-      const startTime = Math.max(0, Math.min(params.videoDuration - 4, Number(item.startTime) || 0));
+      const minClipLen = Math.min(4, Math.max(1, params.videoDuration * 0.5));
+      const startTime = Math.max(0, Math.min(Math.max(0, params.videoDuration - minClipLen), Number(item.startTime) || 0));
       const endTime = Math.max(
-        startTime + 4,
+        startTime + minClipLen,
         Math.min(params.videoDuration, Number(item.endTime) || startTime + effectiveTarget)
       );
       const validCategories: ClipCategory[] = [

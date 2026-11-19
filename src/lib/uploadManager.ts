@@ -14,6 +14,7 @@ export interface BackgroundUploadState {
   completedProject: ProjectRecord | null;
   error: string | null;
   bannerDismissed: boolean;
+  autoAnalyze: boolean;
   savedConfig: AnalysisConfig | null;
   savedDurationPreset: string | null;
   savedCustomDurationSec: number | null;
@@ -29,6 +30,7 @@ let state: BackgroundUploadState = {
   completedProject: null,
   error: null,
   bannerDismissed: false,
+  autoAnalyze: true,
   savedConfig: null,
   savedDurationPreset: null,
   savedCustomDurationSec: null,
@@ -52,7 +54,7 @@ function setState(patch: Partial<BackgroundUploadState>) {
 
 function isActivelyUploading(): boolean {
   const s = state.info?.state;
-  return s === 'uploading' || s === 'assembling';
+  return s === 'uploading' || s === 'verifying' || s === 'assembling';
 }
 
 function ensureGlobalHooks() {
@@ -116,7 +118,11 @@ export const uploadManager = {
     setState({ bannerDismissed: true });
   },
 
-  startUpload(file: File, analysisConfig: Partial<AnalysisConfig>) {
+  setAutoAnalyze(enabled: boolean) {
+    setState({ autoAnalyze: enabled });
+  },
+
+  startUpload(file: File, analysisConfig: Partial<AnalysisConfig>, autoAnalyzeOverride?: boolean) {
     ensureGlobalHooks();
 
     // Never drop an in-flight upload accidentally
@@ -127,9 +133,12 @@ export const uploadManager = {
       return;
     }
 
+    const shouldAutoAnalyze = autoAnalyzeOverride ?? state.autoAnalyze;
+
     const controller = createResumableUploader({
       file,
       analysisConfig,
+      autoAnalyze: shouldAutoAnalyze,
       onProgress: (info) => {
         // Only apply progress events from the currently active controller
         if (activeController !== controller) return;

@@ -279,6 +279,18 @@ export const api = {
   getExports: (projectId?: string) =>
     requestJson<ExportJob[]>(projectId ? `/api/exports?projectId=${encodeURIComponent(projectId)}` : '/api/exports'),
 
+  getUploadStatus: (projectId: string) =>
+    requestJson<{
+      uploadId: string;
+      projectId: string;
+      status: string;
+      fileSize: number;
+      totalChunks: number;
+      uploadedChunks: number[];
+      missingChunks: number[];
+      uploadProgress: number;
+    }>(`/api/uploads/${projectId}/status`),
+
   cancelUpload: (projectId: string) =>
     requestJson<{ cancelled: boolean }>(`/api/uploads/${projectId}/cancel`, { method: 'DELETE' }),
 };
@@ -291,6 +303,7 @@ export interface ResumableUploadController {
 }
 
 export interface UploadProgressInfo {
+  uploadId?: string;
   projectId: string;
   fileName: string;
   uploadedBytes: number;
@@ -299,7 +312,7 @@ export interface UploadProgressInfo {
   chunkIndex: number;
   totalChunks: number;
   speedBytesPerSec: number;
-  state: 'uploading' | 'paused' | 'assembling' | 'completed' | 'cancelled' | 'error';
+  state: 'uploading' | 'verifying' | 'paused' | 'assembling' | 'completed' | 'cancelled' | 'error';
   error?: string;
   retryNotice?: string;
 }
@@ -309,18 +322,21 @@ export const UPLOAD_CHUNK_SIZE = 2 * 1024 * 1024; // 2 MB proxy-safe chunks
 /**
  * Resumable chunked uploader capable of streaming multi-GB / 5-hour videos reliably
  * in the background with pause, resume, offline recovery, automatic per-chunk retry,
- * automatic server-restart session recovery, and cancel support.
+ * server-verified disk status sync, automatic server-restart recovery, and cancel support.
  */
 export function createResumableUploader(params: {
   file: File;
   analysisConfig: Partial<AnalysisConfig>;
+  autoAnalyze?: boolean;
   onProgress: (info: UploadProgressInfo) => void;
 }): ResumableUploadController {
-  const { file, analysisConfig, onProgress } = params;
+  const { file, analysisConfig, autoAnalyze = false, onProgress } = params;
   const CHUNK_SIZE = UPLOAD_CHUNK_SIZE;
   const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
 
+  let uploadId: string | null = null;
   let projectId: string | null = null;
+  const uploadedChunkSet = new Set<number>();
   let nextChunk = 0;
   let paused = false;
   let cancelled = false;
@@ -346,6 +362,7 @@ export function createResumableUploader(params: {
   const emit = (state: UploadProgressInfo['state'], error?: string, retryNotice?: string) => {
     const elapsedSec = getActiveElapsedSec();
     onProgress({
+      uploadId: uploadId || undefined,
       projectId: projectId || '',
       fileName: file.name,
       uploadedBytes,
@@ -463,7 +480,7 @@ export function createResumableUploader(params: {
 
   const initSession = async (): Promise<void> => {
     const initRes = await retryJsonCall('Initializing upload', () =>
-      requestJson<{ projectId: string; chunkSize: number }>('/api/uploads/init', {
+      requestJson<{ uploadId?: string; projectId: string; chunkSize: number }>('/api/uploads/init', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -475,7 +492,20 @@ export function createResumableUploader(params: {
         }),
       })
     );
+    uploadId = initRes.uploadId ?? initRes.projectId;
     projectId = initRes.projectId;
+    uploadedChunkSet.clear();
+  };
+
+  const syncWithServerStatus = async (): Promise<number[]> => {
+    if (!projectId) return [];
+    const statusRes = await retryJsonCall('Verifying uploaded chunks', () => api.getUploadStatus(projectId!), 5);
+    uploadedChunkSet.clear();
+    for (const idx of statusRes.uploadedChunks) {
+      uploadedChunkSet.add(idx);
+    }
+    uploadedBytes = Math.min(file.size, uploadedChunkSet.size * CHUNK_SIZE);
+    return statusRes.missingChunks;
   };
 
   const uploadSingleChunk = async (chunkIdx: number): Promise<'ok' | 'paused' | 'cancelled' | 'reset_session'> => {
@@ -587,11 +617,30 @@ export function createResumableUploader(params: {
       if (!projectId) {
         emit('uploading');
         await initSession();
+      } else {
+        // Resuming an existing session: sync with server's persisted chunks on disk first
+        try {
+          emit('verifying', undefined, 'Checking previously uploaded chunks on server...');
+          await syncWithServerStatus();
+        } catch (syncErr) {
+          if (syncErr instanceof ApiResponseError && syncErr.code === 'not_found') {
+            projectId = null;
+            uploadId = null;
+            nextChunk = 0;
+            uploadedBytes = 0;
+            await initSession();
+          }
+        }
       }
 
       emit('uploading');
 
-      while (nextChunk < totalChunks) {
+      for (let idx = 0; idx < totalChunks; idx++) {
+        if (uploadedChunkSet.has(idx)) {
+          nextChunk = idx + 1;
+          continue;
+        }
+        nextChunk = idx;
         if (cancelled) return null;
         if (paused) {
           if (runStartedAt > 0) {
@@ -602,7 +651,7 @@ export function createResumableUploader(params: {
           return null;
         }
 
-        const outcome = await uploadSingleChunk(nextChunk);
+        const outcome = await uploadSingleChunk(idx);
         if (outcome === 'cancelled') return null;
         if (outcome === 'paused') {
           if (runStartedAt > 0) {
@@ -615,23 +664,64 @@ export function createResumableUploader(params: {
         if (outcome === 'reset_session') {
           sessionRecoveries++;
           projectId = null;
+          uploadId = null;
           nextChunk = 0;
           uploadedBytes = 0;
+          uploadedChunkSet.clear();
           emit('uploading', undefined, 'Server restarted — re-establishing upload session automatically...');
           await waitForServerReady();
           await initSession();
           emit('uploading');
+          idx = -1;
           continue;
         }
 
-        uploadedBytes = Math.min(file.size, (nextChunk + 1) * CHUNK_SIZE);
-        nextChunk++;
+        uploadedChunkSet.add(idx);
+        uploadedBytes = Math.min(file.size, uploadedChunkSet.size * CHUNK_SIZE);
+        nextChunk = idx + 1;
         emit('uploading');
       }
 
-      // Finalize upload — if server reports a specific missing chunk, repair it automatically and retry
+      // Verify all chunks on server & finalize upload
       let completed: ProjectRecord | null = null;
       for (let finalizePass = 0; finalizePass < 5; finalizePass++) {
+        emit('verifying');
+        try {
+          const missing = await syncWithServerStatus();
+          if (missing.length > 0) {
+            for (const missingIdx of missing) {
+              emit(
+                'uploading',
+                undefined,
+                `Re-sending missing chunk ${missingIdx + 1} of ${totalChunks}...`
+              );
+              const repair = await uploadSingleChunk(missingIdx);
+              if (repair === 'cancelled') return null;
+              if (repair === 'paused') {
+                if (runStartedAt > 0) {
+                  cumulativeElapsedMs += Date.now() - runStartedAt;
+                  runStartedAt = 0;
+                }
+                emit('paused');
+                return null;
+              }
+              if (repair === 'reset_session') {
+                sessionRecoveries++;
+                projectId = null;
+                uploadId = null;
+                nextChunk = 0;
+                uploadedBytes = 0;
+                uploadedChunkSet.clear();
+                return runLoop();
+              }
+              uploadedChunkSet.add(missingIdx);
+              uploadedBytes = Math.min(file.size, uploadedChunkSet.size * CHUNK_SIZE);
+            }
+          }
+        } catch {
+          // Proceed to /complete which also validates every chunk strictly
+        }
+
         emit('assembling');
         try {
           completed = await retryJsonCall(
@@ -639,6 +729,8 @@ export function createResumableUploader(params: {
             () =>
               requestJson<ProjectRecord>(`/api/uploads/${projectId}/complete`, {
                 method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ autoAnalyze }),
               }),
             6
           );
@@ -667,10 +759,13 @@ export function createResumableUploader(params: {
             if (repair === 'reset_session') {
               sessionRecoveries++;
               projectId = null;
+              uploadId = null;
               nextChunk = 0;
               uploadedBytes = 0;
+              uploadedChunkSet.clear();
               return runLoop();
             }
+            uploadedChunkSet.add(err.missingChunk);
             continue;
           }
           throw err;

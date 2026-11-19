@@ -210,11 +210,48 @@ export default function App() {
     return () => clearInterval(timer);
   }, [hasActiveWork]);
 
+  // Real-time Server-Sent Events stream for the active analyzing project (with polling fallback)
+  useEffect(() => {
+    if (!activeProject || activeProject.status !== 'analyzing' || typeof EventSource === 'undefined') {
+      return;
+    }
+    const es = new EventSource(`/api/projects/${activeProject.id}/events`, { withCredentials: true });
+    es.addEventListener('update', (event) => {
+      try {
+        const payload = JSON.parse((event as MessageEvent).data) as {
+          project?: ProjectRecord;
+          exports?: ExportJob[];
+        };
+        if (payload.project) {
+          const updated = payload.project;
+          setProjects((prev) => [updated, ...prev.filter((p) => p.id !== updated.id)]);
+        }
+        if (payload.exports) {
+          const projExports = payload.exports;
+          setExportJobs((prev) => [
+            ...projExports,
+            ...prev.filter((j) => j.projectId !== activeProject.id),
+          ]);
+        }
+      } catch {
+        // ignore malformed event frames
+      }
+    });
+    return () => {
+      es.close();
+    };
+  }, [activeProject?.id, activeProject?.status]);
+
   const handleProjectCreated = useCallback((project: ProjectRecord) => {
     setProjects((prev) => [project, ...prev.filter((p) => p.id !== project.id)]);
     setActiveProjectId((curr) =>
       !curr || activePageRef.current === 'upload' ? project.id : curr
     );
+    // If auto-analyze started immediately on upload completion while on UploadPage, open live AI Analysis
+    if (project.status === 'analyzing' && activePageRef.current === 'upload') {
+      uploadManager.dismissBanner();
+      setActivePage('analysis');
+    }
   }, []);
 
   useEffect(() => {
@@ -225,6 +262,7 @@ export default function App() {
   const activeUploadInfo = uploadState.info;
   const isBgUploadInProgress =
     activeUploadInfo?.state === 'uploading' ||
+    activeUploadInfo?.state === 'verifying' ||
     activeUploadInfo?.state === 'paused' ||
     activeUploadInfo?.state === 'assembling' ||
     activeUploadInfo?.state === 'error';
@@ -232,6 +270,7 @@ export default function App() {
   const sidebarUploadProgressText = useMemo(() => {
     if (!activeUploadInfo) return null;
     if (activeUploadInfo.state === 'uploading') return `${activeUploadInfo.percentage}%`;
+    if (activeUploadInfo.state === 'verifying') return 'Verifying';
     if (activeUploadInfo.state === 'assembling') return 'Finalizing';
     if (activeUploadInfo.state === 'paused') return `Paused`;
     if (activeUploadInfo.state === 'error') return 'Retry';
@@ -423,7 +462,9 @@ export default function App() {
                 : 'bg-[#0E1913] hover:bg-[#14251C] border-[#D4AF37]/25 text-[#FEFCE8]'
             }`}
           >
-            {activeUploadInfo?.state === 'uploading' || activeUploadInfo?.state === 'assembling' ? (
+            {activeUploadInfo?.state === 'uploading' ||
+            activeUploadInfo?.state === 'verifying' ||
+            activeUploadInfo?.state === 'assembling' ? (
               <Loader2 className="w-3.5 h-3.5 text-[#F5C451] animate-spin" />
             ) : (
               <UploadCloud className="w-3.5 h-3.5 text-[#F5C451]" />
@@ -431,13 +472,15 @@ export default function App() {
             <span className="tabular-nums">
               {activeUploadInfo?.state === 'uploading'
                 ? `Uploading ${activeUploadInfo.percentage}%`
-                : activeUploadInfo?.state === 'assembling'
-                  ? 'Finalizing Upload...'
-                  : activeUploadInfo?.state === 'paused'
-                    ? `Upload Paused (${activeUploadInfo.percentage}%)`
-                    : activeUploadInfo?.state === 'error'
-                      ? 'Upload Needs Retry'
-                      : 'Upload Video'}
+                : activeUploadInfo?.state === 'verifying'
+                  ? 'Verifying Chunks...'
+                  : activeUploadInfo?.state === 'assembling'
+                    ? 'Finalizing Upload...'
+                    : activeUploadInfo?.state === 'paused'
+                      ? `Upload Paused (${activeUploadInfo.percentage}%)`
+                      : activeUploadInfo?.state === 'error'
+                        ? 'Resume Upload'
+                        : 'Upload Video'}
             </span>
           </button>
         </header>
@@ -468,19 +511,21 @@ export default function App() {
                       <div className="text-[11px] text-[#94A89C] tabular-nums truncate">
                         {activeUploadInfo.retryNotice
                           ? activeUploadInfo.retryNotice
-                          : activeUploadInfo.state === 'assembling'
-                            ? 'Assembling chunks & probing video streams with FFprobe...'
-                            : activeUploadInfo.state === 'paused'
-                              ? `Paused at ${formatBytes(activeUploadInfo.uploadedBytes)} / ${formatBytes(activeUploadInfo.totalBytes)}`
-                              : activeUploadInfo.state === 'error'
-                                ? `Interrupted: ${activeUploadInfo.error || 'Connection lost'} — click Resume to continue`
-                                : `Uploading in background · ${formatBytes(activeUploadInfo.uploadedBytes)} / ${formatBytes(activeUploadInfo.totalBytes)} · ${formatBytes(activeUploadInfo.speedBytesPerSec)}/s`}
+                          : activeUploadInfo.state === 'verifying'
+                            ? 'Verifying uploaded chunks on server...'
+                            : activeUploadInfo.state === 'assembling'
+                              ? 'Finalizing video & probing streams with FFprobe...'
+                              : activeUploadInfo.state === 'paused'
+                                ? `Paused at ${formatBytes(activeUploadInfo.uploadedBytes)} / ${formatBytes(activeUploadInfo.totalBytes)}`
+                                : activeUploadInfo.state === 'error'
+                                  ? `Interrupted: ${activeUploadInfo.error || 'Connection lost'} — click Resume Upload to continue`
+                                  : `Uploading in background · ${formatBytes(activeUploadInfo.uploadedBytes)} / ${formatBytes(activeUploadInfo.totalBytes)} · ${formatBytes(activeUploadInfo.speedBytesPerSec)}/s`}
                       </div>
                     </div>
                   </div>
 
                   <div className="flex items-center gap-2 shrink-0">
-                    {activeUploadInfo.state !== 'assembling' && (
+                    {activeUploadInfo.state !== 'assembling' && activeUploadInfo.state !== 'verifying' && (
                       <button
                         onClick={() => {
                           if (activeUploadInfo.state === 'uploading') {
@@ -497,7 +542,7 @@ export default function App() {
                           </>
                         ) : (
                           <>
-                            <Play className="w-3.5 h-3.5 text-[#10B981]" /> Resume
+                            <Play className="w-3.5 h-3.5 text-[#10B981]" /> Resume Upload
                           </>
                         )}
                       </button>
@@ -539,7 +584,11 @@ export default function App() {
                     <span className="text-[#E6EFE9] truncate">
                       {uploadState.completedProject.originalFilename}
                     </span>
-                    <span className="text-[#94A89C]"> — ready for AI clipping analysis.</span>
+                    <span className="text-[#94A89C]">
+                      {uploadState.completedProject.status === 'analyzing'
+                        ? ' — AI analysis & clip generation started automatically.'
+                        : ' — ready for AI clipping analysis.'}
+                    </span>
                   </div>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
@@ -548,11 +597,16 @@ export default function App() {
                       if (uploadState.completedProject) {
                         setActiveProjectId(uploadState.completedProject.id);
                       }
-                      setActivePage('upload');
+                      uploadManager.dismissBanner();
+                      setActivePage(
+                        uploadState.completedProject?.status === 'analyzing' ? 'analysis' : 'upload'
+                      );
                     }}
                     className="studio-btn-primary inline-flex items-center gap-1.5 h-8 px-3 rounded-lg text-xs font-semibold text-white"
                   >
-                    Open & Analyze
+                    {uploadState.completedProject.status === 'analyzing'
+                      ? 'View AI Analysis'
+                      : 'Open & Analyze'}
                     <ArrowUpRight className="w-3.5 h-3.5" />
                   </button>
                   <button

@@ -94,6 +94,14 @@ export function AnalysisPage({ project, onResumeOrStart, onNavigate }: AnalysisP
                 <span>Language: {project.detectedLanguage}</span>
               </>
             )}
+            {project.processingJobId && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className="font-mono text-[11px] text-zinc-500">
+                  Job {project.processingJobId.slice(0, 8)}
+                </span>
+              </>
+            )}
           </div>
         </div>
 
@@ -109,7 +117,7 @@ export function AnalysisPage({ project, onResumeOrStart, onNavigate }: AnalysisP
               ) : (
                 <RefreshCw className="w-4 h-4" />
               )}
-              {project.status === 'failed' ? 'Resume From Checkpoint' : 'Start AI Analysis'}
+              {project.status === 'failed' ? 'Retry Processing' : 'Start AI Analysis'}
             </button>
           )}
           {project.status === 'ready' && (
@@ -135,12 +143,24 @@ export function AnalysisPage({ project, onResumeOrStart, onNavigate }: AnalysisP
       </div>
 
       {project.errorMessage && (
-        <div className="flex items-start gap-3 p-4 rounded-xl bg-red-500/10 border border-red-500/30 text-sm text-red-200">
-          <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
-          <div>
-            <div className="font-semibold text-red-100">Pipeline paused with error</div>
-            <p className="mt-0.5 text-red-200/85">{project.errorMessage}</p>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-4 rounded-xl bg-red-500/10 border border-red-500/30 text-sm text-red-200">
+          <div className="flex items-start gap-3">
+            <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+            <div>
+              <div className="font-semibold text-red-100">
+                Processing failed{project.failedStage ? ` at stage: ${project.failedStage}` : ''}
+              </div>
+              <p className="mt-0.5 text-red-200/85">{project.errorMessage}</p>
+            </div>
           </div>
+          <button
+            onClick={() => void handleAction(false)}
+            disabled={triggering}
+            className="inline-flex items-center gap-1.5 h-9 px-3.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 border border-red-400/35 text-xs font-semibold text-white whitespace-nowrap shrink-0"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${triggering ? 'animate-spin' : ''}`} />
+            Retry From Failed Stage
+          </button>
         </div>
       )}
 

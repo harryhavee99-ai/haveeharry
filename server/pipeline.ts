@@ -9,6 +9,7 @@ import type {
   PipelineStageState,
   ProjectRecord,
   SceneMarker,
+  TranscriptSegment,
   VideoMetadata,
 } from '../shared/types.ts';
 import {
@@ -19,6 +20,7 @@ import {
   getVisualStylePreset,
 } from '../shared/presets.ts';
 import { store } from './store.ts';
+import { logBackendError } from './logger.ts';
 import {
   analyzeKeyframesForFraming,
   generateSampleSpokenAudio,
@@ -28,19 +30,28 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-const AUDIO_CHUNK_SECONDS = 480; // 8-minute chunks -> supports 5-hour videos (~38 chunks) cleanly
+const AUDIO_CHUNK_STRIDE_SECONDS = 300; // 5-minute stride -> ~60 compact chunks for a 5-hour video
+const AUDIO_CHUNK_OVERLAP_SECONDS = 10; // 10s overlap prevents cutting words/sentences at chunk boundaries
+
+export interface AudioChunkDescriptor {
+  index: number;
+  filePath: string;
+  offsetSeconds: number;
+  durationSeconds: number;
+  strideEndSeconds: number;
+}
 
 const activePipelines = new Set<string>();
 
 export function createInitialPipelineStages(): PipelineStageState[] {
   return [
-    { key: 'probe', label: 'Media Probe & Metadata', status: 'pending', progress: 0, detail: 'Waiting to inspect video streams' },
-    { key: 'audio_chunks', label: 'Chunked Audio Extraction', status: 'pending', progress: 0, detail: 'Splits long audio into resumable 8-min chunks' },
-    { key: 'signal_analysis', label: 'Silence & Scene Detection', status: 'pending', progress: 0, detail: 'Maps speech pauses and visual cut points' },
-    { key: 'transcription', label: 'AI Speech-to-Text Transcription', status: 'pending', progress: 0, detail: 'Generates verbatim timestamped transcript' },
-    { key: 'visual_framing', label: 'Speaker & Visual Framing Analysis', status: 'pending', progress: 0, detail: 'Detects active speaker positions for auto-reframe' },
-    { key: 'highlight_selection', label: 'Gemini Semantic Highlight Engine', status: 'pending', progress: 0, detail: 'Scores hooks, stories, and standalone clips' },
-    { key: 'clip_thumbnails', label: 'Clip Extraction & Thumbnails', status: 'pending', progress: 0, detail: 'Generates clip previews and frame thumbnails' },
+    { key: 'probe', label: 'Preparing & Validating Video', status: 'pending', progress: 0, detail: 'Waiting to validate video file & extract metadata' },
+    { key: 'audio_chunks', label: 'Extracting Audio Segments', status: 'pending', progress: 0, detail: 'Splits long audio into overlapping 5-min chunks' },
+    { key: 'signal_analysis', label: 'Scene & Speech Pause Detection', status: 'pending', progress: 0, detail: 'Maps speech pauses, scene cuts, and representative frames' },
+    { key: 'transcription', label: 'Transcribing Speech (AI)', status: 'pending', progress: 0, detail: 'Generates verbatim timestamped transcript across segments' },
+    { key: 'visual_framing', label: 'Analyzing Visual Framing', status: 'pending', progress: 0, detail: 'Detects active speaker positions for smart reframing' },
+    { key: 'highlight_selection', label: 'Finding Best Moments (AI)', status: 'pending', progress: 0, detail: 'Scores hooks, stories, and standalone highlight arcs' },
+    { key: 'clip_thumbnails', label: 'Generating Clips & Previews', status: 'pending', progress: 0, detail: 'Creates clip metadata, captions, motion presets & thumbnails' },
   ];
 }
 
@@ -54,6 +65,24 @@ function updateStage(
     Object.assign(stage, patch, { updatedAt: new Date().toISOString() });
   }
   store.upsertProject(project);
+}
+
+/**
+ * Runs an FFmpeg command via spawn without risking Node execFile 1 MB maxBuffer crashes on 5-hour videos.
+ */
+function runFFmpegSpawn(args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    let errTail = '';
+    proc.stderr.on('data', (d) => {
+      errTail = (errTail + d.toString()).slice(-2000);
+    });
+    proc.on('error', (err) => reject(err));
+    proc.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`FFmpeg failed (exit ${code}): ${errTail.trim() || 'unknown error'}`));
+    });
+  });
 }
 
 function parseDurationValue(raw?: string | number | null): number {
@@ -214,9 +243,85 @@ export async function extractThumbnail(
   }
 }
 
+/**
+ * Computes overlapping audio chunk plan (5-min stride with 10s overlap) for any video duration (10s to 5+ hours).
+ */
+function buildAudioChunkPlan(duration: number, audioChunksDir: string): AudioChunkDescriptor[] {
+  const plan: AudioChunkDescriptor[] = [];
+  if (duration <= AUDIO_CHUNK_STRIDE_SECONDS + AUDIO_CHUNK_OVERLAP_SECONDS) {
+    plan.push({
+      index: 0,
+      filePath: path.join(audioChunksDir, 'chunk_000.mp3'),
+      offsetSeconds: 0,
+      durationSeconds: Math.max(1, duration),
+      strideEndSeconds: duration,
+    });
+    return plan;
+  }
+
+  let idx = 0;
+  for (let start = 0; start < duration; start += AUDIO_CHUNK_STRIDE_SECONDS) {
+    const remaining = duration - start;
+    if (remaining < 1 && idx > 0) break;
+    const windowDur = Math.min(remaining, AUDIO_CHUNK_STRIDE_SECONDS + AUDIO_CHUNK_OVERLAP_SECONDS);
+    plan.push({
+      index: idx,
+      filePath: path.join(audioChunksDir, `chunk_${String(idx).padStart(3, '0')}.mp3`),
+      offsetSeconds: start,
+      durationSeconds: windowDur,
+      strideEndSeconds: Math.min(duration, start + AUDIO_CHUNK_STRIDE_SECONDS),
+    });
+    idx++;
+  }
+  return plan;
+}
+
+/**
+ * Merges newly transcribed overlapping chunk segments into the unified project transcript,
+ * deduplicating sentences repeated inside the 10s chunk overlap boundary while preserving original timestamps.
+ */
+function mergeOverlappingTranscriptSegments(
+  existing: TranscriptSegment[],
+  incoming: TranscriptSegment[],
+  chunkIndex: number,
+  chunkOffsetSeconds: number
+): TranscriptSegment[] {
+  if (chunkIndex === 0 || existing.length === 0) {
+    return [...existing, ...incoming].sort((a, b) => a.start - b.start);
+  }
+
+  const overlapEnd = chunkOffsetSeconds + AUDIO_CHUNK_OVERLAP_SECONDS;
+  const previousBoundarySegs = existing.filter((s) => s.end >= chunkOffsetSeconds - 2);
+  const normalize = (t: string) => t.toLowerCase().replace(/[^a-z0-9\u0600-\u06FF\u0900-\u097F]+/g, ' ').trim();
+
+  const filteredIncoming = incoming.filter((seg) => {
+    const midpoint = (seg.start + seg.end) / 2;
+    if (midpoint > overlapEnd) return true;
+    // Check if this segment overlaps significantly in time or text with a segment from the prior chunk
+    const incNorm = normalize(seg.text);
+    const isDuplicate = previousBoundarySegs.some((prev) => {
+      const timeOverlap = Math.min(prev.end, seg.end) - Math.max(prev.start, seg.start);
+      if (timeOverlap > 0.4) return true;
+      const prevNorm = normalize(prev.text);
+      if (incNorm.length > 6 && prevNorm.length > 6 && (prevNorm.includes(incNorm) || incNorm.includes(prevNorm))) {
+        return true;
+      }
+      return false;
+    });
+    return !isDuplicate;
+  });
+
+  return [...existing, ...filteredIncoming].sort((a, b) => a.start - b.start);
+}
+
+/**
+ * Audio-only (-vn) streaming silence detector — constant O(1) memory and 10x-20x faster on 5-hour HD/4K files.
+ */
 async function detectSilences(videoPath: string): Promise<Array<{ start: number; end: number }>> {
   return new Promise((resolve) => {
     const proc = spawn('ffmpeg', [
+      '-hide_banner',
+      '-vn',
       '-i',
       videoPath,
       '-af',
@@ -225,14 +330,15 @@ async function detectSilences(videoPath: string): Promise<Array<{ start: number;
       'null',
       '-',
     ]);
-    let stderr = '';
+    const silences: Array<{ start: number; end: number }> = [];
+    let currentStart: number | null = null;
+    let lineRemainder = '';
+
     proc.stderr.on('data', (d) => {
-      stderr += d.toString();
-    });
-    proc.on('close', () => {
-      const silences: Array<{ start: number; end: number }> = [];
-      let currentStart: number | null = null;
-      for (const line of stderr.split('\n')) {
+      const chunk = lineRemainder + d.toString();
+      const lines = chunk.split('\n');
+      lineRemainder = lines.pop() ?? '';
+      for (const line of lines) {
         const startMatch = line.match(/silence_start:\s*([0-9.]+)/);
         if (startMatch) {
           currentStart = Number(startMatch[1]);
@@ -243,48 +349,128 @@ async function detectSilences(videoPath: string): Promise<Array<{ start: number;
           currentStart = null;
         }
       }
-      resolve(silences);
     });
+    proc.on('close', () => resolve(silences));
     proc.on('error', () => resolve([]));
+  });
+}
+
+/**
+ * Fast lightweight FFmpeg scene-change detector (for videos <= 10 min) returning up to 12 cut timestamps.
+ */
+async function detectSceneChangeTimestamps(videoPath: string, duration: number): Promise<number[]> {
+  if (duration > 600 || duration < 4) return [];
+  return new Promise((resolve) => {
+    const proc = spawn('ffmpeg', [
+      '-hide_banner',
+      '-i',
+      videoPath,
+      '-vf',
+      "select='gt(scene,0.35)',showinfo",
+      '-vsync',
+      'vfr',
+      '-an',
+      '-f',
+      'null',
+      '-',
+    ]);
+    const timestamps: number[] = [];
+    let remainder = '';
+    const timer = setTimeout(() => {
+      try {
+        proc.kill('SIGKILL');
+      } catch {
+        // ignore
+      }
+      resolve(timestamps);
+    }, 15000);
+
+    proc.stderr.on('data', (d) => {
+      const text = remainder + d.toString();
+      const lines = text.split('\n');
+      remainder = lines.pop() ?? '';
+      for (const line of lines) {
+        const m = line.match(/pts_time:([0-9.]+)/);
+        if (m) {
+          const ts = Number(m[1]);
+          if (Number.isFinite(ts) && ts > 0.5 && ts < duration - 0.5) {
+            if (timestamps.length === 0 || ts - timestamps[timestamps.length - 1] >= 2.0) {
+              timestamps.push(Number(ts.toFixed(2)));
+            }
+          }
+        }
+      }
+    });
+    proc.on('close', () => {
+      clearTimeout(timer);
+      resolve(timestamps.slice(0, 12));
+    });
+    proc.on('error', () => {
+      clearTimeout(timer);
+      resolve([]);
+    });
   });
 }
 
 async function extractSampleKeyframes(
   videoPath: string,
   duration: number,
-  outDir: string
+  outDir: string,
+  sceneTimestamps: number[] = []
 ): Promise<Array<{ time: number; filePath: string; filename: string }>> {
   fs.mkdirSync(outDir, { recursive: true });
   const targetFrames = Math.min(12, Math.max(4, Math.ceil(duration / 25)));
-  const interval = Math.max(1, duration / (targetFrames + 1));
-  const results: Array<{ time: number; filePath: string; filename: string }> = [];
 
-  for (let i = 1; i <= targetFrames; i++) {
-    const t = Number(Math.min(duration - 0.5, i * interval).toFixed(2));
-    if (t < 0) continue;
-    const filename = `kf_${String(i).padStart(3, '0')}.jpg`;
+  // Combine detected scene cuts with uniform coverage across the video timeline
+  const sampleTimes: number[] = [];
+  const addTime = (t: number) => {
+    const clamped = Number(Math.max(0.2, Math.min(Math.max(0.2, duration - 0.4), t)).toFixed(2));
+    if (!sampleTimes.some((existing) => Math.abs(existing - clamped) < Math.max(1.2, duration / 24))) {
+      sampleTimes.push(clamped);
+    }
+  };
+  for (const ts of sceneTimestamps) {
+    if (sampleTimes.length >= Math.floor(targetFrames * 0.6)) break;
+    addTime(ts);
+  }
+  const interval = Math.max(1, duration / (targetFrames + 1));
+  for (let i = 1; i <= targetFrames && sampleTimes.length < targetFrames; i++) {
+    addTime(i * interval);
+  }
+  sampleTimes.sort((a, b) => a - b);
+
+  const results: Array<{ time: number; filePath: string; filename: string }> = [];
+  for (let i = 0; i < sampleTimes.length; i++) {
+    const t = sampleTimes[i];
+    const filename = `kf_${String(i + 1).padStart(3, '0')}.jpg`;
     const filePath = path.join(outDir, filename);
     if (!fs.existsSync(filePath)) {
       try {
-        await execFileAsync('ffmpeg', [
-          '-y',
-          '-ss',
-          t.toFixed(2),
-          '-i',
-          videoPath,
-          '-frames:v',
-          '1',
-          '-vf',
-          'scale=480:-2',
-          '-q:v',
-          '5',
-          filePath,
-        ]);
+        await execFileAsync(
+          'ffmpeg',
+          [
+            '-loglevel',
+            'error',
+            '-y',
+            '-ss',
+            t.toFixed(2),
+            '-i',
+            videoPath,
+            '-frames:v',
+            '1',
+            '-vf',
+            'scale=480:-2',
+            '-q:v',
+            '5',
+            filePath,
+          ],
+          { maxBuffer: 10 * 1024 * 1024, timeout: 25000 }
+        );
       } catch {
         continue;
       }
     }
-    if (fs.existsSync(filePath)) {
+    if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
       results.push({ time: t, filePath, filename });
     }
   }
@@ -306,9 +492,12 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
     throw new Error('Source video file not found for this project.');
   }
 
+  const jobId = uuidv4();
   activePipelines.add(projectId);
+  project.processingJobId = jobId;
   project.status = 'analyzing';
   project.errorMessage = undefined;
+  project.failedStage = undefined;
   if (!project.pipelineStages || project.pipelineStages.length === 0) {
     project.pipelineStages = createInitialPipelineStages();
   }
@@ -318,15 +507,17 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
   const audioChunksDir = path.join(projectDir, 'audio_chunks');
   const keyframesDir = path.join(projectDir, 'keyframes');
   const clipsDir = path.join(projectDir, 'clips');
+  let activeStage: PipelineStageKey = 'probe';
 
   try {
-    // STAGE 1: Probe media & extract source thumbnail
+    // STAGE 1: Validate file, probe media & extract source thumbnail
+    activeStage = 'probe';
     const probeStage = project.pipelineStages.find((s) => s.key === 'probe');
     if (!probeStage || probeStage.status !== 'completed' || !project.metadata) {
       updateStage(project, 'probe', {
         status: 'running',
         progress: 25,
-        detail: 'Running FFprobe stream inspection...',
+        detail: 'Validating video file and running FFprobe stream inspection...',
       });
       const meta = await probeVideoFile(project.sourcePath);
       if (meta.duration <= 0) {
@@ -342,7 +533,9 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
           // non-fatal
         }
       }
-      project.thumbnailUrl = `/media/projects/${projectId}/thumb.jpg`;
+      if (fs.existsSync(thumbPath) && fs.statSync(thumbPath).size > 0) {
+        project.thumbnailUrl = `/media/projects/${projectId}/thumb.jpg`;
+      }
       updateStage(project, 'probe', {
         status: 'completed',
         progress: 100,
@@ -352,10 +545,12 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
 
     const meta = project.metadata!;
 
-    // STAGE 2: Chunked Audio Extraction (supports 5-hour videos)
+    // STAGE 2: Overlapping Chunked Audio Extraction (supports 5-hour+ videos without cutting boundary words)
+    activeStage = 'audio_chunks';
     const audioStage = project.pipelineStages.find((s) => s.key === 'audio_chunks');
     fs.mkdirSync(audioChunksDir, { recursive: true });
-    let audioChunkFiles: string[] = [];
+    const audioPlan: AudioChunkDescriptor[] =
+      meta.audioCodec === 'none' ? [] : buildAudioChunkPlan(meta.duration, audioChunksDir);
 
     if (meta.audioCodec === 'none') {
       project.totalAudioChunks = 0;
@@ -366,78 +561,82 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
         detail: 'No audio track detected in source video (visual-only mode).',
       });
     } else if (!audioStage || audioStage.status !== 'completed') {
+      project.totalAudioChunks = audioPlan.length;
+      project.completedAudioChunks = 0;
       updateStage(project, 'audio_chunks', {
         status: 'running',
-        progress: 15,
-        detail: 'Extracting 16kHz mono speech audio into resumable chunks...',
+        progress: 5,
+        detail: `Extracting ${audioPlan.length} overlapping 16kHz speech audio segment${audioPlan.length === 1 ? '' : 's'}...`,
       });
-      const expectedChunks = Math.max(1, Math.ceil(meta.duration / AUDIO_CHUNK_SECONDS));
-      project.totalAudioChunks = expectedChunks;
-      store.upsertProject(project);
 
-      await execFileAsync('ffmpeg', [
-        '-y',
-        '-i',
-        project.sourcePath,
-        '-vn',
-        '-ac',
-        '1',
-        '-ar',
-        '16000',
-        '-c:a',
-        'libmp3lame',
-        '-b:a',
-        '32k',
-        '-f',
-        'segment',
-        '-segment_time',
-        String(AUDIO_CHUNK_SECONDS),
-        '-reset_timestamps',
-        '1',
-        path.join(audioChunksDir, 'chunk_%03d.mp3'),
-      ]);
+      for (let i = 0; i < audioPlan.length; i++) {
+        const desc = audioPlan[i];
+        if (!fs.existsSync(desc.filePath) || fs.statSync(desc.filePath).size === 0) {
+          const args = [
+            '-loglevel',
+            'error',
+            '-y',
+            ...(desc.offsetSeconds > 0 ? ['-ss', desc.offsetSeconds.toFixed(2)] : []),
+            '-i',
+            project.sourcePath,
+            ...(audioPlan.length > 1 ? ['-t', desc.durationSeconds.toFixed(2)] : []),
+            '-vn',
+            '-ac',
+            '1',
+            '-ar',
+            '16000',
+            '-c:a',
+            'libmp3lame',
+            '-b:a',
+            '32k',
+            desc.filePath,
+          ];
+          await runFFmpegSpawn(args);
+        }
+        project.completedAudioChunks = i + 1;
+        updateStage(project, 'audio_chunks', {
+          status: 'running',
+          progress: Math.round(((i + 1) / audioPlan.length) * 100),
+          detail: `Extracted audio segment ${i + 1} of ${audioPlan.length} (10s overlap preserved)`,
+        });
+      }
 
-      audioChunkFiles = fs
-        .readdirSync(audioChunksDir)
-        .filter((f) => f.endsWith('.mp3'))
-        .sort()
-        .map((f) => path.join(audioChunksDir, f));
-
-      project.totalAudioChunks = audioChunkFiles.length;
-      project.completedAudioChunks = audioChunkFiles.length;
       updateStage(project, 'audio_chunks', {
         status: 'completed',
         progress: 100,
-        detail: `Extracted ${audioChunkFiles.length} audio chunk${audioChunkFiles.length === 1 ? '' : 's'} for scalable AI processing`,
+        detail: `Extracted ${audioPlan.length} overlapping audio segment${audioPlan.length === 1 ? '' : 's'} for scalable AI transcription`,
       });
-    } else {
-      audioChunkFiles = fs
-        .readdirSync(audioChunksDir)
-        .filter((f) => f.endsWith('.mp3'))
-        .sort()
-        .map((f) => path.join(audioChunksDir, f));
     }
 
-    // STAGE 3: Silence Detection & Keyframe Sampling
+    // STAGE 3: Silence Detection, Scene Cuts & Keyframe Sampling
+    activeStage = 'signal_analysis';
     const signalStage = project.pipelineStages.find((s) => s.key === 'signal_analysis');
     let sampledKeyframes: Array<{ time: number; filePath: string; filename: string }> = [];
     if (!signalStage || signalStage.status !== 'completed') {
       updateStage(project, 'signal_analysis', {
         status: 'running',
         progress: 20,
-        detail: 'Analyzing speech pauses and sampling visual keyframes...',
+        detail: 'Analyzing speech pauses and visual scene changes...',
       });
-      const silences = meta.audioCodec !== 'none' ? await detectSilences(project.sourcePath) : [];
+      const [silences, sceneCuts] = await Promise.all([
+        meta.audioCodec !== 'none' ? detectSilences(project.sourcePath) : Promise.resolve([]),
+        detectSceneChangeTimestamps(project.sourcePath, meta.duration),
+      ]);
       project.silences = silences;
       updateStage(project, 'signal_analysis', {
         status: 'running',
         progress: 65,
-        detail: `Detected ${silences.length} speech pauses · Extracting scene keyframes...`,
+        detail: `Detected ${silences.length} speech pauses · ${sceneCuts.length} scene cuts · Extracting keyframes...`,
       });
-      sampledKeyframes = await extractSampleKeyframes(project.sourcePath, meta.duration, keyframesDir);
+      sampledKeyframes = await extractSampleKeyframes(
+        project.sourcePath,
+        meta.duration,
+        keyframesDir,
+        sceneCuts
+      );
       project.scenes = sampledKeyframes.map((kf) => ({
         time: kf.time,
-        score: 0.5,
+        score: sceneCuts.some((t) => Math.abs(t - kf.time) < 1.5) ? 0.85 : 0.5,
         speakerX: 0.5,
         speakerY: 0.45,
         keyframeUrl: `/media/projects/${projectId}/keyframes/${kf.filename}`,
@@ -445,7 +644,7 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
       updateStage(project, 'signal_analysis', {
         status: 'completed',
         progress: 100,
-        detail: `${silences.length} silence boundaries · ${sampledKeyframes.length} visual keyframes indexed`,
+        detail: `${silences.length} speech pauses · ${sceneCuts.length} scene cuts · ${sampledKeyframes.length} representative frames indexed`,
       });
     } else {
       sampledKeyframes = project.scenes
@@ -457,37 +656,52 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
         .filter((k) => fs.existsSync(k.filePath));
     }
 
-    // STAGE 4: Chunked AI Transcription (resumable per chunk!)
+    // STAGE 4: Chunked AI Transcription (resumable per chunk with overlap deduplication)
+    activeStage = 'transcription';
     const transcriptStage = project.pipelineStages.find((s) => s.key === 'transcription');
-    if (audioChunkFiles.length === 0) {
+    if (audioPlan.length === 0) {
       updateStage(project, 'transcription', {
         status: 'completed',
         progress: 100,
         detail: 'Skipped transcription (no spoken audio track present)',
       });
     } else if (!transcriptStage || transcriptStage.status !== 'completed') {
-      const doneChunks = new Set(project.transcript.map((seg) => seg.chunkIndex));
-      for (let i = 0; i < audioChunkFiles.length; i++) {
+      const doneChunks = new Set<number>();
+      for (let c = 0; c < project.completedTranscriptChunks; c++) {
+        doneChunks.add(c);
+      }
+      for (const seg of project.transcript) {
+        doneChunks.add(seg.chunkIndex);
+      }
+
+      for (let i = 0; i < audioPlan.length; i++) {
         if (doneChunks.has(i)) continue;
-        const pct = Math.round((i / audioChunkFiles.length) * 100);
+        const desc = audioPlan[i];
+        if (!fs.existsSync(desc.filePath) || fs.statSync(desc.filePath).size === 0) {
+          continue;
+        }
+        const pct = Math.round((i / audioPlan.length) * 100);
         updateStage(project, 'transcription', {
           status: 'running',
           progress: Math.max(5, pct),
-          detail: `Transcribing audio chunk ${i + 1} of ${audioChunkFiles.length} with Gemini Speech-to-Text...`,
+          detail: `Transcribing segment ${i + 1} of ${audioPlan.length} with Gemini Speech-to-Text...`,
         });
-        const chunkOffset = i * AUDIO_CHUNK_SECONDS;
-        const chunkDuration = Math.min(AUDIO_CHUNK_SECONDS, Math.max(1, meta.duration - chunkOffset));
         const res = await transcribeAudioChunk({
-          audioPath: audioChunkFiles[i],
+          audioPath: desc.filePath,
           chunkIndex: i,
-          chunkOffsetSeconds: chunkOffset,
-          chunkDurationSeconds: chunkDuration,
+          chunkOffsetSeconds: desc.offsetSeconds,
+          chunkDurationSeconds: desc.durationSeconds,
           language: project.analysisConfig.language,
         });
         if (!project.detectedLanguage && res.detectedLanguage) {
           project.detectedLanguage = res.detectedLanguage;
         }
-        project.transcript = [...project.transcript, ...res.segments].sort((a, b) => a.start - b.start);
+        project.transcript = mergeOverlappingTranscriptSegments(
+          project.transcript,
+          res.segments,
+          i,
+          desc.offsetSeconds
+        );
         project.completedTranscriptChunks = i + 1;
         store.upsertProject(project);
       }
@@ -501,12 +715,13 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
     }
 
     // STAGE 5: Visual Framing & Active Speaker Detection
+    activeStage = 'visual_framing';
     const framingStage = project.pipelineStages.find((s) => s.key === 'visual_framing');
     if (!framingStage || framingStage.status !== 'completed') {
       updateStage(project, 'visual_framing', {
         status: 'running',
         progress: 35,
-        detail: 'Analyzing speaker face coordinates across sampled video frames...',
+        detail: 'Analyzing active speaker coordinates across representative frames...',
       });
       const framingPoints = await analyzeKeyframesForFraming(sampledKeyframes);
       const updatedScenes: SceneMarker[] = project.scenes.map((scene) => {
@@ -530,6 +745,7 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
     }
 
     // STAGE 6: Gemini Semantic Highlight Selection
+    activeStage = 'highlight_selection';
     const highlightStage = project.pipelineStages.find((s) => s.key === 'highlight_selection');
     if (!highlightStage || highlightStage.status !== 'completed') {
       updateStage(project, 'highlight_selection', {
@@ -538,13 +754,30 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
         detail: 'Scoring hooks, story arcs, and educational moments with Gemini...',
       });
 
-      const highlights = await selectHighlightsWithGemini({
+      let highlights = await selectHighlightsWithGemini({
         transcript: project.transcript,
         scenes: project.scenes,
         videoDuration: meta.duration,
         targetDuration: project.analysisConfig.targetClipDuration,
         desiredCount: project.analysisConfig.clipCount,
       });
+
+      // Retry once with relaxed prompt if Gemini returned empty array for valid footage
+      if (highlights.length === 0 && meta.duration >= 3) {
+        highlights = await selectHighlightsWithGemini({
+          transcript: project.transcript,
+          scenes: project.scenes,
+          videoDuration: meta.duration,
+          targetDuration: Math.max(5, Math.min(project.analysisConfig.targetClipDuration, Math.round(meta.duration))),
+          desiredCount: Math.max(1, Math.min(3, project.analysisConfig.clipCount || 3)),
+          customFocusPrompt:
+            'Always return at least 1 strong standalone highlight clip covering the most compelling portion of this video.',
+        });
+      }
+
+      if (highlights.length === 0) {
+        throw new Error('AI highlight selection returned no valid clip intervals. Click Retry Processing to run this stage again.');
+      }
 
       const now = new Date().toISOString();
       const generatedClips: ClipRecord[] = highlights.map((h) => {
@@ -618,11 +851,12 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
       });
     }
 
-    // STAGE 7: Extract real FFmpeg thumbnails for every generated clip
+    // STAGE 7: Extract real FFmpeg thumbnails for every generated clip (per-clip fault tolerant)
+    activeStage = 'clip_thumbnails';
     updateStage(project, 'clip_thumbnails', {
       status: 'running',
       progress: 10,
-      detail: 'Generating frame thumbnails for each highlight clip...',
+      detail: 'Generating frame thumbnails & clip previews...',
     });
     fs.mkdirSync(clipsDir, { recursive: true });
     for (let i = 0; i < project.clips.length; i++) {
@@ -630,32 +864,56 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
       const clipThumbPath = path.join(clipsDir, clip.id, 'thumb.jpg');
       if (!fs.existsSync(clipThumbPath)) {
         const sampleTime = clip.startTime + Math.min(2, clip.duration * 0.25);
-        await extractThumbnail(project.sourcePath, clipThumbPath, sampleTime);
+        try {
+          await extractThumbnail(project.sourcePath, clipThumbPath, sampleTime);
+        } catch (thumbErr) {
+          logBackendError({
+            projectId,
+            uploadId: project.uploadId,
+            jobId,
+            stage: 'clip_thumbnails',
+            httpStatus: 500,
+            error: thumbErr,
+          });
+          if (project.thumbnailUrl) {
+            clip.thumbnailUrl = project.thumbnailUrl;
+          }
+        }
       }
       updateStage(project, 'clip_thumbnails', {
         status: 'running',
         progress: Math.round(((i + 1) / Math.max(1, project.clips.length)) * 100),
-        detail: `Generated thumbnail ${i + 1} of ${project.clips.length}`,
+        detail: `Prepared clip ${i + 1} of ${project.clips.length}`,
       });
     }
 
     updateStage(project, 'clip_thumbnails', {
       status: 'completed',
       progress: 100,
-      detail: `All ${project.clips.length} clips ready for preview, editing, and export`,
+      detail: `All ${project.clips.length} clips ready with captions, motion graphics & export presets`,
     });
 
     project.status = 'ready';
     project.errorMessage = undefined;
+    project.failedStage = undefined;
     store.upsertProject(project);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const safeMessage = logBackendError({
+      projectId,
+      uploadId: project.uploadId,
+      jobId,
+      stage: activeStage,
+      httpStatus: 500,
+      route: 'pipeline:runAnalysisPipeline',
+      error: err,
+    });
     project.status = 'failed';
-    project.errorMessage = message;
+    project.failedStage = activeStage;
+    project.errorMessage = safeMessage;
     for (const s of project.pipelineStages) {
-      if (s.status === 'running') {
+      if (s.status === 'running' || s.key === activeStage) {
         s.status = 'failed';
-        s.detail = message;
+        s.detail = safeMessage;
       }
     }
     store.upsertProject(project);
@@ -746,14 +1004,11 @@ export async function createRealSampleVideoProject(project: ProjectRecord): Prom
   await generateSampleSpokenAudio(wavPath);
 
   // Measure actual WAV duration
-  const { stdout } = await execFileAsync('ffprobe', [
-    '-v',
-    'quiet',
-    '-print_format',
-    'json',
-    '-show_format',
-    wavPath,
-  ]);
+  const { stdout } = await execFileAsync(
+    'ffprobe',
+    ['-v', 'quiet', '-print_format', 'json', '-show_format', wavPath],
+    { maxBuffer: 10 * 1024 * 1024 }
+  );
   const wavDur = Number((JSON.parse(stdout) as { format?: { duration?: string } }).format?.duration || 35);
 
   // Step 2: Render a crisp 1280x720 multi-scene studio presentation video synced to the real spoken WAV
@@ -770,7 +1025,9 @@ export async function createRealSampleVideoProject(project: ProjectRecord): Prom
     `drawtext=font='DejaVu Sans':text='Lesson 3 - Complete Story Arc & Payoff':x=(w-text_w)/2:y=470:fontsize=22:fontcolor=#38BDF8:enable='gte(t,33)'`,
   ].join(',');
 
-  await execFileAsync('ffmpeg', [
+  await runFFmpegSpawn([
+    '-loglevel',
+    'error',
     '-y',
     '-f',
     'lavfi',
@@ -799,6 +1056,7 @@ export async function createRealSampleVideoProject(project: ProjectRecord): Prom
   await extractThumbnail(videoPath, thumbPath, 2);
 
   project.sourcePath = videoPath;
+  project.storageRef = `local://projects/${project.id}/source.mp4`;
   project.sourceUrl = `/media/projects/${project.id}/source.mp4`;
   project.thumbnailUrl = `/media/projects/${project.id}/thumb.jpg`;
   project.fileSize = meta.fileSize;
