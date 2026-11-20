@@ -7,10 +7,16 @@ import type {
   ExportFps,
   ExportResolution,
   FramingMode,
+  HookScoringWeights,
   MotionIntensity,
   SystemCapabilities,
 } from '../../shared/types.ts';
-import { CAPTION_PRESETS, SUPPORTED_LANGUAGES, VISUAL_STYLE_PRESETS } from '../../shared/presets.ts';
+import {
+  CAPTION_PRESETS,
+  DEFAULT_HOOK_SCORING_WEIGHTS,
+  SUPPORTED_LANGUAGES,
+  VISUAL_STYLE_PRESETS,
+} from '../../shared/presets.ts';
 import { formatBytes } from '../lib/format.ts';
 
 interface SettingsPageProps {
@@ -258,6 +264,77 @@ export function SettingsPage({
               <option value={60} className="bg-[#0C1510]">60 FPS</option>
             </select>
           </div>
+        </div>
+      </div>
+
+      {/* Configurable AI Hook Scoring Weights */}
+      <div className="p-6 rounded-xl studio-panel space-y-4">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h2 className="font-display text-sm font-semibold text-white">
+              AI Hook Scoring Rubric Weights
+            </h2>
+            <p className="text-xs text-zinc-400 mt-0.5">
+              Customize how the two-pass AI Hook Engine weights each scoring factor (normalized to 0–100).
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() =>
+              setDraft((d) => ({
+                ...d,
+                hookScoringWeights: { ...DEFAULT_HOOK_SCORING_WEIGHTS },
+              }))
+            }
+            className="text-xs text-[#F5C451] hover:text-[#FEF3C7] whitespace-nowrap"
+          >
+            Reset Defaults (20/15/15/15/15/10/10)
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+          {(
+            [
+              ['openingHook', 'Opening Hook Strength'],
+              ['curiosityInterest', 'Curiosity & Interest'],
+              ['emotionalEngagement', 'Emotional Engagement'],
+              ['infoEntertainment', 'Info / Entertainment'],
+              ['storyCompleteness', 'Story Completeness'],
+              ['standaloneContext', 'Standalone Context'],
+              ['audioVisualQuality', 'Audio & Visual Quality'],
+            ] as Array<[keyof HookScoringWeights, string]>
+          ).map(([key, label]) => {
+            const weights = draft.hookScoringWeights ?? DEFAULT_HOOK_SCORING_WEIGHTS;
+            const val = weights[key];
+            return (
+              <div
+                key={key}
+                className="p-3 rounded-lg bg-[#0C1510] border border-[#D4AF37]/15 space-y-1.5"
+              >
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-zinc-300">{label}</span>
+                  <span className="font-mono font-semibold text-[#F5C451] tabular-nums">{val}</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={40}
+                  step={1}
+                  value={val}
+                  onChange={(e) =>
+                    setDraft((d) => ({
+                      ...d,
+                      hookScoringWeights: {
+                        ...(d.hookScoringWeights ?? DEFAULT_HOOK_SCORING_WEIGHTS),
+                        [key]: Number(e.target.value),
+                      },
+                    }))
+                  }
+                  className="w-full accent-[#10B981]"
+                />
+              </div>
+            );
+          })}
         </div>
       </div>
 

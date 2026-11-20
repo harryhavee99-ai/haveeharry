@@ -685,6 +685,16 @@ export function createDefaultAudioMix(): AudioMixConfig {
   };
 }
 
+export const DEFAULT_HOOK_SCORING_WEIGHTS = {
+  openingHook: 20,
+  curiosityInterest: 15,
+  emotionalEngagement: 15,
+  infoEntertainment: 15,
+  storyCompleteness: 15,
+  standaloneContext: 10,
+  audioVisualQuality: 10,
+} as const;
+
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   defaultLanguage: 'auto',
   defaultClipDuration: 60,
@@ -697,4 +707,5 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   defaultExportResolution: '1080p',
   defaultExportCodec: 'h264',
   defaultExportFps: 30,
+  hookScoringWeights: { ...DEFAULT_HOOK_SCORING_WEIGHTS },
 };

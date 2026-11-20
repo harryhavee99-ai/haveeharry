@@ -18,6 +18,7 @@ import type {
   ColorGradingConfig,
   ExportJob,
   ExportOptions,
+  HookCandidate,
   MotionGraphicsConfig,
   MusicTrack,
   NavPage,
@@ -406,6 +407,23 @@ export default function App() {
     setExportJobs((prev) => [...res.jobs, ...prev]);
   };
 
+  const handleUpdateHookCandidate = async (
+    projectId: string,
+    candidateId: string,
+    patch: Partial<HookCandidate>
+  ) => {
+    const res = await api.updateHookCandidate(projectId, candidateId, patch);
+    setProjects((prev) => prev.map((p) => (p.id === projectId ? res.project : p)));
+  };
+
+  const handleGenerateClipFromHook = async (projectId: string, candidateId: string) => {
+    const res = await api.generateClipFromHook(projectId, candidateId);
+    setProjects((prev) => prev.map((p) => (p.id === projectId ? res.project : p)));
+    if (res.exportJob) {
+      setExportJobs((prev) => [res.exportJob, ...prev]);
+    }
+  };
+
   const handleSaveSettings = async (patch: Partial<AppSettings>) => {
     const updated = await api.updateSettings(patch);
     setSettings(updated);
@@ -677,6 +695,8 @@ export default function App() {
               onDeleteClip={handleDeleteClip}
               onRenderClipDirect={handleExportSingle}
               onRenderAllClips={handleExportBatch}
+              onUpdateHookCandidate={handleUpdateHookCandidate}
+              onGenerateClipFromHook={handleGenerateClipFromHook}
               onNavigate={setActivePage}
             />
           )}

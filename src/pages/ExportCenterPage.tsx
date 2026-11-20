@@ -8,6 +8,7 @@ import {
   AlertCircle,
   FileText,
   UploadCloud,
+  X,
 } from 'lucide-react';
 import type {
   AppSettings,
@@ -20,6 +21,7 @@ import type {
   ProjectRecord,
   SystemCapabilities,
 } from '../../shared/types.ts';
+import { api } from '../lib/api.ts';
 import { formatBytes, formatDurationHuman, formatRelativeDate } from '../lib/format.ts';
 
 interface ExportCenterPageProps {
@@ -38,6 +40,15 @@ interface ExportCenterPageProps {
     options: ExportOptions
   ) => Promise<void>;
   onNavigate: (page: NavPage) => void;
+}
+
+function getExportStageText(job: ExportJob): string {
+  if (job.stage === 'validating_mp4') return 'Validating MP4';
+  if (job.stage === 'saving_storage') return 'Saving to storage';
+  if (job.stage === 'export_ready') return 'Export ready';
+  if (job.stage === 'failed' || job.status === 'failed') return 'Failed';
+  if (job.status === 'queued' || job.stage === 'queued') return 'Queued';
+  return 'Rendering MP4';
 }
 
 export function ExportCenterPage({
@@ -60,6 +71,9 @@ export function ExportCenterPage({
 
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
+  const [downloadingClipId, setDownloadingClipId] = useState<string | null>(null);
+  const [downloadingZip, setDownloadingZip] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
 
   const projectJobs = useMemo(
     () => (project ? exportJobs.filter((j) => j.projectId === project.id) : exportJobs),
@@ -85,7 +99,9 @@ export function ExportCenterPage({
 
   const effectiveSelected =
     selectedIds.length > 0 ? selectedIds : project.clips.map((c) => c.id);
-  const renderedClipsCount = project.clips.filter((c) => c.renderedVideoUrl).length;
+  const renderedClipsCount = project.clips.filter(
+    (c) => c.renderStatus === 'export_ready' || c.renderedVideoUrl
+  ).length;
 
   const toggleSelect = (id: string) => {
     setSelectedIds((prev) =>
@@ -95,11 +111,38 @@ export function ExportCenterPage({
 
   const handleRenderBatch = async () => {
     if (project.clips.length === 0) return;
+    setDownloadError(null);
     setSubmitting(true);
     try {
       await onExportBatch(project.id, effectiveSelected, options);
+    } catch (err) {
+      setDownloadError(err instanceof Error ? err.message : 'Batch export failed.');
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleDownloadClip = async (clipId: string) => {
+    setDownloadError(null);
+    setDownloadingClipId(clipId);
+    try {
+      await api.downloadClipMp4(project.id, clipId);
+    } catch (err) {
+      setDownloadError(err instanceof Error ? err.message : 'MP4 download failed.');
+    } finally {
+      setDownloadingClipId(null);
+    }
+  };
+
+  const handleDownloadZip = async () => {
+    setDownloadError(null);
+    setDownloadingZip(true);
+    try {
+      await api.downloadProjectZip(project.id, project.name);
+    } catch (err) {
+      setDownloadError(err instanceof Error ? err.message : 'ZIP download failed.');
+    } finally {
+      setDownloadingZip(false);
     }
   };
 
@@ -110,20 +153,24 @@ export function ExportCenterPage({
         <div>
           <h1 className="font-display text-2xl font-bold text-white">Export Center</h1>
           <p className="mt-1 text-xs text-zinc-400">
-            {project.name} · Real FFmpeg video encoding with embedded ASS captions, reframing, color grading, and ducked audio.
+            {project.name} · Real FFmpeg MP4 encoding (H.264 / yuv420p / AAC 48kHz / faststart) with automatic FFprobe validation.
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5 shrink-0">
           {renderedClipsCount > 0 && (
-            <a
-              href={`/api/projects/${project.id}/download-zip`}
-              download
-              className="studio-btn-gold inline-flex items-center gap-2 h-10 px-4 rounded-lg text-xs font-semibold whitespace-nowrap"
+            <button
+              onClick={() => void handleDownloadZip()}
+              disabled={downloadingZip}
+              className="studio-btn-gold inline-flex items-center gap-2 h-10 px-4 rounded-lg text-xs font-semibold whitespace-nowrap disabled:opacity-50"
             >
-              <Archive className="w-4 h-4" />
-              Download All as ZIP ({renderedClipsCount})
-            </a>
+              {downloadingZip ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Archive className="w-4 h-4" />
+              )}
+              {downloadingZip ? 'Building ZIP...' : `Download All as ZIP (${renderedClipsCount})`}
+            </button>
           )}
 
           <button
@@ -140,6 +187,18 @@ export function ExportCenterPage({
           </button>
         </div>
       </div>
+
+      {downloadError && (
+        <div className="flex items-center justify-between gap-3 px-4 py-3 rounded-xl bg-red-500/12 border border-red-500/35 text-xs text-red-200">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+            <span>{downloadError}</span>
+          </div>
+          <button onClick={() => setDownloadError(null)} className="p-1 text-red-300 hover:text-white">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Export Encoding Settings */}
       <div className="p-5 rounded-2xl studio-panel grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4">
@@ -248,8 +307,16 @@ export function ExportCenterPage({
           {project.clips.map((clip, idx) => {
             const latestJob = projectJobs.find((j) => j.clipId === clip.id);
             const isRendering =
-              latestJob && (latestJob.status === 'rendering' || latestJob.status === 'queued');
+              (latestJob && (latestJob.status === 'rendering' || latestJob.status === 'queued')) ||
+              clip.renderStatus === 'rendering' ||
+              clip.renderStatus === 'validating' ||
+              clip.renderStatus === 'saving' ||
+              clip.renderStatus === 'queued';
             const isChecked = selectedIds.includes(clip.id);
+            const isReady = Boolean(
+              !isRendering && (clip.renderStatus === 'export_ready' || clip.renderedVideoUrl)
+            );
+            const isDownloading = downloadingClipId === clip.id;
 
             return (
               <div
@@ -277,7 +344,9 @@ export function ExportCenterPage({
                       {String(idx + 1).padStart(2, '0')}. {clip.title}
                     </div>
                     <div className="mt-0.5 text-xs text-zinc-400 font-mono tabular-nums">
-                      {formatDurationHuman(clip.duration)} · {clip.framing.aspectRatio} ·{' '}
+                      {formatDurationHuman(clip.renderedDuration ?? clip.duration)} ·{' '}
+                      {clip.renderedResolution || clip.framing.aspectRatio}
+                      {clip.renderedFileSize ? ` · ${formatBytes(clip.renderedFileSize)}` : ''} ·{' '}
                       {clip.captionStyle.enabled ? clip.captionStyle.presetId : 'No captions'}
                     </div>
                   </div>
@@ -285,17 +354,17 @@ export function ExportCenterPage({
 
                 {/* Progress + Actions */}
                 <div className="flex flex-wrap items-center gap-3 shrink-0">
-                  {isRendering && latestJob && (
-                    <div className="flex items-center gap-2.5 min-w-[160px]">
+                  {isRendering && (
+                    <div className="flex items-center gap-2.5 min-w-[180px]">
                       <Loader2 className="w-4 h-4 text-[#F5C451] animate-spin shrink-0" />
                       <div className="flex-1">
                         <div className="flex justify-between text-[11px] text-[#F5C451] font-mono tabular-nums mb-1">
-                          <span>{latestJob.status === 'queued' ? 'Queued' : 'Encoding'}</span>
-                          <span>{latestJob.progress}%</span>
+                          <span>{latestJob ? getExportStageText(latestJob) : 'Rendering MP4'}</span>
+                          <span>{latestJob?.progress ?? 10}%</span>
                         </div>
                         <div className="h-1.5 rounded-full bg-[#132219] overflow-hidden">
                           <div
-                            style={{ width: `${latestJob.progress}%` }}
+                            style={{ width: `${latestJob?.progress ?? 10}%` }}
                             className="h-full bg-gradient-to-r from-[#059669] via-[#10B981] to-[#D4AF37] transition-[width] duration-200"
                           />
                         </div>
@@ -303,8 +372,11 @@ export function ExportCenterPage({
                     </div>
                   )}
 
-                  {!isRendering && latestJob?.status === 'failed' && (
-                    <span className="inline-flex items-center gap-1 text-xs text-red-400">
+                  {!isRendering && (clip.renderStatus === 'failed' || latestJob?.status === 'failed') && (
+                    <span
+                      title={clip.renderError || latestJob?.error}
+                      className="inline-flex items-center gap-1 text-xs text-red-400"
+                    >
                       <AlertCircle className="w-3.5 h-3.5" />
                       Render failed
                     </span>
@@ -324,18 +396,22 @@ export function ExportCenterPage({
                     disabled={Boolean(isRendering)}
                     className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg bg-[#0E1913] hover:bg-[#14241B] border border-[#D4AF37]/22 text-xs font-medium text-white disabled:opacity-40 whitespace-nowrap"
                   >
-                    {clip.renderedVideoUrl ? 'Re-Render' : 'Render MP4'}
+                    {isReady ? 'Re-Render' : 'Render MP4'}
                   </button>
 
-                  {clip.renderedVideoUrl && (
-                    <a
-                      href={`/api/projects/${project.id}/clips/${clip.id}/download`}
-                      download
-                      className="studio-btn-gold inline-flex items-center gap-1.5 h-8 px-3 rounded-lg text-xs font-semibold whitespace-nowrap"
+                  {isReady && (
+                    <button
+                      onClick={() => void handleDownloadClip(clip.id)}
+                      disabled={isDownloading}
+                      className="studio-btn-gold inline-flex items-center gap-1.5 h-8 px-3 rounded-lg text-xs font-semibold whitespace-nowrap disabled:opacity-50"
                     >
-                      <Download className="w-3.5 h-3.5" />
-                      Download HD MP4
-                    </a>
+                      {isDownloading ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <Download className="w-3.5 h-3.5" />
+                      )}
+                      {isDownloading ? 'Downloading...' : 'Download MP4'}
+                    </button>
                   )}
                 </div>
               </div>
@@ -348,7 +424,7 @@ export function ExportCenterPage({
       {projectJobs.length > 0 && (
         <div className="rounded-xl studio-panel overflow-hidden">
           <div className="px-5 py-3.5 border-b border-[#D4AF37]/12">
-            <h2 className="font-display text-sm font-semibold text-white">FFmpeg Render Queue</h2>
+            <h2 className="font-display text-sm font-semibold text-white">FFmpeg Render & Validation Queue</h2>
           </div>
           <div className="divide-y divide-[#D4AF37]/8">
             {projectJobs.slice(0, 12).map((job) => (
@@ -368,7 +444,9 @@ export function ExportCenterPage({
                   )}
                   <span className="font-medium text-white truncate">{job.clipTitle}</span>
                   <span className="text-zinc-500 font-mono tabular-nums">
-                    {job.options.resolution} · {job.options.codec.toUpperCase()} · {job.options.fps}fps
+                    {getExportStageText(job)} · {job.validationMeta
+                      ? `${job.validationMeta.width}x${job.validationMeta.height} · ${job.validationMeta.videoCodec.toUpperCase()}/${job.validationMeta.audioCodec.toUpperCase()}`
+                      : `${job.options.resolution} · ${job.options.codec.toUpperCase()} · ${job.options.fps}fps`}
                   </span>
                 </div>
 

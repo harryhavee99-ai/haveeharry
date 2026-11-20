@@ -4,7 +4,10 @@ import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import { v4 as uuidv4 } from 'uuid';
 import type {
+  AudioEnergyPoint,
   ClipRecord,
+  ExportOptions,
+  HookCandidate,
   PipelineStageKey,
   PipelineStageState,
   ProjectRecord,
@@ -23,15 +26,21 @@ import { store } from './store.ts';
 import { logBackendError } from './logger.ts';
 import {
   analyzeKeyframesForFraming,
+  computeWeightedHookScore,
+  discoverHookCandidatesWithGemini,
   generateSampleSpokenAudio,
   selectHighlightsWithGemini,
   transcribeAudioChunk,
+  verifyHookCandidatesWithGemini,
+  type RawCriterionRatings,
 } from './gemini.ts';
+import { renderClipWithFFmpeg } from './renderer.ts';
 
 const execFileAsync = promisify(execFile);
 
 const AUDIO_CHUNK_STRIDE_SECONDS = 300; // 5-minute stride -> ~60 compact chunks for a 5-hour video
 const AUDIO_CHUNK_OVERLAP_SECONDS = 10; // 10s overlap prevents cutting words/sentences at chunk boundaries
+const AUTO_RENDER_CLIP_LIMIT = 5; // Auto-render top 5 clips to verified MP4 immediately so downloads work out of the box
 
 export interface AudioChunkDescriptor {
   index: number;
@@ -47,12 +56,29 @@ export function createInitialPipelineStages(): PipelineStageState[] {
   return [
     { key: 'probe', label: 'Preparing & Validating Video', status: 'pending', progress: 0, detail: 'Waiting to validate video file & extract metadata' },
     { key: 'audio_chunks', label: 'Extracting Audio Segments', status: 'pending', progress: 0, detail: 'Splits long audio into overlapping 5-min chunks' },
-    { key: 'signal_analysis', label: 'Scene & Speech Pause Detection', status: 'pending', progress: 0, detail: 'Maps speech pauses, scene cuts, and representative frames' },
+    { key: 'signal_analysis', label: 'Scene, Pause & Audio Energy Analysis', status: 'pending', progress: 0, detail: 'Maps speech pauses, audio energy dynamics, scene cuts & frames' },
     { key: 'transcription', label: 'Transcribing Speech (AI)', status: 'pending', progress: 0, detail: 'Generates verbatim timestamped transcript across segments' },
     { key: 'visual_framing', label: 'Analyzing Visual Framing', status: 'pending', progress: 0, detail: 'Detects active speaker positions for smart reframing' },
-    { key: 'highlight_selection', label: 'Finding Best Moments (AI)', status: 'pending', progress: 0, detail: 'Scores hooks, stories, and standalone highlight arcs' },
-    { key: 'clip_thumbnails', label: 'Generating Clips & Previews', status: 'pending', progress: 0, detail: 'Creates clip metadata, captions, motion presets & thumbnails' },
+    { key: 'hook_discovery', label: 'Finding Interesting Moments (Pass 1)', status: 'pending', progress: 0, detail: 'Scans full transcript & scenes to discover engaging hook candidates' },
+    { key: 'hook_scoring', label: 'Building & Scoring Hook Candidates', status: 'pending', progress: 0, detail: 'Snaps timestamps to sentences, scores 7 criteria (0-100) & deduplicates' },
+    { key: 'hook_verification', label: 'Verifying Timestamps & Context (Pass 2)', status: 'pending', progress: 0, detail: 'Audits opening hooks, complete context & natural endings' },
+    { key: 'clip_generation', label: 'Selecting Final Clips & Previews', status: 'pending', progress: 0, detail: 'Builds approved clips with captions, motion presets & thumbnails' },
+    { key: 'clip_rendering', label: 'Rendering & Validating MP4 Exports', status: 'pending', progress: 0, detail: 'Encodes H.264/AAC MP4s with faststart & FFprobe validation' },
   ];
+}
+
+function ensureModernPipelineStages(project: ProjectRecord): void {
+  const defaults = createInitialPipelineStages();
+  if (!project.pipelineStages || project.pipelineStages.length === 0) {
+    project.pipelineStages = defaults;
+    return;
+  }
+  const existingMap = new Map(project.pipelineStages.map((s) => [s.key, s]));
+  project.pipelineStages = defaults.map((def) => {
+    const prev = existingMap.get(def.key);
+    if (prev) return { ...def, status: prev.status, progress: prev.progress, detail: prev.detail, updatedAt: prev.updatedAt };
+    return def;
+  });
 }
 
 function updateStage(
@@ -356,6 +382,386 @@ async function detectSilences(videoPath: string): Promise<Array<{ start: number;
 }
 
 /**
+ * Fast audio-only (-vn) vocal energy dynamics analyzer using FFmpeg astats metadata per window.
+ * Produces normalized 0..100 energy points across the timeline without ever confusing raw volume with content quality.
+ */
+async function analyzeAudioEnergy(videoPath: string, duration: number): Promise<AudioEnergyPoint[]> {
+  if (duration < 2) return [];
+  const windowSec = duration <= 180 ? 4 : duration <= 1800 ? 10 : 20;
+  return new Promise((resolve) => {
+    const proc = spawn('ffmpeg', [
+      '-hide_banner',
+      '-vn',
+      '-i',
+      videoPath,
+      '-af',
+      `asetnsamples=n=${Math.round(48000 * windowSec)},astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-`,
+      '-f',
+      'null',
+      '-',
+    ]);
+
+    const rmsValues: Array<{ time: number; rmsDb: number }> = [];
+    let currentPts = 0;
+    let remainder = '';
+
+    const timer = setTimeout(() => {
+      try {
+        proc.kill('SIGKILL');
+      } catch {
+        // ignore
+      }
+      resolve(buildNormalizedEnergyPoints(rmsValues, windowSec, duration));
+    }, 15_000);
+
+    const handleChunk = (d: Buffer) => {
+      const text = remainder + d.toString();
+      const lines = text.split('\n');
+      remainder = lines.pop() ?? '';
+      for (const line of lines) {
+        const ptsMatch = line.match(/pts_time:([0-9.]+)/);
+        if (ptsMatch) {
+          currentPts = Number(ptsMatch[1]);
+        }
+        const rmsMatch = line.match(/RMS_level=([-0-9.inf]+)/i);
+        if (rmsMatch) {
+          const val = Number(rmsMatch[1]);
+          const safeDb = Number.isFinite(val) ? Math.max(-70, Math.min(0, val)) : -65;
+          rmsValues.push({ time: currentPts, rmsDb: safeDb });
+        }
+      }
+    };
+
+    proc.stdout.on('data', handleChunk);
+    proc.stderr.on('data', () => {
+      // drain stderr
+    });
+    proc.on('close', () => {
+      clearTimeout(timer);
+      resolve(buildNormalizedEnergyPoints(rmsValues, windowSec, duration));
+    });
+    proc.on('error', () => {
+      clearTimeout(timer);
+      resolve([]);
+    });
+  });
+}
+
+function buildNormalizedEnergyPoints(
+  samples: Array<{ time: number; rmsDb: number }>,
+  windowSec: number,
+  duration: number
+): AudioEnergyPoint[] {
+  if (samples.length === 0) return [];
+  const validDbs = samples.map((s) => s.rmsDb).filter((v) => v > -65);
+  const minDb = validDbs.length ? Math.min(...validDbs) : -50;
+  const maxDb = validDbs.length ? Math.max(...validDbs) : -12;
+  const span = Math.max(6, maxDb - minDb);
+
+  return samples.slice(0, 600).map((s, idx) => {
+    const start = Number(Math.max(0, s.time > 0 ? s.time : idx * windowSec).toFixed(2));
+    const end = Number(Math.min(duration, start + windowSec).toFixed(2));
+    const norm = Math.max(0, Math.min(100, Math.round(((s.rmsDb - minDb) / span) * 100)));
+    return {
+      start,
+      end,
+      rmsDb: Number(s.rmsDb.toFixed(1)),
+      peakDb: Number(Math.min(0, s.rmsDb + 6).toFixed(1)),
+      normalizedEnergy: norm,
+    };
+  });
+}
+
+/**
+ * Snaps raw candidate [startTime, endTime] strictly to real transcript sentence/word boundaries,
+ * trims leading/trailing dead air from detected silences, and extracts verbatim opening/ending dialogue.
+ */
+export function snapBoundsToTranscript(params: {
+  rawStart: number;
+  rawEnd: number;
+  transcript: TranscriptSegment[];
+  silences: Array<{ start: number; end: number }>;
+  audioEnergy?: AudioEnergyPoint[];
+  videoDuration: number;
+}): {
+  startTime: number;
+  endTime: number;
+  openingDialogue: string;
+  endingDialogue: string;
+  transcriptExcerpt: string;
+  silenceRatio: number;
+  audioEnergyScore: number;
+} {
+  const { transcript, silences, audioEnergy, videoDuration } = params;
+  const minClipLen = Math.min(4, Math.max(1.5, videoDuration * 0.35));
+  let start = Math.max(0, Math.min(Math.max(0, videoDuration - minClipLen), Number(params.rawStart) || 0));
+  let end = Math.max(start + minClipLen, Math.min(videoDuration, Number(params.rawEnd) || start + 15));
+
+  if (transcript.length > 0) {
+    // Snap start to the closest transcript segment start (or word start inside a long segment)
+    let bestStartSeg = transcript[0];
+    let bestStartDist = Infinity;
+    for (const seg of transcript) {
+      const dist = Math.abs(seg.start - start);
+      if (dist < bestStartDist) {
+        bestStartDist = dist;
+        bestStartSeg = seg;
+      }
+    }
+    if (bestStartDist <= 4.0) {
+      start = bestStartSeg.start;
+    } else {
+      // Check if rawStart falls cleanly inside a segment with words
+      const containing = transcript.find((s) => start >= s.start && start < s.end);
+      if (containing) {
+        start = containing.start;
+      }
+    }
+
+    // Snap end to the closest transcript segment end so we never cut mid-sentence
+    let bestEndSeg = transcript[transcript.length - 1];
+    let bestEndDist = Infinity;
+    for (const seg of transcript) {
+      if (seg.end <= start + minClipLen * 0.6) continue;
+      const dist = Math.abs(seg.end - end);
+      if (dist < bestEndDist) {
+        bestEndDist = dist;
+        bestEndSeg = seg;
+      }
+    }
+    if (bestEndDist <= 5.0 && bestEndSeg.end > start + minClipLen * 0.6) {
+      end = bestEndSeg.end;
+    } else {
+      const containingEnd = transcript.find((s) => end > s.start && end <= s.end);
+      if (containingEnd && containingEnd.end > start + minClipLen * 0.6) {
+        end = containingEnd.end;
+      }
+    }
+  }
+
+  // Trim leading/trailing pure silence so clips never open or close on dead air
+  for (const sil of silences) {
+    if (sil.start <= start + 0.15 && sil.end > start && sil.end < end - minClipLen) {
+      start = Math.min(end - minClipLen, sil.end);
+    }
+    if (sil.end >= end - 0.15 && sil.start < end && sil.start > start + minClipLen) {
+      end = Math.max(start + minClipLen, sil.start);
+    }
+  }
+
+  start = Number(Math.max(0, Math.min(Math.max(0, videoDuration - minClipLen), start)).toFixed(2));
+  end = Number(Math.max(start + minClipLen, Math.min(videoDuration, end)).toFixed(2));
+  const dur = Math.max(0.5, end - start);
+
+  // Extract verbatim transcript lines inside [start, end]
+  const insideSegs = transcript.filter((s) => s.end > start + 0.1 && s.start < end - 0.1);
+  const openingDialogue = insideSegs[0]?.text.trim() || '';
+  const endingDialogue = insideSegs[insideSegs.length - 1]?.text.trim() || '';
+  const transcriptExcerpt = insideSegs.map((s) => `[${s.start.toFixed(1)}s] ${s.speaker}: ${s.text}`).join('\n');
+
+  // Compute silence ratio inside [start, end]
+  let silenceTotal = 0;
+  for (const sil of silences) {
+    const ov = Math.min(end, sil.end) - Math.max(start, sil.start);
+    if (ov > 0) silenceTotal += ov;
+  }
+  const silenceRatio = Math.max(0, Math.min(1, silenceTotal / dur));
+
+  // Compute audio quality/dynamics score (clear speech + low dead air + healthy dynamic variation)
+  let energyDynamics = 72;
+  if (audioEnergy && audioEnergy.length > 0) {
+    const pts = audioEnergy.filter((p) => p.end >= start && p.start <= end);
+    if (pts.length > 0) {
+      const avg = pts.reduce((acc, p) => acc + p.normalizedEnergy, 0) / pts.length;
+      const variance =
+        pts.reduce((acc, p) => acc + Math.pow(p.normalizedEnergy - avg, 2), 0) / pts.length;
+      const stdDev = Math.sqrt(variance);
+      // Reward clear speech presence (not clipped/flat, not silent) + natural dynamic range
+      const clarityScore = avg < 15 ? 45 : avg > 95 ? 78 : 85;
+      const dynamicBonus = Math.min(15, Math.round(stdDev * 0.6));
+      energyDynamics = Math.max(30, Math.min(100, Math.round(clarityScore + dynamicBonus - silenceRatio * 45)));
+    }
+  } else {
+    energyDynamics = Math.max(35, Math.min(95, Math.round(85 - silenceRatio * 55)));
+  }
+
+  return {
+    startTime: start,
+    endTime: end,
+    openingDialogue,
+    endingDialogue,
+    transcriptExcerpt,
+    silenceRatio,
+    audioEnergyScore: energyDynamics,
+  };
+}
+
+/**
+ * Re-extracts verbatim openingDialogue, endingDialogue, transcriptExcerpt & duration
+ * whenever a user manually adjusts a HookCandidate's start/end timestamps.
+ */
+export function refreshHookCandidateTranscriptFields(
+  project: ProjectRecord,
+  candidate: HookCandidate
+): HookCandidate {
+  const duration = project.metadata?.duration ?? Math.max(candidate.endTime, 10);
+  const snapped = snapBoundsToTranscript({
+    rawStart: candidate.startTime,
+    rawEnd: candidate.endTime,
+    transcript: project.transcript,
+    silences: project.silences,
+    audioEnergy: project.audioEnergy,
+    videoDuration: duration,
+  });
+  // Respect exact user-edited boundaries while updating verbatim transcript excerpts
+  const start = Number(Math.max(0, Math.min(duration - 1, candidate.startTime)).toFixed(2));
+  const end = Number(Math.max(start + 1, Math.min(duration, candidate.endTime)).toFixed(2));
+  const insideSegs = project.transcript.filter((s) => s.end > start + 0.1 && s.start < end - 0.1);
+  return {
+    ...candidate,
+    startTime: start,
+    endTime: end,
+    duration: Number((end - start).toFixed(2)),
+    openingDialogue: insideSegs[0]?.text.trim() || snapped.openingDialogue || candidate.openingDialogue,
+    endingDialogue: insideSegs[insideSegs.length - 1]?.text.trim() || snapped.endingDialogue || candidate.endingDialogue,
+    transcriptExcerpt:
+      insideSegs.length > 0
+        ? insideSegs.map((s) => `[${s.start.toFixed(1)}s] ${s.speaker}: ${s.text}`).join('\n')
+        : snapped.transcriptExcerpt,
+    audioEnergyScore: snapped.audioEnergyScore,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Semantic + Chronological Deduplication:
+ * Prevents duplicate overlapping moments and near-identical topics, ensuring diverse high-scoring candidates.
+ */
+function deduplicateHookCandidates(candidates: HookCandidate[]): HookCandidate[] {
+  const stopWords = new Set([
+    'the', 'and', 'that', 'this', 'with', 'from', 'have', 'your', 'about', 'what', 'when', 'where',
+    'they', 'them', 'just', 'like', 'into', 'over', 'also', 'very', 'more', 'most', 'only', 'then',
+  ]);
+  const tokenize = (text: string): Set<string> => {
+    const words = text
+      .toLowerCase()
+      .replace(/[^a-z0-9\u0600-\u06FF\u0900-\u097F]+/g, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length > 3 && !stopWords.has(w));
+    return new Set(words);
+  };
+  const jaccard = (a: Set<string>, b: Set<string>): number => {
+    if (a.size === 0 || b.size === 0) return 0;
+    let inter = 0;
+    for (const tok of a) {
+      if (b.has(tok)) inter++;
+    }
+    return inter / Math.max(1, a.size + b.size - inter);
+  };
+
+  const sorted = [...candidates].sort((a, b) => b.hookBreakdown.total - a.hookBreakdown.total);
+  const kept: Array<{ cand: HookCandidate; tokens: Set<string> }> = [];
+
+  for (const cand of sorted) {
+    const tokens = tokenize(`${cand.title} ${cand.topic} ${cand.openingDialogue} ${cand.transcriptExcerpt.slice(0, 320)}`);
+    let duplicateReason: string | null = null;
+
+    for (const prev of kept) {
+      const ovStart = Math.max(prev.cand.startTime, cand.startTime);
+      const ovEnd = Math.min(prev.cand.endTime, cand.endTime);
+      const ovDur = Math.max(0, ovEnd - ovStart);
+      const minDur = Math.max(1, Math.min(prev.cand.duration, cand.duration));
+      if (ovDur / minDur > 0.3) {
+        duplicateReason = `Overlaps chronologically with higher-scoring hook "${prev.cand.title}"`;
+        break;
+      }
+      const sim = jaccard(prev.tokens, tokens);
+      if (sim > 0.48) {
+        duplicateReason = `Semantically redundant with "${prev.cand.title}"`;
+        break;
+      }
+    }
+
+    if (!duplicateReason) {
+      kept.push({ cand, tokens });
+    } else {
+      // Keep rejected duplicate visible in Hook Intelligence with explicit reason (never silently lost, never promoted as duplicate clip)
+      cand.status = 'rejected';
+      cand.rejectedReasons = [...(cand.rejectedReasons ?? []), duplicateReason];
+      kept.push({ cand, tokens });
+    }
+  }
+
+  return kept.map((k) => k.cand);
+}
+
+/**
+ * Converts a HookCandidate into a full ClipRecord with framing, captions, grading, and motion presets.
+ */
+export function buildClipFromHookCandidate(project: ProjectRecord, candidate: HookCandidate, existingClipId?: string): ClipRecord {
+  const clipId = existingClipId || candidate.clipId || uuidv4();
+  const now = new Date().toISOString();
+  const localFocalPoints = project.scenes
+    .filter((s) => s.time >= candidate.startTime - 5 && s.time <= candidate.endTime + 5)
+    .map((s) => ({
+      time: Math.max(0, Number((s.time - candidate.startTime).toFixed(2))),
+      x: s.speakerX ?? 0.5,
+      y: s.speakerY ?? 0.45,
+    }));
+
+  const avgX =
+    localFocalPoints.length > 0
+      ? Number((localFocalPoints.reduce((acc, p) => acc + p.x, 0) / localFocalPoints.length).toFixed(3))
+      : 0.5;
+  const avgY =
+    localFocalPoints.length > 0
+      ? Number((localFocalPoints.reduce((acc, p) => acc + p.y, 0) / localFocalPoints.length).toFixed(3))
+      : 0.45;
+
+  const framing = createDefaultFraming(project.analysisConfig.aspectRatio, project.analysisConfig.framingMode);
+  framing.manualX = avgX;
+  framing.manualY = avgY;
+  framing.focalKeyframes = localFocalPoints;
+
+  const motion = createDefaultMotionGraphics(
+    project.analysisConfig.motionIntensity,
+    candidate.hookTitle,
+    candidate.speakerLabel
+  );
+  motion.emphasizedKeywords = candidate.emphasizedKeywords;
+
+  return {
+    id: clipId,
+    projectId: project.id,
+    originalVideoId: project.uploadId ?? project.id,
+    candidateId: candidate.id,
+    title: candidate.title,
+    topic: candidate.topic,
+    openingDialogue: candidate.openingDialogue,
+    endingDialogue: candidate.endingDialogue,
+    description: candidate.description,
+    reasonSelected: candidate.reasonSelected,
+    category: candidate.category,
+    startTime: candidate.startTime,
+    endTime: candidate.endTime,
+    duration: Number((candidate.endTime - candidate.startTime).toFixed(2)),
+    scores: candidate.scores,
+    hookBreakdown: candidate.hookBreakdown,
+    editingStatus: 'auto_generated',
+    renderStatus: 'not_rendered',
+    thumbnailUrl: `/media/projects/${project.id}/clips/${clipId}/thumb.jpg`,
+    framing,
+    captionStyle: getCaptionPreset(project.analysisConfig.captionPresetId),
+    colorGrading: getVisualStylePreset(project.analysisConfig.stylePresetId),
+    motionGraphics: motion,
+    audioMix: createDefaultAudioMix(),
+    textOverlays: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+/**
  * Fast lightweight FFmpeg scene-change detector (for videos <= 10 min) returning up to 12 cut timestamps.
  */
 async function detectSceneChangeTimestamps(videoPath: string, duration: number): Promise<number[]> {
@@ -498,9 +904,7 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
   project.status = 'analyzing';
   project.errorMessage = undefined;
   project.failedStage = undefined;
-  if (!project.pipelineStages || project.pipelineStages.length === 0) {
-    project.pipelineStages = createInitialPipelineStages();
-  }
+  ensureModernPipelineStages(project);
   store.upsertProject(project);
 
   const projectDir = store.getProjectDir(projectId);
@@ -608,7 +1012,7 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
       });
     }
 
-    // STAGE 3: Silence Detection, Scene Cuts & Keyframe Sampling
+    // STAGE 3: Silence Detection, Audio Energy Dynamics, Scene Cuts & Keyframe Sampling
     activeStage = 'signal_analysis';
     const signalStage = project.pipelineStages.find((s) => s.key === 'signal_analysis');
     let sampledKeyframes: Array<{ time: number; filePath: string; filename: string }> = [];
@@ -616,17 +1020,19 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
       updateStage(project, 'signal_analysis', {
         status: 'running',
         progress: 20,
-        detail: 'Analyzing speech pauses and visual scene changes...',
+        detail: 'Analyzing speech pauses, audio vocal energy dynamics, and scene cuts...',
       });
-      const [silences, sceneCuts] = await Promise.all([
+      const [silences, audioEnergy, sceneCuts] = await Promise.all([
         meta.audioCodec !== 'none' ? detectSilences(project.sourcePath) : Promise.resolve([]),
+        meta.audioCodec !== 'none' ? analyzeAudioEnergy(project.sourcePath, meta.duration) : Promise.resolve([]),
         detectSceneChangeTimestamps(project.sourcePath, meta.duration),
       ]);
       project.silences = silences;
+      project.audioEnergy = audioEnergy;
       updateStage(project, 'signal_analysis', {
         status: 'running',
         progress: 65,
-        detail: `Detected ${silences.length} speech pauses · ${sceneCuts.length} scene cuts · Extracting keyframes...`,
+        detail: `Detected ${silences.length} speech pauses · ${audioEnergy.length} energy windows · ${sceneCuts.length} scene cuts · Extracting frames...`,
       });
       sampledKeyframes = await extractSampleKeyframes(
         project.sourcePath,
@@ -644,7 +1050,7 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
       updateStage(project, 'signal_analysis', {
         status: 'completed',
         progress: 100,
-        detail: `${silences.length} speech pauses · ${sceneCuts.length} scene cuts · ${sampledKeyframes.length} representative frames indexed`,
+        detail: `${silences.length} pauses · ${audioEnergy.length} audio energy windows · ${sceneCuts.length} scene cuts · ${sampledKeyframes.length} frames`,
       });
     } else {
       sampledKeyframes = project.scenes
@@ -744,154 +1150,413 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
       });
     }
 
-    // STAGE 6: Gemini Semantic Highlight Selection
-    activeStage = 'highlight_selection';
-    const highlightStage = project.pipelineStages.find((s) => s.key === 'highlight_selection');
-    if (!highlightStage || highlightStage.status !== 'completed') {
-      updateStage(project, 'highlight_selection', {
+    const appSettings = store.getSettings();
+    const scoringWeights = appSettings.hookScoringWeights;
+
+    // STAGE 6: PASS 1 — Finding Interesting Moments (Hook Discovery)
+    activeStage = 'hook_discovery';
+    const discoveryStage = project.pipelineStages.find((s) => s.key === 'hook_discovery');
+    let rawDiscovered: Awaited<ReturnType<typeof discoverHookCandidatesWithGemini>> = [];
+    if (!discoveryStage || discoveryStage.status !== 'completed' || !project.hookCandidates?.length) {
+      updateStage(project, 'hook_discovery', {
         status: 'running',
-        progress: 40,
-        detail: 'Scoring hooks, story arcs, and educational moments with Gemini...',
+        progress: 30,
+        detail: 'Pass 1: Scanning full transcript, audio energy & scenes for strong hooks...',
       });
 
-      let highlights = await selectHighlightsWithGemini({
+      rawDiscovered = await discoverHookCandidatesWithGemini({
         transcript: project.transcript,
         scenes: project.scenes,
+        audioEnergy: project.audioEnergy,
+        silences: project.silences,
         videoDuration: meta.duration,
         targetDuration: project.analysisConfig.targetClipDuration,
         desiredCount: project.analysisConfig.clipCount,
       });
 
-      // Retry once with relaxed prompt if Gemini returned empty array for valid footage
-      if (highlights.length === 0 && meta.duration >= 3) {
-        highlights = await selectHighlightsWithGemini({
+      // Retry once with broader instruction if Pass 1 returned empty on valid video
+      if (rawDiscovered.length === 0 && meta.duration >= 3) {
+        rawDiscovered = await discoverHookCandidatesWithGemini({
           transcript: project.transcript,
           scenes: project.scenes,
+          audioEnergy: project.audioEnergy,
+          silences: project.silences,
           videoDuration: meta.duration,
-          targetDuration: Math.max(5, Math.min(project.analysisConfig.targetClipDuration, Math.round(meta.duration))),
+          targetDuration: Math.max(6, Math.min(project.analysisConfig.targetClipDuration, Math.round(meta.duration * 0.5))),
           desiredCount: Math.max(1, Math.min(3, project.analysisConfig.clipCount || 3)),
           customFocusPrompt:
-            'Always return at least 1 strong standalone highlight clip covering the most compelling portion of this video.',
+            'Identify at least 1 strong standalone highlight moment covering the clearest insight or narrative arc in this footage.',
         });
       }
 
-      if (highlights.length === 0) {
-        throw new Error('AI highlight selection returned no valid clip intervals. Click Retry Processing to run this stage again.');
+      if (rawDiscovered.length === 0) {
+        throw new Error('Pass 1 Hook Discovery could not identify any valid highlight intervals. Click Retry Processing to run again.');
       }
 
+      updateStage(project, 'hook_discovery', {
+        status: 'completed',
+        progress: 100,
+        detail: `Discovered ${rawDiscovered.length} candidate engaging moments across the video`,
+      });
+    }
+
+    // STAGE 7: Building Hook Candidates, Grounded Transcript Snapping, 7-Criterion Scoring & Deduplication
+    activeStage = 'hook_scoring';
+    const scoringStage = project.pipelineStages.find((s) => s.key === 'hook_scoring');
+    const rawRatingsByCandidateId = new Map<string, RawCriterionRatings>();
+    const silenceRatioByCandidateId = new Map<string, number>();
+
+    if (!scoringStage || scoringStage.status !== 'completed' || rawDiscovered.length > 0) {
+      updateStage(project, 'hook_scoring', {
+        status: 'running',
+        progress: 35,
+        detail: 'Snapping candidate timestamps to sentence boundaries & scoring 7 hook criteria (0-100)...',
+      });
+
       const now = new Date().toISOString();
-      const generatedClips: ClipRecord[] = highlights.map((h) => {
-        const clipId = uuidv4();
-        // Gather focal keyframes inside this clip window
-        const localFocalPoints = project.scenes
-          .filter((s) => s.time >= h.startTime - 5 && s.time <= h.endTime + 5)
-          .map((s) => ({
-            time: Math.max(0, Number((s.time - h.startTime).toFixed(2))),
-            x: s.speakerX ?? 0.5,
-            y: s.speakerY ?? 0.45,
-          }));
-
-        const avgX =
-          localFocalPoints.length > 0
-            ? Number(
-                (localFocalPoints.reduce((acc, p) => acc + p.x, 0) / localFocalPoints.length).toFixed(3)
-              )
-            : 0.5;
-        const avgY =
-          localFocalPoints.length > 0
-            ? Number(
-                (localFocalPoints.reduce((acc, p) => acc + p.y, 0) / localFocalPoints.length).toFixed(3)
-              )
-            : 0.45;
-
-        const framing = createDefaultFraming(
-          project.analysisConfig.aspectRatio,
-          project.analysisConfig.framingMode
+      const builtCandidates: HookCandidate[] = rawDiscovered.map((raw) => {
+        const snapped = snapBoundsToTranscript({
+          rawStart: raw.startTime,
+          rawEnd: raw.endTime,
+          transcript: project.transcript,
+          silences: project.silences,
+          audioEnergy: project.audioEnergy,
+          videoDuration: meta.duration,
+        });
+        const { hookBreakdown, legacyScores } = computeWeightedHookScore(
+          raw.rawRatings,
+          scoringWeights,
+          snapped.audioEnergyScore
         );
-        framing.manualX = avgX;
-        framing.manualY = avgY;
-        framing.focalKeyframes = localFocalPoints;
-
-        const motion = createDefaultMotionGraphics(
-          project.analysisConfig.motionIntensity,
-          h.hookTitle,
-          h.speakerLabel
-        );
-        motion.emphasizedKeywords = h.emphasizedKeywords;
+        const candId = uuidv4();
+        rawRatingsByCandidateId.set(candId, raw.rawRatings);
+        silenceRatioByCandidateId.set(candId, snapped.silenceRatio);
 
         return {
-          id: clipId,
+          id: candId,
           projectId,
-          title: h.title,
-          description: h.description,
-          reasonSelected: h.reasonSelected,
-          category: h.category,
-          startTime: h.startTime,
-          endTime: h.endTime,
-          duration: Number((h.endTime - h.startTime).toFixed(2)),
-          scores: h.scores,
-          editingStatus: 'auto_generated',
-          thumbnailUrl: `/media/projects/${projectId}/clips/${clipId}/thumb.jpg`,
-          framing,
-          captionStyle: getCaptionPreset(project.analysisConfig.captionPresetId),
-          colorGrading: getVisualStylePreset(project.analysisConfig.stylePresetId),
-          motionGraphics: motion,
-          audioMix: createDefaultAudioMix(),
-          textOverlays: [],
+          title: raw.title,
+          topic: raw.topic,
+          openingDialogue: snapped.openingDialogue || raw.openingDialogue,
+          endingDialogue: snapped.endingDialogue,
+          transcriptExcerpt: snapped.transcriptExcerpt,
+          startTime: snapped.startTime,
+          endTime: snapped.endTime,
+          duration: Number((snapped.endTime - snapped.startTime).toFixed(2)),
+          description: raw.description,
+          reasonSelected: raw.reasonSelected,
+          category: raw.category,
+          hookTitle: raw.hookTitle,
+          speakerLabel: raw.speakerLabel,
+          emphasizedKeywords: raw.emphasizedKeywords,
+          scores: legacyScores,
+          hookBreakdown,
+          audioEnergyScore: snapped.audioEnergyScore,
+          status: 'discovered',
           createdAt: now,
           updatedAt: now,
         };
       });
 
-      project.clips = generatedClips;
-      updateStage(project, 'highlight_selection', {
+      project.hookCandidates = deduplicateHookCandidates(builtCandidates);
+      const uniqueActiveCount = project.hookCandidates.filter((c) => c.status !== 'rejected').length;
+      updateStage(project, 'hook_scoring', {
         status: 'completed',
         progress: 100,
-        detail: `Selected ${generatedClips.length} standalone highlight clip${generatedClips.length === 1 ? '' : 's'}`,
+        detail: `Scored ${project.hookCandidates.length} candidates (${uniqueActiveCount} unique non-overlapping hooks)`,
       });
     }
 
-    // STAGE 7: Extract real FFmpeg thumbnails for every generated clip (per-clip fault tolerant)
-    activeStage = 'clip_thumbnails';
-    updateStage(project, 'clip_thumbnails', {
-      status: 'running',
-      progress: 10,
-      detail: 'Generating frame thumbnails & clip previews...',
-    });
-    fs.mkdirSync(clipsDir, { recursive: true });
-    for (let i = 0; i < project.clips.length; i++) {
-      const clip = project.clips[i];
-      const clipThumbPath = path.join(clipsDir, clip.id, 'thumb.jpg');
-      if (!fs.existsSync(clipThumbPath)) {
-        const sampleTime = clip.startTime + Math.min(2, clip.duration * 0.25);
+    // STAGE 8: PASS 2 — Verifying Timestamps, Opening Hooks, Standalone Context & Natural Endings
+    activeStage = 'hook_verification';
+    const verifyStage = project.pipelineStages.find((s) => s.key === 'hook_verification');
+    if (!verifyStage || verifyStage.status !== 'completed') {
+      const candidatesToVerify = (project.hookCandidates ?? []).filter((c) => c.status !== 'rejected');
+      updateStage(project, 'hook_verification', {
+        status: 'running',
+        progress: 30,
+        detail: `Pass 2: Auditing ${candidatesToVerify.length} candidates against surrounding transcript context...`,
+      });
+
+      if (candidatesToVerify.length > 0 && project.transcript.length > 0) {
+        const verificationPayload = candidatesToVerify.map((cand, idx) => {
+          const surroundingSegs = project.transcript.filter(
+            (seg) => seg.end >= cand.startTime - 18 && seg.start <= cand.endTime + 18
+          );
+          const surroundingTranscript = surroundingSegs
+            .map((s) => `[${s.start.toFixed(2)}s - ${s.end.toFixed(2)}s] (${s.speaker}): ${s.text}`)
+            .join('\n');
+
+          return {
+            index: idx,
+            title: cand.title,
+            topic: cand.topic,
+            startTime: cand.startTime,
+            endTime: cand.endTime,
+            openingDialogue: cand.openingDialogue,
+            endingDialogue: cand.endingDialogue,
+            surroundingTranscript,
+            silenceRatio: silenceRatioByCandidateId.get(cand.id) ?? 0.05,
+            audioEnergyScore: cand.audioEnergyScore,
+            rawRatings: rawRatingsByCandidateId.get(cand.id) ?? {
+              openingHook: cand.scores.hookStrength,
+              curiosityInterest: cand.scores.engagement,
+              emotionalEngagement: cand.scores.emotionalImpact,
+              infoEntertainment: cand.scores.informationValue,
+              storyCompleteness: cand.scores.storyCompleteness,
+              standaloneContext: 75,
+              audioVisualQuality: cand.audioEnergyScore,
+              surprisingScore: cand.hookBreakdown.surprisingScore,
+              storytellingScore: cand.hookBreakdown.storytellingScore,
+              entertainingScore: cand.hookBreakdown.entertainingScore,
+              informativeScore: cand.hookBreakdown.informativeScore,
+              emotionalScore: cand.hookBreakdown.emotionalScore,
+            },
+          };
+        });
+
+        const verifiedResults = await verifyHookCandidatesWithGemini({
+          candidates: verificationPayload,
+          videoDuration: meta.duration,
+          targetDuration: project.analysisConfig.targetClipDuration,
+        });
+
+        const resultMap = new Map(verifiedResults.map((r) => [r.candidateIndex, r]));
+        for (let idx = 0; idx < candidatesToVerify.length; idx++) {
+          const cand = candidatesToVerify[idx];
+          const res = resultMap.get(idx);
+          if (!res) {
+            cand.status = 'verified';
+            cand.verificationNotes = 'Transcript boundaries and opening dialogue verified.';
+            continue;
+          }
+
+          // Re-snap refined Pass 2 timestamps to exact transcript boundaries
+          const reSnapped = snapBoundsToTranscript({
+            rawStart: res.refinedStartTime,
+            rawEnd: res.refinedEndTime,
+            transcript: project.transcript,
+            silences: project.silences,
+            audioEnergy: project.audioEnergy,
+            videoDuration: meta.duration,
+          });
+          const { hookBreakdown, legacyScores } = computeWeightedHookScore(
+            res.rawRatings,
+            scoringWeights,
+            reSnapped.audioEnergyScore
+          );
+
+          cand.startTime = reSnapped.startTime;
+          cand.endTime = reSnapped.endTime;
+          cand.duration = Number((reSnapped.endTime - reSnapped.startTime).toFixed(2));
+          cand.openingDialogue = reSnapped.openingDialogue || cand.openingDialogue;
+          cand.endingDialogue = reSnapped.endingDialogue || cand.endingDialogue;
+          cand.transcriptExcerpt = reSnapped.transcriptExcerpt || cand.transcriptExcerpt;
+          cand.audioEnergyScore = reSnapped.audioEnergyScore;
+          cand.hookBreakdown = hookBreakdown;
+          cand.scores = legacyScores;
+          cand.verificationNotes = res.verificationNotes;
+          if (res.approved) {
+            cand.status = 'verified';
+          } else {
+            cand.status = 'rejected';
+            cand.rejectedReasons = res.rejectedReasons?.length
+              ? res.rejectedReasons
+              : ['Did not pass Pass 2 context & hook completeness audit'];
+          }
+          cand.updatedAt = new Date().toISOString();
+        }
+      } else {
+        for (const cand of candidatesToVerify) {
+          cand.status = 'verified';
+          cand.verificationNotes = 'Verified against video scene boundaries.';
+        }
+      }
+
+      // Final dedupe pass after Pass 2 boundary adjustments
+      if (project.hookCandidates) {
+        project.hookCandidates.sort((a, b) => b.hookBreakdown.total - a.hookBreakdown.total);
+      }
+      const verifiedCount = (project.hookCandidates ?? []).filter((c) => c.status === 'verified' || c.status === 'approved').length;
+      const rejectedCount = (project.hookCandidates ?? []).filter((c) => c.status === 'rejected').length;
+
+      updateStage(project, 'hook_verification', {
+        status: 'completed',
+        progress: 100,
+        detail: `${verifiedCount} hooks verified · ${rejectedCount} filtered out by Pass 2 quality audit`,
+      });
+    }
+
+    // STAGE 9: Selecting Final Clips & Generating Thumbnails
+    activeStage = 'clip_generation';
+    const clipGenStage = project.pipelineStages.find((s) => s.key === 'clip_generation');
+    if (!clipGenStage || clipGenStage.status !== 'completed') {
+      updateStage(project, 'clip_generation', {
+        status: 'running',
+        progress: 20,
+        detail: 'Selecting top verified hooks and generating clip previews...',
+      });
+
+      const allCandidates = project.hookCandidates ?? [];
+      let approvedPool = allCandidates
+        .filter((c) => c.status === 'verified' || c.status === 'approved' || c.status === 'generated')
+        .sort((a, b) => b.hookBreakdown.total - a.hookBreakdown.total);
+
+      // If Pass 2 rejected everything on a tricky clip, rescue the single highest-scored candidate with a clear note
+      let selectionNote: string | undefined;
+      if (approvedPool.length === 0 && allCandidates.length > 0) {
+        const topFallback = [...allCandidates].sort((a, b) => b.hookBreakdown.total - a.hookBreakdown.total)[0];
+        topFallback.status = 'verified';
+        approvedPool = [topFallback];
+        selectionNote =
+          'Few moments matched all strict hook criteria for the requested duration; the strongest available moment was selected. Review all candidates in Hook Intelligence.';
+      }
+
+      const desiredLimit =
+        project.analysisConfig.clipCount === 0
+          ? Math.min(30, approvedPool.length)
+          : Math.min(project.analysisConfig.clipCount, approvedPool.length);
+
+      if (
+        !selectionNote &&
+        project.analysisConfig.clipCount > 0 &&
+        approvedPool.length < project.analysisConfig.clipCount
+      ) {
+        selectionNote = `Found ${approvedPool.length} high-quality verified hook${approvedPool.length === 1 ? '' : 's'} matching your ${project.analysisConfig.targetClipDuration}s target (requested ${project.analysisConfig.clipCount}). Inspect or approve additional moments in Hook Intelligence.`;
+      }
+      project.hookSelectionNote = selectionNote;
+
+      // Enforce zero chronological overlap in the final chosen clip list
+      const selectedCandidates: HookCandidate[] = [];
+      for (const cand of approvedPool) {
+        if (selectedCandidates.length >= desiredLimit) break;
+        const overlaps = selectedCandidates.some((ex) => {
+          const ov = Math.min(ex.endTime, cand.endTime) - Math.max(ex.startTime, cand.startTime);
+          const minD = Math.max(1, Math.min(ex.duration, cand.duration));
+          return ov / minD > 0.25;
+        });
+        if (!overlaps) {
+          selectedCandidates.push(cand);
+        }
+      }
+
+      const generatedClips: ClipRecord[] = selectedCandidates.map((cand) => {
+        const clip = buildClipFromHookCandidate(project, cand);
+        cand.clipId = clip.id;
+        cand.status = 'generated';
+        return clip;
+      });
+
+      project.clips = generatedClips;
+      fs.mkdirSync(clipsDir, { recursive: true });
+      for (let i = 0; i < project.clips.length; i++) {
+        const clip = project.clips[i];
+        const clipThumbPath = path.join(clipsDir, clip.id, 'thumb.jpg');
+        if (!fs.existsSync(clipThumbPath)) {
+          const sampleTime = clip.startTime + Math.min(2, clip.duration * 0.25);
+          try {
+            await extractThumbnail(project.sourcePath, clipThumbPath, sampleTime);
+          } catch (thumbErr) {
+            logBackendError({
+              projectId,
+              uploadId: project.uploadId,
+              jobId,
+              stage: 'clip_generation',
+              httpStatus: 500,
+              error: thumbErr,
+            });
+            if (project.thumbnailUrl) {
+              clip.thumbnailUrl = project.thumbnailUrl;
+            }
+          }
+        }
+        updateStage(project, 'clip_generation', {
+          status: 'running',
+          progress: Math.round(((i + 1) / Math.max(1, project.clips.length)) * 100),
+          detail: `Prepared clip ${i + 1} of ${project.clips.length} (${clip.title})`,
+        });
+      }
+
+      updateStage(project, 'clip_generation', {
+        status: 'completed',
+        progress: 100,
+        detail: `Selected ${project.clips.length} verified clip${project.clips.length === 1 ? '' : 's'} with captions & thumbnails`,
+      });
+    }
+
+    // STAGE 10: Rendering & FFprobe-Validating Real Downloadable MP4 Files
+    activeStage = 'clip_rendering';
+    const renderStage = project.pipelineStages.find((s) => s.key === 'clip_rendering');
+    if (!renderStage || renderStage.status !== 'completed') {
+      const autoRenderTargets = project.clips.slice(0, AUTO_RENDER_CLIP_LIMIT);
+      const exportDefaults: ExportOptions = {
+        resolution: appSettings.defaultExportResolution === '4k' ? '1080p' : appSettings.defaultExportResolution,
+        codec: 'h264',
+        fps: appSettings.defaultExportFps || 30,
+        quality: 'standard',
+        embedCaptions: true,
+        includeMusic: true,
+      };
+
+      updateStage(project, 'clip_rendering', {
+        status: 'running',
+        progress: 5,
+        detail: `Rendering & validating ${autoRenderTargets.length} playable MP4 file${autoRenderTargets.length === 1 ? '' : 's'} (H.264 / AAC 48kHz / faststart)...`,
+      });
+
+      let readyCount = 0;
+      for (let i = 0; i < autoRenderTargets.length; i++) {
+        const clip = autoRenderTargets[i];
+        const latestProj = store.getProject(projectId) ?? project;
+        const latestClip = latestProj.clips.find((c) => c.id === clip.id) ?? clip;
+
+        if (latestClip.renderStatus === 'export_ready' && latestClip.renderedVideoUrl) {
+          readyCount++;
+          continue;
+        }
+
+        updateStage(project, 'clip_rendering', {
+          status: 'running',
+          progress: Math.max(8, Math.round((i / Math.max(1, autoRenderTargets.length)) * 100)),
+          detail: `Rendering & FFprobe-validating MP4 ${i + 1} of ${autoRenderTargets.length}: "${clip.title}"...`,
+        });
+
         try {
-          await extractThumbnail(project.sourcePath, clipThumbPath, sampleTime);
-        } catch (thumbErr) {
+          await renderClipWithFFmpeg({
+            project: latestProj,
+            clip: latestClip,
+            options: exportDefaults,
+          });
+          readyCount++;
+        } catch (renderErr) {
+          // Record exact error on the clip via renderClipWithFFmpeg, continue remaining clips
           logBackendError({
             projectId,
             uploadId: project.uploadId,
             jobId,
-            stage: 'clip_thumbnails',
+            stage: 'clip_rendering',
             httpStatus: 500,
-            error: thumbErr,
+            error: renderErr,
           });
-          if (project.thumbnailUrl) {
-            clip.thumbnailUrl = project.thumbnailUrl;
-          }
+        }
+
+        // Refresh in-memory project reference so renderedVideoUrl & metadata stay synced
+        const synced = store.getProject(projectId);
+        if (synced) {
+          project.clips = synced.clips;
         }
       }
-      updateStage(project, 'clip_thumbnails', {
-        status: 'running',
-        progress: Math.round(((i + 1) / Math.max(1, project.clips.length)) * 100),
-        detail: `Prepared clip ${i + 1} of ${project.clips.length}`,
+
+      const remaining = Math.max(0, project.clips.length - autoRenderTargets.length);
+      updateStage(project, 'clip_rendering', {
+        status: 'completed',
+        progress: 100,
+        detail:
+          remaining > 0
+            ? `${readyCount} verified MP4s export-ready · ${remaining} additional clips ready for on-demand render`
+            : `${readyCount} of ${autoRenderTargets.length} verified MP4 clips export-ready for instant download`,
       });
     }
-
-    updateStage(project, 'clip_thumbnails', {
-      status: 'completed',
-      progress: 100,
-      detail: `All ${project.clips.length} clips ready with captions, motion graphics & export presets`,
-    });
 
     project.status = 'ready';
     project.errorMessage = undefined;
@@ -960,19 +1625,38 @@ export async function regenerateSingleClip(params: {
   }
 
   const h = highlights[0];
+  const snapped = snapBoundsToTranscript({
+    rawStart: h.startTime,
+    rawEnd: h.endTime,
+    transcript: project.transcript,
+    silences: project.silences,
+    audioEnergy: project.audioEnergy,
+    videoDuration: project.metadata.duration,
+  });
   const old = project.clips[existingIdx];
   const updated: ClipRecord = {
     ...old,
     title: h.title,
+    topic: h.topic ?? old.topic,
+    openingDialogue: snapped.openingDialogue || old.openingDialogue,
+    endingDialogue: snapped.endingDialogue || old.endingDialogue,
     description: h.description,
     reasonSelected: h.reasonSelected,
     category: h.category,
-    startTime: h.startTime,
-    endTime: h.endTime,
-    duration: Number((h.endTime - h.startTime).toFixed(2)),
+    startTime: snapped.startTime,
+    endTime: snapped.endTime,
+    duration: Number((snapped.endTime - snapped.startTime).toFixed(2)),
     scores: h.scores,
     editingStatus: 'auto_generated',
+    renderStatus: 'not_rendered',
+    renderStageDetail: undefined,
+    renderError: undefined,
     renderedVideoUrl: undefined,
+    storageObjectPath: undefined,
+    mp4Filename: undefined,
+    renderedFileSize: undefined,
+    renderedDuration: undefined,
+    renderedResolution: undefined,
     motionGraphics: {
       ...old.motionGraphics,
       hookTitleText: h.hookTitle,

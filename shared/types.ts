@@ -31,6 +31,12 @@ export type PipelineStageKey =
   | 'signal_analysis'
   | 'transcription'
   | 'visual_framing'
+  | 'hook_discovery'
+  | 'hook_scoring'
+  | 'hook_verification'
+  | 'clip_generation'
+  | 'clip_rendering'
+  // Legacy keys kept for backward compatibility with existing saved projects in data/db.json
   | 'highlight_selection'
   | 'clip_thumbnails';
 
@@ -41,6 +47,76 @@ export interface PipelineStageState {
   progress: number;
   detail: string;
   updatedAt?: string;
+}
+
+export interface AudioEnergyPoint {
+  start: number;
+  end: number;
+  rmsDb: number; // e.g. -60..0 dB
+  peakDb: number;
+  normalizedEnergy: number; // 0..100 relative energy
+}
+
+export interface HookScoringWeights {
+  openingHook: number; // default 20
+  curiosityInterest: number; // default 15
+  emotionalEngagement: number; // default 15
+  infoEntertainment: number; // default 15
+  storyCompleteness: number; // default 15
+  standaloneContext: number; // default 10
+  audioVisualQuality: number; // default 10
+}
+
+export interface HookScoreBreakdown {
+  total: number; // 0..100 weighted total
+  openingHook: number; // 0..20 (or scaled to weight)
+  curiosityInterest: number; // 0..15
+  emotionalEngagement: number; // 0..15
+  infoEntertainment: number; // 0..15
+  storyCompleteness: number; // 0..15
+  standaloneContext: number; // 0..10
+  audioVisualQuality: number; // 0..10
+  // Auxiliary 0..100 sort dimensions for Hook Intelligence views
+  surprisingScore: number;
+  storytellingScore: number;
+  entertainingScore: number;
+  informativeScore: number;
+  emotionalScore: number;
+}
+
+export type HookCandidateStatus =
+  | 'discovered'
+  | 'verified'
+  | 'approved'
+  | 'rejected'
+  | 'generated';
+
+export interface HookCandidate {
+  id: string;
+  projectId: string;
+  title: string;
+  topic: string;
+  openingDialogue: string;
+  endingDialogue: string;
+  transcriptExcerpt: string;
+  startTime: number;
+  endTime: number;
+  duration: number;
+  description: string;
+  reasonSelected: string;
+  verificationNotes?: string;
+  rejectedReasons?: string[];
+  category: ClipCategory;
+  hookTitle: string;
+  speakerLabel: string;
+  emphasizedKeywords: string[];
+  scores: ClipScoreBreakdown;
+  hookBreakdown: HookScoreBreakdown;
+  audioEnergyScore: number;
+  status: HookCandidateStatus;
+  clipId?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface WordTiming {
@@ -174,10 +250,24 @@ export interface ClipScoreBreakdown {
   storyCompleteness: number;
 }
 
+export type ClipRenderStatus =
+  | 'not_rendered'
+  | 'queued'
+  | 'rendering'
+  | 'validating'
+  | 'saving'
+  | 'export_ready'
+  | 'failed';
+
 export interface ClipRecord {
   id: string;
   projectId: string;
+  originalVideoId?: string;
+  candidateId?: string;
   title: string;
+  topic?: string;
+  openingDialogue?: string;
+  endingDialogue?: string;
   description: string;
   reasonSelected: string;
   category: ClipCategory;
@@ -185,9 +275,18 @@ export interface ClipRecord {
   endTime: number;
   duration: number;
   scores: ClipScoreBreakdown;
+  hookBreakdown?: HookScoreBreakdown;
   editingStatus: 'auto_generated' | 'edited' | 'rendered';
+  renderStatus?: ClipRenderStatus;
+  renderStageDetail?: string;
+  renderError?: string;
   thumbnailUrl: string;
   renderedVideoUrl?: string;
+  storageObjectPath?: string;
+  mp4Filename?: string;
+  renderedFileSize?: number;
+  renderedDuration?: number;
+  renderedResolution?: string;
   renderedAt?: string;
   lastExportConfig?: ExportOptions;
   framing: FramingConfig;
@@ -250,8 +349,11 @@ export interface ProjectRecord {
   completedTranscriptChunks: number;
   transcript: TranscriptSegment[];
   silences: Array<{ start: number; end: number }>;
+  audioEnergy?: AudioEnergyPoint[];
   scenes: SceneMarker[];
   detectedLanguage?: string;
+  hookCandidates?: HookCandidate[];
+  hookSelectionNote?: string;
   clips: ClipRecord[];
   createdAt: string;
   updatedAt: string;
@@ -266,16 +368,39 @@ export interface ExportOptions {
   includeMusic: boolean;
 }
 
+export type ExportStage =
+  | 'queued'
+  | 'rendering_mp4'
+  | 'validating_mp4'
+  | 'saving_storage'
+  | 'export_ready'
+  | 'failed';
+
+export interface Mp4ValidationMeta {
+  container: string;
+  videoCodec: string;
+  audioCodec: string;
+  width: number;
+  height: number;
+  duration: number;
+  fileSize: number;
+}
+
 export interface ExportJob {
   id: string;
   projectId: string;
   clipId: string;
   clipTitle: string;
   status: 'queued' | 'rendering' | 'completed' | 'failed';
+  stage?: ExportStage;
+  stageDetail?: string;
   progress: number;
   options: ExportOptions;
   outputUrl?: string;
+  storageObjectPath?: string;
+  mp4Filename?: string;
   fileSize?: number;
+  validationMeta?: Mp4ValidationMeta;
   error?: string;
   createdAt: string;
   completedAt?: string;
@@ -303,6 +428,7 @@ export interface AppSettings {
   defaultExportResolution: ExportResolution;
   defaultExportCodec: ExportCodec;
   defaultExportFps: ExportFps;
+  hookScoringWeights?: HookScoringWeights;
 }
 
 export interface SystemCapabilities {

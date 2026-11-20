@@ -1,8 +1,11 @@
 import fs from 'fs';
 import path from 'path';
-import { spawn } from 'child_process';
+import { execFile, spawn } from 'child_process';
+import { promisify } from 'util';
 import { createRequire } from 'module';
 import { v4 as uuidv4 } from 'uuid';
+
+const execFileAsync = promisify(execFile);
 
 const require = createRequire(import.meta.url);
 const archiver = require('archiver') as (
@@ -18,15 +21,149 @@ import type {
   AspectRatio,
   CaptionStyleConfig,
   ClipRecord,
+  ClipRenderStatus,
   ExportJob,
   ExportOptions,
   ExportResolution,
+  Mp4ValidationMeta,
   ProjectRecord,
   TranscriptSegment,
   WordTiming,
 } from '../shared/types.ts';
 import { store } from './store.ts';
+import { logBackendError } from './logger.ts';
 import { getMusicTrackPath, getSfxPath } from './music.ts';
+
+/**
+ * Resolves the persistent on-disk path of a clip's rendered MP4 file safely.
+ */
+export function resolveClipMp4Path(project: ProjectRecord, clip: ClipRecord): string | null {
+  const clipDir = path.join(store.getProjectDir(project.id), 'clips', clip.id);
+  const candidateName =
+    clip.mp4Filename ||
+    (clip.renderedVideoUrl ? path.basename(clip.renderedVideoUrl.split('?')[0]) : '');
+  if (!candidateName) return null;
+  const fullPath = path.join(clipDir, path.basename(candidateName));
+  return fullPath;
+}
+
+/**
+ * Builds a clean, filesystem- and browser-safe MP4 download filename.
+ */
+export function buildClipDownloadFilename(clip: ClipRecord): string {
+  const safeTitle =
+    clip.title
+      .replace(/[^a-zA-Z0-9-_ ]/g, '')
+      .trim()
+      .replace(/\s+/g, '_')
+      .slice(0, 60) || 'ClipGenius_Clip';
+  const resTag = clip.lastExportConfig?.resolution ?? '1080p';
+  return `${safeTitle}_${resTag}.mp4`;
+}
+
+/**
+ * Strictly validates a rendered MP4 file with FFprobe before allowing it to be marked Export Ready.
+ * Checks file existence, non-zero byte size, MP4 container, valid video stream, valid audio stream (when expected),
+ * valid duration, and valid resolution.
+ */
+export async function validateRenderedMp4WithFFprobe(
+  filePath: string,
+  expectAudio: boolean
+): Promise<Mp4ValidationMeta> {
+  if (!fs.existsSync(filePath)) {
+    throw new Error('Rendered MP4 validation failed: output file does not exist on disk.');
+  }
+  const stat = fs.statSync(filePath);
+  if (stat.size <= 0) {
+    throw new Error('Rendered MP4 validation failed: output file size is 0 bytes.');
+  }
+
+  const { stdout } = await execFileAsync(
+    'ffprobe',
+    ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', filePath],
+    { maxBuffer: 10 * 1024 * 1024, timeout: 25000 }
+  );
+
+  const parsed = JSON.parse(stdout) as {
+    format?: {
+      format_name?: string;
+      duration?: string;
+      size?: string;
+    };
+    streams?: Array<{
+      codec_type?: string;
+      codec_name?: string;
+      width?: number;
+      height?: number;
+      sample_rate?: string;
+      duration?: string;
+    }>;
+  };
+
+  const formatName = (parsed.format?.format_name || '').toLowerCase();
+  if (!formatName.includes('mp4') && !formatName.includes('mov')) {
+    throw new Error(`Rendered MP4 validation failed: invalid container format "${formatName || 'unknown'}".`);
+  }
+
+  const videoStream = parsed.streams?.find((s) => s.codec_type === 'video');
+  const audioStream = parsed.streams?.find((s) => s.codec_type === 'audio');
+
+  if (!videoStream) {
+    throw new Error('Rendered MP4 validation failed: no playable video stream found.');
+  }
+
+  const width = Number(videoStream.width || 0);
+  const height = Number(videoStream.height || 0);
+  if (width < 64 || height < 64) {
+    throw new Error(`Rendered MP4 validation failed: invalid resolution ${width}x${height}.`);
+  }
+
+  if (expectAudio && !audioStream) {
+    throw new Error('Rendered MP4 validation failed: expected audio stream is missing.');
+  }
+
+  const duration = Number(parsed.format?.duration || videoStream.duration || 0);
+  if (!Number.isFinite(duration) || duration <= 0.25) {
+    throw new Error(`Rendered MP4 validation failed: invalid duration (${duration}s).`);
+  }
+
+  return {
+    container: formatName,
+    videoCodec: videoStream.codec_name || 'h264',
+    audioCodec: audioStream?.codec_name || 'none',
+    width,
+    height,
+    duration: Number(duration.toFixed(2)),
+    fileSize: stat.size,
+  };
+}
+
+function updateClipRenderState(
+  projectId: string,
+  clipId: string,
+  patch: {
+    renderStatus: ClipRenderStatus;
+    renderStageDetail?: string;
+    renderError?: string;
+    renderedVideoUrl?: string;
+    storageObjectPath?: string;
+    mp4Filename?: string;
+    renderedFileSize?: number;
+    renderedDuration?: number;
+    renderedResolution?: string;
+    renderedAt?: string;
+    lastExportConfig?: ExportOptions;
+    editingStatus?: ClipRecord['editingStatus'];
+    originalVideoId?: string;
+  }
+): void {
+  const freshProject = store.getProject(projectId);
+  if (!freshProject) return;
+  const targetClip = freshProject.clips.find((c) => c.id === clipId);
+  if (!targetClip) return;
+  Object.assign(targetClip, patch, { updatedAt: new Date().toISOString() });
+  store.upsertProject(freshProject);
+}
 
 function getOutputDimensions(aspectRatio: AspectRatio, resolution: ExportResolution): { width: number; height: number } {
   const shortSide = resolution === '4k' ? 2160 : resolution === '1080p' ? 1080 : 720;
@@ -293,13 +430,25 @@ export async function renderClipWithFFmpeg(params: {
     clipId: clip.id,
     clipTitle: clip.title,
     status: 'rendering',
+    stage: 'rendering_mp4',
+    stageDetail: 'Rendering MP4 (H.264 / yuv420p / AAC 48kHz / faststart)...',
     progress: 2,
     options,
     createdAt: new Date().toISOString(),
   };
   job.status = 'rendering';
+  job.stage = 'rendering_mp4';
+  job.stageDetail = 'Rendering MP4 (H.264 / yuv420p / AAC 48kHz / faststart)...';
   job.progress = 3;
+  job.error = undefined;
   store.upsertExportJob(job);
+
+  updateClipRenderState(project.id, clip.id, {
+    renderStatus: 'rendering',
+    renderStageDetail: 'Rendering MP4...',
+    renderError: undefined,
+    originalVideoId: project.uploadId ?? project.id,
+  });
 
   const { width: outW, height: outH } = getOutputDimensions(clip.framing.aspectRatio, options.resolution);
   const inW = project.metadata.width || 1920;
@@ -308,6 +457,7 @@ export async function renderClipWithFFmpeg(params: {
 
   const assPath = path.join(clipDir, 'subtitles.ass');
   const outFilename = `export_${job.id.slice(0, 8)}.mp4`;
+  const tmpOutPath = path.join(clipDir, `export_${job.id.slice(0, 8)}.tmp.mp4`);
   const outPath = path.join(clipDir, outFilename);
 
   // Build video filter chain
@@ -523,8 +673,8 @@ export async function renderClipWithFFmpeg(params: {
       .filter(Boolean)
       .join(',');
 
-    const musicPrep = `[${musicInputIdx}:a]aformat=sample_rates=44100:channel_layouts=stereo,volume=${musVol.toFixed(3)}${fadeExpr ? `,${fadeExpr}` : ''}[mus_raw]`;
-    const voicePrep = `[0:a]aformat=sample_rates=44100:channel_layouts=stereo,volume=${origVol.toFixed(3)}[v_base]`;
+    const musicPrep = `[${musicInputIdx}:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=${musVol.toFixed(3)}${fadeExpr ? `,${fadeExpr}` : ''}[mus_raw]`;
+    const voicePrep = `[0:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=${origVol.toFixed(3)}[v_base]`;
 
     if (clip.audioMix.autoDucking) {
       complexFilters.push(
@@ -543,11 +693,11 @@ export async function renderClipWithFFmpeg(params: {
     }
     audioMapLabel = '[a_mixed]';
   } else if (hasSourceAudio) {
-    complexFilters.push(`[0:a]aformat=sample_rates=44100:channel_layouts=stereo,volume=${origVol.toFixed(3)}[a_mixed]`);
+    complexFilters.push(`[0:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=${origVol.toFixed(3)}[a_mixed]`);
     audioMapLabel = '[a_mixed]';
   } else if (musicInputIdx >= 0) {
     complexFilters.push(
-      `[${musicInputIdx}:a]aformat=sample_rates=44100:channel_layouts=stereo,volume=${musVol.toFixed(3)}[a_mixed]`
+      `[${musicInputIdx}:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=${musVol.toFixed(3)}[a_mixed]`
     );
     audioMapLabel = '[a_mixed]';
   }
@@ -555,7 +705,7 @@ export async function renderClipWithFFmpeg(params: {
   // Layer optional hook SFX at 0.15s
   if (sfxInputIdx >= 0 && audioMapLabel) {
     complexFilters.push(
-      `[${sfxInputIdx}:a]aformat=sample_rates=44100:channel_layouts=stereo,adelay=150|150,volume=0.55[sfx_ready]`,
+      `[${sfxInputIdx}:a]aformat=sample_rates=48000:channel_layouts=stereo,adelay=150|150,volume=0.55[sfx_ready]`,
       `${audioMapLabel}[sfx_ready]amix=inputs=2:duration=first:normalize=0[a_final]`
     );
     audioMapLabel = '[a_final]';
@@ -610,101 +760,188 @@ export async function renderClipWithFFmpeg(params: {
     ...(audioMapLabel ? ['-c:a', 'aac', '-b:a', '192k', '-ar', '48000'] : []),
     '-movflags',
     '+faststart',
+    '-f',
+    'mp4',
     '-progress',
     'pipe:1',
     '-nostats',
-    outPath,
+    tmpOutPath,
   ];
 
-  await new Promise<void>((resolve, reject) => {
-    const proc = spawn('ffmpeg', ffmpegArgs);
-    let stderrTail = '';
+  try {
+    // Stage 1: Real FFmpeg MP4 encode into atomic temporary path
+    await new Promise<void>((resolve, reject) => {
+      const proc = spawn('ffmpeg', ffmpegArgs);
+      let stderrTail = '';
 
-    proc.stdout.on('data', (chunk: Buffer) => {
-      const text = chunk.toString();
-      const match = text.match(/out_time_us=(\d+)/);
-      if (match) {
-        const outSeconds = Number(match[1]) / 1_000_000;
-        const pct = Math.max(5, Math.min(98, Math.round((outSeconds / clipDur) * 100)));
-        if (pct !== job.progress) {
-          job.progress = pct;
-          store.upsertExportJob(job);
+      proc.stdout.on('data', (chunk: Buffer) => {
+        const text = chunk.toString();
+        const match = text.match(/out_time_us=(\d+)/);
+        if (match) {
+          const outSeconds = Number(match[1]) / 1_000_000;
+          const pct = Math.max(5, Math.min(88, Math.round((outSeconds / clipDur) * 88)));
+          if (pct !== job.progress) {
+            job.progress = pct;
+            store.upsertExportJob(job);
+          }
+        }
+      });
+
+      proc.stderr.on('data', (chunk: Buffer) => {
+        stderrTail = (stderrTail + chunk.toString()).slice(-2500);
+      });
+
+      proc.on('close', (code) => {
+        if (code === 0 && fs.existsSync(tmpOutPath)) {
+          resolve();
+        } else {
+          reject(new Error(`FFmpeg render failed (code ${code}): ${stderrTail.slice(-400)}`));
+        }
+      });
+
+      proc.on('error', (err) => reject(err));
+    });
+
+    // Stage 2: Mandatory FFprobe MP4 Verification
+    job.stage = 'validating_mp4';
+    job.stageDetail = 'Validating MP4 container, H.264 video stream, AAC audio & duration with FFprobe...';
+    job.progress = 92;
+    store.upsertExportJob(job);
+    updateClipRenderState(project.id, clip.id, {
+      renderStatus: 'validating',
+      renderStageDetail: 'Validating MP4 with FFprobe...',
+    });
+
+    const expectAudio = Boolean(audioMapLabel);
+    const validationMeta = await validateRenderedMp4WithFFprobe(tmpOutPath, expectAudio);
+
+    // Stage 3: Atomic commit to persistent storage + remove older stale export files for this clip
+    job.stage = 'saving_storage';
+    job.stageDetail = 'Saving verified MP4 to persistent storage...';
+    job.progress = 96;
+    store.upsertExportJob(job);
+    updateClipRenderState(project.id, clip.id, {
+      renderStatus: 'saving',
+      renderStageDetail: 'Saving verified MP4 to storage...',
+    });
+
+    fs.renameSync(tmpOutPath, outPath);
+    if (!fs.existsSync(outPath) || fs.statSync(outPath).size <= 0) {
+      throw new Error('Failed to verify persisted MP4 file after saving to storage.');
+    }
+
+    // Clean up older export_*.mp4 versions for this clip to keep storage clean
+    try {
+      for (const f of fs.readdirSync(clipDir)) {
+        if (f.startsWith('export_') && f.endsWith('.mp4') && f !== outFilename) {
+          fs.rmSync(path.join(clipDir, f), { force: true });
         }
       }
-    });
-
-    proc.stderr.on('data', (chunk: Buffer) => {
-      stderrTail = (stderrTail + chunk.toString()).slice(-2500);
-    });
-
-    proc.on('close', (code) => {
-      if (code === 0 && fs.existsSync(outPath)) {
-        resolve();
-      } else {
-        reject(new Error(`FFmpeg render failed (code ${code}): ${stderrTail.slice(-400)}`));
-      }
-    });
-
-    proc.on('error', (err) => reject(err));
-  });
-
-  const stat = fs.statSync(outPath);
-  const publicUrl = `/media/projects/${project.id}/clips/${clip.id}/${outFilename}`;
-
-  job.status = 'completed';
-  job.progress = 100;
-  job.outputUrl = publicUrl;
-  job.fileSize = stat.size;
-  job.completedAt = new Date().toISOString();
-  store.upsertExportJob(job);
-
-  // Update clip record with latest rendered artifact
-  const freshProject = store.getProject(project.id);
-  if (freshProject) {
-    const targetClip = freshProject.clips.find((c) => c.id === clip.id);
-    if (targetClip) {
-      targetClip.renderedVideoUrl = publicUrl;
-      targetClip.renderedAt = job.completedAt;
-      targetClip.lastExportConfig = options;
-      targetClip.editingStatus = 'rendered';
-      targetClip.updatedAt = new Date().toISOString();
-      store.upsertProject(freshProject);
+    } catch {
+      // non-fatal cleanup
     }
-  }
 
-  return job;
+    const storageObjectPath = `projects/${project.id}/clips/${clip.id}/${outFilename}`;
+    const publicUrl = `/media/${storageObjectPath}`;
+    const completedAt = new Date().toISOString();
+    const resolutionLabel = `${validationMeta.width}x${validationMeta.height}`;
+
+    // Stage 4: Mark Export Ready ONLY after FFprobe validation & persistent storage verification succeed
+    job.status = 'completed';
+    job.stage = 'export_ready';
+    job.stageDetail = `Export ready · ${resolutionLabel} · ${validationMeta.videoCodec.toUpperCase()}/${validationMeta.audioCodec.toUpperCase()} · ${validationMeta.duration}s`;
+    job.progress = 100;
+    job.outputUrl = publicUrl;
+    job.storageObjectPath = storageObjectPath;
+    job.mp4Filename = outFilename;
+    job.fileSize = validationMeta.fileSize;
+    job.validationMeta = validationMeta;
+    job.completedAt = completedAt;
+    store.upsertExportJob(job);
+
+    updateClipRenderState(project.id, clip.id, {
+      renderStatus: 'export_ready',
+      renderStageDetail: job.stageDetail,
+      renderError: undefined,
+      originalVideoId: project.uploadId ?? project.id,
+      renderedVideoUrl: publicUrl,
+      storageObjectPath,
+      mp4Filename: outFilename,
+      renderedFileSize: validationMeta.fileSize,
+      renderedDuration: validationMeta.duration,
+      renderedResolution: resolutionLabel,
+      renderedAt: completedAt,
+      lastExportConfig: options,
+      editingStatus: 'rendered',
+    });
+
+    return job;
+  } catch (err) {
+    // Clean up any partial or corrupt temporary MP4
+    if (fs.existsSync(tmpOutPath)) {
+      fs.rmSync(tmpOutPath, { force: true });
+    }
+    const safeError = logBackendError({
+      projectId: project.id,
+      jobId: job.id,
+      stage: job.stage || 'rendering_mp4',
+      httpStatus: 500,
+      route: 'renderer:renderClipWithFFmpeg',
+      error: err,
+    });
+    job.status = 'failed';
+    job.stage = 'failed';
+    job.stageDetail = safeError;
+    job.error = safeError;
+    store.upsertExportJob(job);
+
+    updateClipRenderState(project.id, clip.id, {
+      renderStatus: 'failed',
+      renderStageDetail: 'MP4 export failed',
+      renderError: safeError,
+    });
+
+    throw new Error(safeError);
+  }
 }
 
 /**
- * Bundles all rendered clips for a project into a real downloadable ZIP archive.
+ * Bundles all verified, export-ready rendered MP4 clips for a project into a real downloadable ZIP archive.
  */
 export async function streamProjectClipsZip(
   project: ProjectRecord,
   writableStream: NodeJS.WritableStream
 ): Promise<void> {
-  const archive = archiver('zip', { zlib: { level: 5 } });
-  archive.pipe(writableStream);
-
-  let added = 0;
+  const readyEntries: Array<{ clip: ClipRecord; fullPath: string; index: number }> = [];
   for (let i = 0; i < project.clips.length; i++) {
     const clip = project.clips[i];
-    if (!clip.renderedVideoUrl) continue;
-    const filename = path.basename(clip.renderedVideoUrl.split('?')[0]);
-    const fullPath = path.join(store.getProjectDir(project.id), 'clips', clip.id, filename);
-    if (fs.existsSync(fullPath)) {
-      const safeTitle = clip.title.replace(/[^a-zA-Z0-9-_ ]/g, '').trim().slice(0, 48) || `clip_${i + 1}`;
-      archive.file(fullPath, { name: `${String(i + 1).padStart(2, '0')}_${safeTitle}.mp4` });
-      // Include SRT transcript alongside each video
-      const srtContent = generateSrtSubtitles(project, clip);
-      if (srtContent.trim()) {
-        archive.append(srtContent, { name: `${String(i + 1).padStart(2, '0')}_${safeTitle}.srt` });
-      }
-      added++;
-    }
+    const fullPath = resolveClipMp4Path(project, clip);
+    if (!fullPath || !fs.existsSync(fullPath)) continue;
+    const stat = fs.statSync(fullPath);
+    if (stat.size <= 0) continue;
+    readyEntries.push({ clip, fullPath, index: i });
   }
 
-  if (added === 0) {
-    throw new Error('No rendered clips found yet. Render at least one clip before downloading the ZIP bundle.');
+  if (readyEntries.length === 0) {
+    throw new Error('No verified MP4 clips are ready yet. Render at least one clip before downloading the ZIP bundle.');
+  }
+
+  const archive = archiver('zip', { zlib: { level: 1 } }); // MP4 is already compressed; fast level 1 avoids CPU overhead
+  archive.pipe(writableStream);
+
+  for (const entry of readyEntries) {
+    const safeTitle =
+      entry.clip.title
+        .replace(/[^a-zA-Z0-9-_ ]/g, '')
+        .trim()
+        .replace(/\s+/g, '_')
+        .slice(0, 48) || `clip_${entry.index + 1}`;
+    const prefix = String(entry.index + 1).padStart(2, '0');
+    archive.file(entry.fullPath, { name: `${prefix}_${safeTitle}.mp4` });
+    const srtContent = generateSrtSubtitles(project, entry.clip);
+    if (srtContent.trim()) {
+      archive.append(srtContent, { name: `${prefix}_${safeTitle}.srt` });
+    }
   }
 
   await archive.finalize();

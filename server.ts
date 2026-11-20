@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'crypto';
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
@@ -10,6 +11,7 @@ import type {
   ClipRecord,
   ExportJob,
   ExportOptions,
+  HookCandidate,
   ProjectRecord,
   SystemCapabilities,
 } from './shared/types.ts';
@@ -18,21 +20,50 @@ import { logBackendError, sanitizeErrorMessage } from './server/logger.ts';
 import { ensureMusicFileByName, getMusicTracks } from './server/music.ts';
 import { isGeminiConfigured } from './server/gemini.ts';
 import {
+  buildClipFromHookCandidate,
   createInitialPipelineStages,
   createRealSampleVideoProject,
   extractThumbnail,
   isPipelineRunning,
   probeVideoFile,
+  refreshHookCandidateTranscriptFields,
   regenerateSingleClip,
   runAnalysisPipeline,
 } from './server/pipeline.ts';
 import {
+  buildClipDownloadFilename,
   generateSrtSubtitles,
   renderClipWithFFmpeg,
+  resolveClipMp4Path,
   streamProjectClipsZip,
 } from './server/renderer.ts';
 
 const execFileAsync = promisify(execFile);
+
+const DOWNLOAD_SIGNING_SECRET =
+  process.env.DOWNLOAD_SIGNING_SECRET || crypto.createHash('sha256').update(process.cwd() + ':clipgenius-mp4-sign').digest('hex');
+
+function signDownloadToken(projectId: string, clipId: string, filename: string, expUnixSec: number): string {
+  return crypto
+    .createHmac('sha256', DOWNLOAD_SIGNING_SECRET)
+    .update(`${projectId}:${clipId}:${filename}:${expUnixSec}`)
+    .digest('hex');
+}
+
+function verifyDownloadToken(
+  projectId: string,
+  clipId: string,
+  filename: string,
+  token: string,
+  expUnixSec: number
+): boolean {
+  if (!Number.isFinite(expUnixSec) || expUnixSec < Math.floor(Date.now() / 1000)) {
+    return false;
+  }
+  const expected = signDownloadToken(projectId, clipId, filename, expUnixSec);
+  if (token.length !== expected.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected));
+}
 
 const ALLOWED_EXTENSIONS = new Set([
   '.mp4',
@@ -744,12 +775,23 @@ async function createServer() {
       project.analysisConfig = { ...project.analysisConfig, ...body.analysisConfig };
     }
     if (body?.restartHighlightsOnly) {
+      const resetKeys = new Set([
+        'hook_discovery',
+        'hook_scoring',
+        'hook_verification',
+        'clip_generation',
+        'clip_rendering',
+        'highlight_selection',
+        'clip_thumbnails',
+      ]);
       for (const s of project.pipelineStages) {
-        if (s.key === 'highlight_selection' || s.key === 'clip_thumbnails') {
+        if (resetKeys.has(s.key)) {
           s.status = 'pending';
           s.progress = 0;
         }
       }
+      project.hookCandidates = [];
+      project.hookSelectionNote = undefined;
     }
     store.upsertProject(project);
 
@@ -757,6 +799,125 @@ async function createServer() {
       void runAnalysisPipeline(project.id);
     }
     res.json({ started: true, project: store.getProject(project.id) });
+  });
+
+  // Hook Intelligence — Approve, Reject, or Edit Start/End Timestamps of a Hook Candidate
+  app.patch('/api/projects/:id/hooks/:candidateId', (req, res) => {
+    const project = store.getProject(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Project not found.' });
+    const list = project.hookCandidates ?? [];
+    const idx = list.findIndex((c) => c.id === req.params.candidateId);
+    if (idx < 0) return res.status(404).json({ error: 'Hook candidate not found.' });
+
+    const existing = list[idx];
+    const patch = (req.body ?? {}) as Partial<HookCandidate>;
+    const maxDur = project.metadata?.duration ?? 99999;
+
+    const nextStart =
+      typeof patch.startTime === 'number' && Number.isFinite(patch.startTime)
+        ? Math.max(0, Math.min(maxDur - 1.5, patch.startTime))
+        : existing.startTime;
+    const nextEnd =
+      typeof patch.endTime === 'number' && Number.isFinite(patch.endTime)
+        ? Math.max(nextStart + 1.5, Math.min(maxDur, patch.endTime))
+        : existing.endTime;
+
+    const merged: HookCandidate = {
+      ...existing,
+      title: typeof patch.title === 'string' && patch.title.trim() ? patch.title.trim() : existing.title,
+      status: patch.status ?? existing.status,
+      startTime: nextStart,
+      endTime: nextEnd,
+    };
+
+    const refreshed = refreshHookCandidateTranscriptFields(project, merged);
+    list[idx] = refreshed;
+    project.hookCandidates = list;
+    store.upsertProject(project);
+
+    res.json({ candidate: refreshed, project });
+  });
+
+  // Hook Intelligence — Generate a Real Clip & Render Verified MP4 from a Hook Candidate
+  app.post('/api/projects/:id/hooks/:candidateId/generate-clip', async (req, res) => {
+    const project = store.getProject(req.params.id);
+    if (!project || !project.sourcePath || !fs.existsSync(project.sourcePath)) {
+      return res.status(404).json({ error: 'Project or source video not found.' });
+    }
+    const list = project.hookCandidates ?? [];
+    const idx = list.findIndex((c) => c.id === req.params.candidateId);
+    if (idx < 0) return res.status(404).json({ error: 'Hook candidate not found.' });
+
+    try {
+      const candidate = refreshHookCandidateTranscriptFields(project, list[idx]);
+      const existingClipIdx = candidate.clipId
+        ? project.clips.findIndex((c) => c.id === candidate.clipId)
+        : -1;
+
+      const clip = buildClipFromHookCandidate(
+        project,
+        candidate,
+        existingClipIdx >= 0 ? project.clips[existingClipIdx].id : undefined
+      );
+      clip.renderStatus = 'queued';
+      clip.renderStageDetail = 'Queued for FFmpeg MP4 render...';
+
+      const thumbPath = path.join(store.getProjectDir(project.id), 'clips', clip.id, 'thumb.jpg');
+      try {
+        await extractThumbnail(project.sourcePath, thumbPath, clip.startTime + Math.min(2, clip.duration * 0.25));
+        clip.thumbnailUrl = `/media/projects/${project.id}/clips/${clip.id}/thumb.jpg?t=${Date.now()}`;
+      } catch {
+        if (project.thumbnailUrl) clip.thumbnailUrl = project.thumbnailUrl;
+      }
+
+      if (existingClipIdx >= 0) {
+        project.clips[existingClipIdx] = clip;
+      } else {
+        project.clips.unshift(clip);
+      }
+
+      candidate.clipId = clip.id;
+      candidate.status = 'generated';
+      list[idx] = candidate;
+      project.hookCandidates = list;
+      store.upsertProject(project);
+
+      const settings = store.getSettings();
+      const options: ExportOptions = {
+        resolution: settings.defaultExportResolution === '4k' ? '1080p' : settings.defaultExportResolution,
+        codec: 'h264',
+        fps: settings.defaultExportFps || 30,
+        quality: 'excellent',
+        embedCaptions: true,
+        includeMusic: true,
+      };
+      const exportJob: ExportJob = {
+        id: uuidv4(),
+        projectId: project.id,
+        clipId: clip.id,
+        clipTitle: clip.title,
+        status: 'queued',
+        stage: 'queued',
+        stageDetail: 'Queued for MP4 rendering & FFprobe validation...',
+        progress: 0,
+        options,
+        createdAt: new Date().toISOString(),
+      };
+      store.upsertExportJob(exportJob);
+      renderQueue.push({ projectId: project.id, clipId: clip.id, jobId: exportJob.id, options });
+      void processRenderQueue();
+
+      res.json({ clip, candidate, exportJob, project: store.getProject(project.id) ?? project });
+    } catch (err) {
+      const safeErr = logBackendError({
+        projectId: project.id,
+        stage: 'hook_generate_clip',
+        httpStatus: 500,
+        route: 'POST /api/projects/:id/hooks/:candidateId/generate-clip',
+        error: err,
+      });
+      res.status(500).json({ error: safeErr });
+    }
   });
 
   // Update a single clip (trim, title, captions, style, motion, framing, audio, overlays)
@@ -907,26 +1068,117 @@ async function createServer() {
     res.send(srt);
   });
 
-  // Direct attachment download for a rendered clip MP4
+  // Generate fresh signed download URL after verifying persistent MP4 exists and is non-empty
+  app.get('/api/projects/:id/clips/:clipId/download-url', (req, res) => {
+    const project = store.getProject(req.params.id);
+    const clip = project?.clips.find((c) => c.id === req.params.clipId);
+    if (!project || !clip) {
+      return res.status(404).json({ ready: false, error: 'Clip not found.' });
+    }
+    if (clip.renderStatus === 'failed') {
+      return res.status(409).json({
+        ready: false,
+        renderStatus: 'failed',
+        error: clip.renderError || 'MP4 rendering failed for this clip. Please re-render.',
+      });
+    }
+    if (
+      clip.renderStatus === 'queued' ||
+      clip.renderStatus === 'rendering' ||
+      clip.renderStatus === 'validating' ||
+      clip.renderStatus === 'saving'
+    ) {
+      return res.status(409).json({
+        ready: false,
+        renderStatus: clip.renderStatus,
+        error: clip.renderStageDetail || 'Clip MP4 is still being rendered and validated. Please wait a moment.',
+      });
+    }
+
+    const fullPath = resolveClipMp4Path(project, clip);
+    if (!fullPath || !fs.existsSync(fullPath)) {
+      return res.status(409).json({
+        ready: false,
+        renderStatus: 'not_rendered',
+        error: 'Verified MP4 file is not rendered yet. Render the clip first.',
+      });
+    }
+    const stat = fs.statSync(fullPath);
+    if (stat.size <= 0) {
+      return res.status(409).json({
+        ready: false,
+        renderStatus: 'failed',
+        error: 'Rendered MP4 file is empty or corrupted. Please re-render.',
+      });
+    }
+
+    const filename = buildClipDownloadFilename(clip);
+    const storedName = path.basename(fullPath);
+    const exp = Math.floor(Date.now() / 1000) + 600; // 10-minute fresh signed URL
+    const token = signDownloadToken(project.id, clip.id, storedName, exp);
+
+    res.json({
+      ready: true,
+      downloadUrl: `/api/projects/${project.id}/clips/${clip.id}/download?token=${token}&exp=${exp}`,
+      filename,
+      fileSize: stat.size,
+      duration: clip.renderedDuration ?? clip.duration,
+      resolution: clip.renderedResolution ?? (clip.lastExportConfig?.resolution || '1080p'),
+      mimeType: 'video/mp4',
+      expiresAt: new Date(exp * 1000).toISOString(),
+    });
+  });
+
+  // Direct verified MP4 download stream with strict video/mp4 Content-Type & Content-Disposition headers
   app.get('/api/projects/:id/clips/:clipId/download', (req, res) => {
     const project = store.getProject(req.params.id);
     const clip = project?.clips.find((c) => c.id === req.params.clipId);
-    if (!project || !clip || !clip.renderedVideoUrl) {
-      return res.status(404).json({ error: 'Rendered clip file not found. Render the clip first.' });
+    if (!project || !clip) {
+      return res.status(404).json({ error: 'Clip not found.' });
     }
-    const filename = path.basename(clip.renderedVideoUrl.split('?')[0]);
-    const fullPath = path.join(store.getProjectDir(project.id), 'clips', clip.id, filename);
-    if (!fs.existsSync(fullPath)) {
-      return res.status(404).json({ error: 'Rendered MP4 is no longer on disk. Please re-render.' });
+    const fullPath = resolveClipMp4Path(project, clip);
+    if (!fullPath || !fs.existsSync(fullPath)) {
+      return res.status(404).json({ error: 'Rendered MP4 file is not available on disk. Please render the clip first.' });
     }
-    const safeTitle =
-      clip.title
-        .replace(/[^a-zA-Z0-9-_ ]/g, '')
-        .trim()
-        .replace(/\s+/g, '_')
-        .slice(0, 60) || 'ClipGenius_Clip';
-    const resTag = clip.lastExportConfig?.resolution ?? '1080p';
-    res.download(fullPath, `${safeTitle}_${resTag}.mp4`);
+    const stat = fs.statSync(fullPath);
+    if (stat.size <= 0) {
+      return res.status(404).json({ error: 'Rendered MP4 file is empty. Please re-render.' });
+    }
+
+    // Verify signed URL token when provided
+    const token = typeof req.query.token === 'string' ? req.query.token : '';
+    const exp = typeof req.query.exp === 'string' ? Number(req.query.exp) : NaN;
+    if (token) {
+      const storedName = path.basename(fullPath);
+      if (!verifyDownloadToken(project.id, clip.id, storedName, token, exp)) {
+        return res.status(403).json({ error: 'Download link expired or invalid. Click Download MP4 to generate a fresh link.' });
+      }
+    }
+
+    const downloadFilename = buildClipDownloadFilename(clip);
+    res.status(200);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="${downloadFilename}"`);
+    res.setHeader('Content-Length', String(stat.size));
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'no-store');
+
+    const readStream = fs.createReadStream(fullPath);
+    readStream.on('error', (err) => {
+      logBackendError({
+        projectId: project.id,
+        stage: 'mp4_download_stream',
+        httpStatus: 500,
+        route: 'GET /api/projects/:id/clips/:clipId/download',
+        error: err,
+      });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to stream MP4 file.' });
+      } else {
+        res.end();
+      }
+    });
+    readStream.pipe(res);
   });
 
   // Queue real FFmpeg render for a single clip
@@ -952,10 +1204,16 @@ async function createServer() {
       clipId: clip.id,
       clipTitle: clip.title,
       status: 'queued',
+      stage: 'queued',
+      stageDetail: 'Queued for MP4 rendering & FFprobe validation...',
       progress: 0,
       options,
       createdAt: new Date().toISOString(),
     };
+    clip.renderStatus = 'queued';
+    clip.renderStageDetail = 'Queued for MP4 render...';
+    clip.renderError = undefined;
+    store.upsertProject(project);
     store.upsertExportJob(job);
 
     renderQueue.push({ projectId: project.id, clipId: clip.id, jobId: job.id, options });
@@ -1000,14 +1258,20 @@ async function createServer() {
         clipId: clip.id,
         clipTitle: clip.title,
         status: 'queued',
+        stage: 'queued',
+        stageDetail: 'Queued for MP4 rendering & FFprobe validation...',
         progress: 0,
         options,
         createdAt: new Date().toISOString(),
       };
+      clip.renderStatus = 'queued';
+      clip.renderStageDetail = 'Queued for MP4 render...';
+      clip.renderError = undefined;
       store.upsertExportJob(job);
       renderQueue.push({ projectId: project.id, clipId: clip.id, jobId: job.id, options });
       return job;
     });
+    store.upsertProject(project);
 
     void processRenderQueue();
     res.json({ jobs });
@@ -1025,19 +1289,27 @@ async function createServer() {
     res.json(job);
   });
 
-  // Download all rendered clips for a project as a real ZIP bundle
+  // Download all verified, rendered MP4 clips for a project as a real ZIP bundle
   app.get('/api/projects/:id/download-zip', async (req, res) => {
     const project = store.getProject(req.params.id);
     if (!project) return res.status(404).json({ error: 'Project not found.' });
 
-    const renderedCount = project.clips.filter((c) => c.renderedVideoUrl).length;
-    if (renderedCount === 0) {
-      return res.status(400).json({ error: 'No clips have been rendered yet. Render clips first before downloading ZIP.' });
+    const verifiedCount = project.clips.filter((c) => {
+      const p = resolveClipMp4Path(project, c);
+      return Boolean(p && fs.existsSync(p) && fs.statSync(p).size > 0);
+    }).length;
+
+    if (verifiedCount === 0) {
+      return res.status(409).json({ error: 'No verified MP4 clips are ready yet. Render clips first before downloading ZIP.' });
     }
 
-    const safeProjName = project.name.replace(/[^a-zA-Z0-9-_ ]/g, '').trim() || 'clipgenius_export';
+    const safeProjName =
+      project.name.replace(/[^a-zA-Z0-9-_ ]/g, '').trim().replace(/\s+/g, '_') || 'clipgenius_export';
+    res.status(200);
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="${safeProjName}_clips.zip"`);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'no-store');
 
     try {
       await streamProjectClipsZip(project, res);

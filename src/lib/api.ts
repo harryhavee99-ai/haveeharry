@@ -4,6 +4,7 @@ import type {
   ClipRecord,
   ExportJob,
   ExportOptions,
+  HookCandidate,
   MusicTrack,
   ProjectRecord,
   SystemCapabilities,
@@ -278,6 +279,130 @@ export const api = {
 
   getExports: (projectId?: string) =>
     requestJson<ExportJob[]>(projectId ? `/api/exports?projectId=${encodeURIComponent(projectId)}` : '/api/exports'),
+
+  getClipDownloadUrl: (projectId: string, clipId: string) =>
+    requestJson<{
+      ready: boolean;
+      downloadUrl: string;
+      filename: string;
+      fileSize: number;
+      duration: number;
+      resolution: string;
+      mimeType: string;
+      expiresAt: string;
+    }>(`/api/projects/${projectId}/clips/${clipId}/download-url`),
+
+  downloadClipMp4: async (projectId: string, clipId: string): Promise<{ filename: string; fileSize: number }> => {
+    const info = await api.getClipDownloadUrl(projectId, clipId);
+    if (!info?.ready || !info.downloadUrl) {
+      throw new Error('Verified MP4 file is not ready yet. Please render the clip first.');
+    }
+
+    const res = await fetch(info.downloadUrl, {
+      method: 'GET',
+      credentials: 'include',
+      cache: 'no-store',
+    });
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (!res.ok) {
+      const errText = await res.text();
+      throw classifyResponseError(res.status, errText, `MP4 download failed (${res.status})`, res.url);
+    }
+
+    if (contentType.includes('text/html') || contentType.includes('application/json')) {
+      const errText = await res.text();
+      throw classifyResponseError(
+        res.status,
+        errText,
+        'Server did not return a valid video/mp4 binary stream.',
+        res.url
+      );
+    }
+
+    const blob = await res.blob();
+    if (!blob || blob.size === 0) {
+      throw new Error('Downloaded MP4 file was empty (0 bytes). Please re-render the clip.');
+    }
+
+    const mp4Blob = blob.type === 'video/mp4' ? blob : new Blob([blob], { type: 'video/mp4' });
+    const objectUrl = URL.createObjectURL(mp4Blob);
+    try {
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = info.filename || 'ClipGenius_Clip.mp4';
+      link.rel = 'noopener';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 15_000);
+    }
+
+    return { filename: info.filename, fileSize: blob.size };
+  },
+
+  downloadProjectZip: async (projectId: string, fallbackName = 'clipgenius_clips'): Promise<void> => {
+    const res = await fetch(`/api/projects/${projectId}/download-zip`, {
+      method: 'GET',
+      credentials: 'include',
+      cache: 'no-store',
+    });
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (!res.ok) {
+      const errText = await res.text();
+      throw classifyResponseError(res.status, errText, `ZIP download failed (${res.status})`, res.url);
+    }
+    if (!contentType.includes('zip') && !contentType.includes('octet-stream')) {
+      const errText = await res.text();
+      throw classifyResponseError(res.status, errText, 'Server did not return a valid ZIP archive.', res.url);
+    }
+
+    const blob = await res.blob();
+    if (!blob || blob.size === 0) {
+      throw new Error('ZIP archive was empty. Render at least one clip first.');
+    }
+
+    const disp = res.headers.get('content-disposition') || '';
+    const match = disp.match(/filename="?([^"]+)"?/i);
+    const filename =
+      match?.[1] || `${fallbackName.replace(/[^a-zA-Z0-9-_]/g, '_') || 'clipgenius'}_clips.zip`;
+
+    const objectUrl = URL.createObjectURL(blob);
+    try {
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = filename;
+      link.rel = 'noopener';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 15_000);
+    }
+  },
+
+  updateHookCandidate: (projectId: string, candidateId: string, patch: Partial<HookCandidate>) =>
+    requestJson<{ candidate: HookCandidate; project: ProjectRecord }>(
+      `/api/projects/${projectId}/hooks/${candidateId}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      }
+    ),
+
+  generateClipFromHook: (projectId: string, candidateId: string) =>
+    requestJson<{
+      clip: ClipRecord;
+      candidate: HookCandidate;
+      exportJob: ExportJob;
+      project: ProjectRecord;
+    }>(`/api/projects/${projectId}/hooks/${candidateId}/generate-clip`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    }),
 
   getUploadStatus: (projectId: string) =>
     requestJson<{
