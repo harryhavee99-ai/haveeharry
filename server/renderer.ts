@@ -165,9 +165,30 @@ function updateClipRenderState(
   store.upsertProject(freshProject);
 }
 
-function getOutputDimensions(aspectRatio: AspectRatio, resolution: ExportResolution): { width: number; height: number } {
-  const shortSide = resolution === '4k' ? 2160 : resolution === '1080p' ? 1080 : 720;
+function getOutputDimensions(
+  aspectRatio: AspectRatio,
+  resolution: ExportResolution,
+  sourceWidth?: number,
+  sourceHeight?: number
+): { width: number; height: number } {
   const makeEven = (n: number) => Math.max(2, Math.round(n / 2) * 2);
+
+  if (aspectRatio === 'original' || resolution === 'original') {
+    const srcW = sourceWidth && sourceWidth >= 64 ? sourceWidth : 1920;
+    const srcH = sourceHeight && sourceHeight >= 64 ? sourceHeight : 1080;
+    if (resolution === 'original' || aspectRatio === 'original') {
+      if (resolution === 'original') {
+        return { width: makeEven(srcW), height: makeEven(srcH) };
+      }
+      // aspectRatio === 'original' with explicit resolution cap
+      const targetShort = resolution === '4k' ? 2160 : resolution === '1080p' ? 1080 : 720;
+      const srcShort = Math.min(srcW, srcH);
+      const scale = targetShort / Math.max(1, srcShort);
+      return { width: makeEven(srcW * scale), height: makeEven(srcH * scale) };
+    }
+  }
+
+  const shortSide = resolution === '4k' ? 2160 : resolution === '1080p' ? 1080 : 720;
 
   switch (aspectRatio) {
     case '9:16':
@@ -217,6 +238,10 @@ function formatSrtTime(seconds: number): string {
   const sec = Math.floor(s % 60);
   const ms = Math.min(999, Math.floor((s - Math.floor(s)) * 1000));
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
+}
+
+function formatVttTime(seconds: number): string {
+  return formatSrtTime(seconds).replace(',', '.');
 }
 
 function mapFontForLinuxAss(fontFamily: string, sampleText: string): string {
@@ -281,9 +306,11 @@ export function generateAssSubtitles(
   const allText = segments.map((s) => s.text).join(' ');
   const assFont = mapFontForLinuxAss(style.fontFamily, allText);
 
-  // Scale font size relative to 1080p playRes
+  // Orientation-aware studio font scaling (balanced for both 16:9 widescreen & 9:16 portrait across 720p/1080p/4K)
+  const isLandscape = outWidth > outHeight;
   const scaleFactor = Math.min(outWidth, outHeight) / 720;
-  const assFontSize = Math.max(20, Math.round(style.fontSize * scaleFactor * 1.18));
+  const orientationMultiplier = isLandscape ? 1.02 : 1.18;
+  const assFontSize = Math.max(20, Math.round(style.fontSize * scaleFactor * orientationMultiplier));
 
   // ASS alignment: 1-3 bottom, 4-6 middle, 7-9 top
   const rowBase = style.position === 'top' ? 7 : style.position === 'middle' ? 4 : 1;
@@ -292,24 +319,32 @@ export function generateAssSubtitles(
 
   const primaryCol = hexToAssColor(style.textColor, 1);
   const highlightCol = hexToAssColor(style.highlightColor, 1);
-  const outlineCol = hexToAssColor(style.strokeColor, 1);
-  const backCol =
-    style.backgroundOpacity > 0.05
-      ? hexToAssColor(style.backgroundColor, style.backgroundOpacity)
-      : hexToAssColor('#000000', style.shadow ? 0.55 : 0);
+  const hasBox = style.backgroundOpacity > 0.05;
+  const outlineCol = hasBox
+    ? hexToAssColor(style.backgroundColor, style.backgroundOpacity)
+    : hexToAssColor(style.strokeColor, 1);
+  const backCol = hasBox
+    ? hexToAssColor(style.backgroundColor, style.backgroundOpacity)
+    : hexToAssColor('#000000', style.shadow ? 0.65 : 0);
 
-  const borderStyle = style.backgroundOpacity > 0.05 ? 3 : 1;
-  const outlineWidth = style.backgroundOpacity > 0.05 ? Math.max(6, style.strokeWidth + 4) : style.strokeWidth;
-  const shadowDepth = style.shadow ? 2.5 : 0;
+  const borderStyle = hasBox ? 3 : 1;
+  const outlineWidth = Number(
+    (hasBox
+      ? Math.max(7, (style.strokeWidth + 6) * scaleFactor)
+      : Math.max(0.5, style.strokeWidth * scaleFactor)
+    ).toFixed(1)
+  );
+  const shadowDepth = style.shadow ? Number(((hasBox ? 1.5 : 2.8) * scaleFactor).toFixed(1)) : 0;
   const boldFlag = style.fontWeight >= 700 ? -1 : 0;
+  const letterSpacing = style.uppercase ? Number((0.8 * scaleFactor).toFixed(1)) : 0;
 
   const marginV =
     style.position === 'top'
-      ? Math.round((style.verticalOffset / 100) * outHeight)
+      ? Math.max(28, Math.round((style.verticalOffset / 100) * outHeight))
       : style.position === 'bottom'
         ? Math.max(36, Math.round(((100 - style.verticalOffset) / 100) * outHeight))
         : 20;
-  const marginH = Math.round(outWidth * 0.07);
+  const marginH = Math.round(outWidth * (isLandscape ? 0.08 : 0.065));
 
   const header = [
     '[Script Info]',
@@ -317,18 +352,21 @@ export function generateAssSubtitles(
     `PlayResX: ${outWidth}`,
     `PlayResY: ${outHeight}`,
     'ScaledBorderAndShadow: yes',
-    'WrapStyle: 0',
+    'WrapStyle: 2',
     '',
     '[V4+ Styles]',
     'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
-    `Style: Default,${assFont},${assFontSize},${primaryCol},${highlightCol},${outlineCol},${backCol},${boldFlag},0,0,0,100,100,0,0,${borderStyle},${outlineWidth},${shadowDepth},${alignment},${marginH},${marginH},${marginV},1`,
+    `Style: Default,${assFont},${assFontSize},${primaryCol},${highlightCol},${outlineCol},${backCol},${boldFlag},0,0,0,100,100,${letterSpacing},0,${borderStyle},${outlineWidth},${shadowDepth},${alignment},${marginH},${marginH},${marginV},1`,
     '',
     '[Events]',
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
   ];
 
   const offsetSec = (style.timingOffsetMs || 0) / 1000;
-  const wordsPerGroup = Math.max(1, Math.min(12, style.wordsPerLine * style.maxLines));
+  const effectiveWordsPerLine = isLandscape
+    ? Math.max(style.wordsPerLine, Math.min(9, style.wordsPerLine + 2))
+    : style.wordsPerLine;
+  const wordsPerGroup = Math.max(1, Math.min(14, effectiveWordsPerLine * style.maxLines));
   const lines: string[] = [];
 
   for (const seg of segments) {
@@ -342,45 +380,91 @@ export function generateAssSubtitles(
       if (group.length === 0) continue;
 
       const grpStart = Math.max(0, group[0].start - clip.startTime + offsetSec);
-      const grpEnd = Math.min(clip.duration, Math.max(grpStart + 0.12, group[group.length - 1].end - clip.startTime + offsetSec));
+      const grpEnd = Math.min(
+        clip.duration,
+        Math.max(grpStart + 0.14, group[group.length - 1].end - clip.startTime + offsetSec)
+      );
       if (grpEnd <= 0 || grpStart >= clip.duration) continue;
 
       if (style.wordLevelHighlight) {
-        // Emit one dialogue line per active word inside this chunk for crisp, exact color highlight
+        // Emit one dialogue line per active word inside this chunk for studio-grade synchronized motion
         for (let activeIdx = 0; activeIdx < group.length; activeIdx++) {
           const w = group[activeIdx];
           const wStart = Math.max(0, w.start - clip.startTime + offsetSec);
           const wEnd = Math.min(
             clip.duration,
-            Math.max(wStart + 0.06, (activeIdx === group.length - 1 ? group[activeIdx].end : group[activeIdx + 1].start) - clip.startTime + offsetSec)
+            Math.max(
+              wStart + 0.06,
+              (activeIdx === group.length - 1 ? group[activeIdx].end : group[activeIdx + 1].start) -
+                clip.startTime +
+                offsetSec
+            )
           );
           if (wEnd <= 0 || wStart >= clip.duration) continue;
+
+          const baseBlur = hasBox ? '' : '\\blur0.4';
+          const linePrefix =
+            style.animation === 'fade' || style.animation === 'slide'
+              ? activeIdx === 0
+                ? `{\\fad(90,0)${baseBlur}}`
+                : activeIdx === group.length - 1
+                  ? `{\\fad(0,80)${baseBlur}}`
+                  : baseBlur
+                    ? `{${baseBlur}}`
+                    : ''
+              : baseBlur
+                ? `{${baseBlur}}`
+                : '';
 
           const formattedTokens = group.map((token, idx) => {
             const rawWord = style.uppercase ? token.word.toUpperCase() : token.word;
             const safeWord = escapeAssText(rawWord);
-            const lineBreak = idx > 0 && idx % style.wordsPerLine === 0 ? '\\N' : idx > 0 ? ' ' : '';
+            const lineBreak = idx > 0 && idx % effectiveWordsPerLine === 0 ? '\\N' : idx > 0 ? ' ' : '';
+
             if (idx === activeIdx) {
-              const popTag = style.animation === 'pop' ? '\\fscx108\\fscy108' : '';
-              return `${lineBreak}{\\c${highlightCol}${popTag}}${safeWord}{\\c${primaryCol}\\fscx100\\fscy100}`;
+              if (style.animation === 'pop') {
+                return `${lineBreak}{\\c${highlightCol}\\fscx114\\fscy114\\t(0,110,\\fscx105\\fscy105)}${safeWord}{\\c${primaryCol}\\fscx100\\fscy100}`;
+              }
+              if (style.animation === 'glow') {
+                const haloTag = hasBox ? '' : `\\3c${highlightCol}\\blur2.2`;
+                const resetHalo = hasBox ? '' : `\\3c${outlineCol}\\blur0.4`;
+                return `${lineBreak}{\\c${highlightCol}${haloTag}\\fscx105\\fscy105}${safeWord}{\\c${primaryCol}${resetHalo}\\fscx100\\fscy100}`;
+              }
+              if (style.animation === 'karaoke') {
+                return `${lineBreak}{\\c${highlightCol}\\fscx106\\fscy106}${safeWord}{\\c${primaryCol}\\fscx100\\fscy100}`;
+              }
+              return `${lineBreak}{\\c${highlightCol}}${safeWord}{\\c${primaryCol}}`;
             }
+
+            // In Karaoke mode, keep already-spoken words warmly illuminated
+            if (style.animation === 'karaoke' && idx < activeIdx) {
+              return `${lineBreak}{\\c${highlightCol}}${safeWord}{\\c${primaryCol}}`;
+            }
+
             return `${lineBreak}${safeWord}`;
           });
 
           lines.push(
-            `Dialogue: 0,${formatAssTime(wStart)},${formatAssTime(wEnd)},Default,,0,0,0,,${formattedTokens.join('')}`
+            `Dialogue: 0,${formatAssTime(wStart)},${formatAssTime(wEnd)},Default,,0,0,0,,${linePrefix}${formattedTokens.join('')}`
           );
         }
       } else {
         const formattedTokens = group.map((token, idx) => {
           const rawWord = style.uppercase ? token.word.toUpperCase() : token.word;
           const safeWord = escapeAssText(rawWord);
-          const lineBreak = idx > 0 && idx % style.wordsPerLine === 0 ? '\\N' : idx > 0 ? ' ' : '';
+          const lineBreak = idx > 0 && idx % effectiveWordsPerLine === 0 ? '\\N' : idx > 0 ? ' ' : '';
           return `${lineBreak}${safeWord}`;
         });
-        const fadeTag = style.animation === 'fade' ? '{\\fad(120,120)}' : '';
+        const animTag =
+          style.animation === 'fade' || style.animation === 'slide'
+            ? '{\\fad(120,120)\\blur0.4}'
+            : style.animation === 'pop'
+              ? '{\\fscx96\\fscy96\\t(0,100,\\fscx100\\fscy100)\\blur0.4}'
+              : hasBox
+                ? ''
+                : '{\\blur0.4}';
         lines.push(
-          `Dialogue: 0,${formatAssTime(grpStart)},${formatAssTime(grpEnd)},Default,,0,0,0,,${fadeTag}${formattedTokens.join('')}`
+          `Dialogue: 0,${formatAssTime(grpStart)},${formatAssTime(grpEnd)},Default,,0,0,0,,${animTag}${formattedTokens.join('')}`
         );
       }
     }
@@ -403,6 +487,139 @@ export function generateSrtSubtitles(project: ProjectRecord, clip: ClipRecord): 
     index++;
   }
   return blocks.join('\n');
+}
+
+export function generateVttSubtitles(project: ProjectRecord, clip: ClipRecord): string {
+  const segments = getClipSegments(project, clip);
+  const offsetSec = (clip.captionStyle.timingOffsetMs || 0) / 1000;
+  const blocks: string[] = ['WEBVTT\n'];
+
+  for (const seg of segments) {
+    const start = Math.max(0, seg.start - clip.startTime + offsetSec);
+    const end = Math.min(clip.duration, Math.max(start + 0.2, seg.end - clip.startTime + offsetSec));
+    if (end <= 0 || start >= clip.duration) continue;
+    blocks.push(`${formatVttTime(start)} --> ${formatVttTime(end)}\n${seg.text.trim()}\n`);
+  }
+  return blocks.join('\n');
+}
+
+/**
+ * Generates a 0%-re-encode bit-exact MP4 with embedded selectable mov_text soft subtitles
+ * (preserves 100% original video & audio streams untouched whenever source codecs are MP4-compatible).
+ */
+export async function renderSoftSubtitledMp4(params: {
+  project: ProjectRecord;
+  clip: ClipRecord;
+}): Promise<{ filePath: string; fileSize: number; remuxedLossless: boolean }> {
+  const { project, clip } = params;
+  if (!project.sourcePath || !fs.existsSync(project.sourcePath) || !project.metadata) {
+    throw new Error('Source video file is missing.');
+  }
+
+  const clipDir = path.resolve(store.getProjectDir(project.id), 'clips', clip.id);
+  fs.mkdirSync(clipDir, { recursive: true });
+
+  const srtPath = path.resolve(clipDir, 'softsub.srt');
+  const tmpOutPath = path.resolve(clipDir, `softsub_${Date.now()}.tmp.mp4`);
+  const outPath = path.resolve(clipDir, 'softsub_original.mp4');
+  if (!srtPath.startsWith(clipDir + path.sep) || !outPath.startsWith(clipDir + path.sep)) {
+    throw new Error('Invalid output path for soft-subtitled MP4.');
+  }
+
+  const srtContent = generateSrtSubtitles(project, clip);
+  if (!srtContent.trim()) {
+    throw new Error('No caption segments available yet to embed into the video.');
+  }
+  fs.writeFileSync(srtPath, srtContent, 'utf-8');
+
+  const isFullVideo =
+    Boolean(clip.isFullVideoCaption) ||
+    (clip.startTime <= 0.05 && clip.endTime >= (project.metadata.duration || 0) - 0.15);
+  const clipDur = Math.max(1, clip.endTime - clip.startTime);
+
+  const srcVideoCodec = (project.metadata.codec || '').toLowerCase();
+  const srcAudioCodec = (project.metadata.audioCodec || '').toLowerCase();
+  const canStreamCopyVideo = srcVideoCodec === 'h264' || srcVideoCodec === 'hevc' || srcVideoCodec === 'h265' || srcVideoCodec === 'mpeg4';
+  const canStreamCopyAudio = srcAudioCodec === 'aac' || srcAudioCodec === 'mp3' || srcAudioCodec === 'none';
+
+  const trimArgs = isFullVideo ? [] : ['-ss', clip.startTime.toFixed(3), '-t', clipDur.toFixed(3)];
+
+  const runMux = async (copyVideo: boolean) => {
+    const args: string[] = [
+      '-loglevel',
+      'error',
+      '-y',
+      ...trimArgs,
+      '-i',
+      project.sourcePath!,
+      '-sub_charenc',
+      'UTF-8',
+      '-i',
+      srtPath,
+      '-map',
+      '0:v:0',
+      ...(srcAudioCodec !== 'none' ? ['-map', '0:a:0?'] : []),
+      '-map',
+      '1:0',
+      ...(copyVideo
+        ? ['-c:v', 'copy']
+        : ['-c:v', 'libx264', '-preset', 'medium', '-crf', '16', '-pix_fmt', 'yuv420p']),
+      ...(srcAudioCodec !== 'none'
+        ? canStreamCopyAudio && copyVideo
+          ? ['-c:a', 'copy']
+          : ['-c:a', 'aac', '-b:a', '256k', '-ar', '48000']
+        : ['-an']),
+      '-c:s',
+      'mov_text',
+      '-metadata:s:s:0',
+      'language=eng',
+      '-disposition:s:0',
+      'default',
+      '-movflags',
+      '+faststart',
+      '-f',
+      'mp4',
+      tmpOutPath,
+    ];
+
+    await new Promise<void>((resolve, reject) => {
+      const proc = spawn('ffmpeg', args);
+      let stderr = '';
+      proc.stderr.on('data', (d: Buffer) => {
+        stderr = (stderr + d.toString()).slice(-1500);
+      });
+      proc.on('close', (code) => {
+        if (code === 0 && fs.existsSync(tmpOutPath) && fs.statSync(tmpOutPath).size > 0) {
+          resolve();
+        } else {
+          reject(new Error(`FFmpeg soft-subtitle mux failed (${code}): ${stderr.slice(-300)}`));
+        }
+      });
+      proc.on('error', reject);
+    });
+  };
+
+  let remuxedLossless = false;
+  try {
+    if (canStreamCopyVideo) {
+      try {
+        await runMux(true);
+        remuxedLossless = true;
+      } catch {
+        if (fs.existsSync(tmpOutPath)) fs.rmSync(tmpOutPath, { force: true });
+        await runMux(false);
+      }
+    } else {
+      await runMux(false);
+    }
+
+    fs.renameSync(tmpOutPath, outPath);
+    const stat = fs.statSync(outPath);
+    return { filePath: outPath, fileSize: stat.size, remuxedLossless };
+  } catch (err) {
+    if (fs.existsSync(tmpOutPath)) fs.rmSync(tmpOutPath, { force: true });
+    throw err;
+  }
 }
 
 /**
@@ -450,10 +667,33 @@ export async function renderClipWithFFmpeg(params: {
     originalVideoId: project.uploadId ?? project.id,
   });
 
-  const { width: outW, height: outH } = getOutputDimensions(clip.framing.aspectRatio, options.resolution);
   const inW = project.metadata.width || 1920;
   const inH = project.metadata.height || 1080;
+  const isFullVideo =
+    Boolean(clip.isFullVideoCaption) ||
+    (clip.startTime <= 0.05 && clip.endTime >= (project.metadata.duration || 0) - 0.15 && Boolean(clip.preserveOriginalVideo));
+  const preserveOriginal = Boolean(
+    clip.preserveOriginalVideo ||
+      clip.isFullVideoCaption ||
+      (clip.framing.aspectRatio === 'original' && options.resolution === 'original')
+  );
+
+  const effectiveAspectRatio: AspectRatio = preserveOriginal ? 'original' : clip.framing.aspectRatio;
+  const effectiveResolution: ExportResolution = preserveOriginal ? 'original' : options.resolution;
+  const { width: outW, height: outH } = getOutputDimensions(effectiveAspectRatio, effectiveResolution, inW, inH);
   const clipDur = Math.max(1, clip.endTime - clip.startTime);
+
+  if (preserveOriginal) {
+    const detail = `Burning high-end captions onto original video (${outW}×${outH} · original quality, zero video changes)...`;
+    job.stageDetail = detail;
+    store.upsertExportJob(job);
+    updateClipRenderState(project.id, clip.id, {
+      renderStatus: 'rendering',
+      renderStageDetail: detail,
+      renderError: undefined,
+      originalVideoId: project.uploadId ?? project.id,
+    });
+  }
 
   const assPath = path.join(clipDir, 'subtitles.ass');
   const outFilename = `export_${job.id.slice(0, 8)}.mp4`;
@@ -462,149 +702,162 @@ export async function renderClipWithFFmpeg(params: {
 
   // Build video filter chain
   const vfParts: string[] = [];
-
-  // 1. Aspect Ratio & Smart Reframing
-  const targetRatio = outW / outH;
-  const sourceRatio = inW / inH;
-  const baseZoom = Math.max(1.0, Math.min(2.0, clip.framing.zoom || 1.0));
-  const motionExtraZoom = clip.motionGraphics.dynamicZoom
-    ? Math.max(1.0, Math.min(1.28, clip.motionGraphics.zoomAmount || 1.08))
-    : 1.0;
-
-  let focalX = clip.framing.manualX ?? 0.5;
-  let focalY = clip.framing.manualY ?? 0.45;
-  if (clip.framing.mode !== 'manual' && clip.framing.focalKeyframes.length > 0) {
-    focalX =
-      clip.framing.focalKeyframes.reduce((acc, k) => acc + k.x, 0) / clip.framing.focalKeyframes.length;
-    focalY =
-      clip.framing.focalKeyframes.reduce((acc, k) => acc + k.y, 0) / clip.framing.focalKeyframes.length;
-  }
-
-  const useBlurredBackdrop = clip.motionGraphics.backgroundBlur && targetRatio < sourceRatio;
   let videoStreamLabel = '[0:v]';
   const complexFilters: string[] = [];
 
-  if (useBlurredBackdrop) {
-    // Blurred full-bleed background with centered sharp foreground
-    complexFilters.push(
-      `[0:v]split=2[bg_in][fg_in]`,
-      `[bg_in]scale=${outW}:${outH}:force_original_aspect_ratio=increase,crop=${outW}:${outH},boxblur=24:6,eq=brightness=-0.08[bg_blur]`,
-      `[fg_in]scale=${outW}:${outH}:force_original_aspect_ratio=decrease[fg_sharp]`,
-      `[bg_blur][fg_sharp]overlay=(W-w)/2:(H-h)/2[reframed]`
-    );
-    videoStreamLabel = '[reframed]';
-  } else {
-    // Smart crop preserving target aspect ratio centered on active speaker focal point
-    let cropW: number;
-    let cropH: number;
-    if (sourceRatio > targetRatio) {
-      cropH = Math.floor(inH / baseZoom);
-      cropW = Math.floor(cropH * targetRatio);
-    } else {
-      cropW = Math.floor(inW / baseZoom);
-      cropH = Math.floor(cropW / targetRatio);
-    }
-    cropW = Math.max(64, Math.min(inW, cropW - (cropW % 2)));
-    cropH = Math.max(64, Math.min(inH, cropH - (cropH % 2)));
-
-    const maxOffsetX = Math.max(0, inW - cropW);
-    const maxOffsetY = Math.max(0, inH - cropH);
-    const baseCropX = Math.round(Math.max(0, Math.min(maxOffsetX, focalX * inW - cropW / 2)));
-    const baseCropY = Math.round(Math.max(0, Math.min(maxOffsetY, focalY * inH - cropH / 2)));
-
-    // Smooth camera drift or face-tracking pan if enabled
-    let cropXExpr = String(baseCropX);
-    if (clip.framing.mode === 'face_track' && clip.framing.focalKeyframes.length >= 2 && maxOffsetX > 8) {
-      const firstX = clip.framing.focalKeyframes[0].x;
-      const lastX = clip.framing.focalKeyframes[clip.framing.focalKeyframes.length - 1].x;
-      const startPx = Math.round(Math.max(0, Math.min(maxOffsetX, firstX * inW - cropW / 2)));
-      const endPx = Math.round(Math.max(0, Math.min(maxOffsetX, lastX * inW - cropW / 2)));
-      cropXExpr = `${startPx}+(${endPx - startPx})*min(1\\,t/${clipDur.toFixed(2)})`;
-    } else if (clip.motionGraphics.cameraMovement === 'subtle_pan' && maxOffsetX > 20) {
-      const swing = Math.min(28, Math.floor(maxOffsetX / 3));
-      cropXExpr = `max(0\\,min(${maxOffsetX}\\,${baseCropX}+${swing}*sin(t*0.45)))`;
-    }
-
-    vfParts.push(`crop=${cropW}:${cropH}:${cropXExpr}:${baseCropY}`);
-    if (motionExtraZoom > 1.01) {
-      const scaledW = Math.round((outW * motionExtraZoom) / 2) * 2;
-      const scaledH = Math.round((outH * motionExtraZoom) / 2) * 2;
-      vfParts.push(
-        `scale=${scaledW}:${scaledH}:flags=lanczos`,
-        `crop=${outW}:${outH}:(${scaledW}-${outW})/2:(${scaledH}-${outH})/2`
-      );
-    } else {
+  if (preserveOriginal) {
+    // CAPTIONS-ONLY / PRESERVE ORIGINAL VIDEO MODE:
+    // Zero crop, zero zoom, zero pan, zero color grading, zero fades, zero extra overlays.
+    // Only adjust by 1px if source had an odd pixel dimension (required by yuv420p H.264).
+    if (inW !== outW || inH !== outH) {
       vfParts.push(`scale=${outW}:${outH}:flags=lanczos`);
     }
-  }
+  } else {
+    // 1. Aspect Ratio & Smart Reframing
+    const targetRatio = outW / outH;
+    const sourceRatio = inW / inH;
+    const baseZoom = Math.max(1.0, Math.min(2.0, clip.framing.zoom || 1.0));
+    const motionExtraZoom = clip.motionGraphics.dynamicZoom
+      ? Math.max(1.0, Math.min(1.28, clip.motionGraphics.zoomAmount || 1.08))
+      : 1.0;
 
-  // 2. Color Grading & Visual Style
-  const cg = clip.colorGrading;
-  const effBrightness = Math.max(-0.5, Math.min(0.5, (cg.brightness || 0) + (cg.exposure || 0) * 0.6 + (cg.aiEnhance ? 0.015 : 0)));
-  const effContrast = Math.max(0.5, Math.min(1.8, (cg.contrast || 1) + (cg.aiEnhance ? 0.04 : 0)));
-  const effSat = Math.max(0, Math.min(2.2, (cg.saturation || 1) + (cg.aiEnhance ? 0.03 : 0)));
-  vfParts.push(`eq=brightness=${effBrightness.toFixed(3)}:contrast=${effContrast.toFixed(3)}:saturation=${effSat.toFixed(3)}`);
+    let focalX = clip.framing.manualX ?? 0.5;
+    let focalY = clip.framing.manualY ?? 0.45;
+    if (clip.framing.mode !== 'manual' && clip.framing.focalKeyframes.length > 0) {
+      focalX =
+        clip.framing.focalKeyframes.reduce((acc, k) => acc + k.x, 0) / clip.framing.focalKeyframes.length;
+      focalY =
+        clip.framing.focalKeyframes.reduce((acc, k) => acc + k.y, 0) / clip.framing.focalKeyframes.length;
+    }
 
-  const temp = Math.max(-0.4, Math.min(0.4, cg.temperature || 0));
-  const hi = Math.max(-0.3, Math.min(0.3, cg.highlights || 0));
-  const sh = Math.max(-0.3, Math.min(0.3, cg.shadows || 0));
-  if (Math.abs(temp) > 0.01 || Math.abs(hi) > 0.01 || Math.abs(sh) > 0.01) {
-    vfParts.push(
-      `colorbalance=rs=${sh.toFixed(3)}:bs=${sh.toFixed(3)}:rm=${temp.toFixed(3)}:bm=${(-temp).toFixed(3)}:rh=${hi.toFixed(3)}:bh=${hi.toFixed(3)}`
-    );
-  }
+    const useBlurredBackdrop = clip.motionGraphics.backgroundBlur && targetRatio < sourceRatio;
 
-  const sharp = (cg.sharpness || 0) + (cg.aiEnhance ? 0.25 : 0);
-  if (sharp > 0.05) {
-    vfParts.push(`unsharp=5:5:${Math.min(1.8, sharp).toFixed(2)}:5:5:0.0`);
-  }
-
-  // 3. Context-Aware Motion Graphics Overlays
-  const mg = clip.motionGraphics;
-
-  // Subtle fade in/out transitions
-  if (mg.subtleTransitions && clipDur > 2) {
-    vfParts.push(`fade=t=in:st=0:d=0.35`, `fade=t=out:st=${Math.max(0.5, clipDur - 0.35).toFixed(2)}:d=0.35`);
-  }
-
-  // Progress bar
-  if (mg.progressBar !== 'none') {
-    const barH = Math.max(6, Math.round(outH * 0.007));
-    const barY = mg.progressBar === 'top' ? 0 : outH - barH;
-    const barHex = (mg.progressBarColor || '#8B5CF6').replace('#', '0x');
-    vfParts.push(`drawbox=x=0:y=${barY}:w=iw:h=${barH}:color=0x000000@0.45:t=fill`);
-    vfParts.push(
-      `drawbox=x=0:y=${barY}:w=iw*min(1\\,t/${clipDur.toFixed(2)}):h=${barH}:color=${barHex}@0.95:t=fill`
-    );
-  }
-
-  // Animated Hook Title Card (opening few seconds)
-  if (mg.hookTitleEnabled && mg.hookTitleText.trim()) {
-    const hookDur = Math.min(clipDur * 0.5, Math.max(1.5, mg.hookDuration || 3));
-    const hookFontSize = Math.max(24, Math.round(Math.min(outW, outH) * 0.044));
-    const safeHook = escapeDrawtext(mg.hookTitleText.trim().slice(0, 44));
-    const boxY = Math.round(outH * 0.08);
-    vfParts.push(
-      `drawtext=font='DejaVu Sans':text='${safeHook}':x=(w-text_w)/2:y=${boxY}:fontsize=${hookFontSize}:fontcolor=0xFFFFFF:box=1:boxcolor=0x09090D@0.78:boxborderw=18:enable='between(t,0.15,${hookDur.toFixed(2)})'`
-    );
-  }
-
-  // Speaker Lower Third
-  if (mg.lowerThirdEnabled && mg.speakerLabel.trim()) {
-    const ltStart = mg.hookTitleEnabled ? 2.2 : 0.6;
-    const ltEnd = Math.min(clipDur - 0.5, ltStart + 4.5);
-    if (ltEnd > ltStart) {
-      const safeName = escapeDrawtext(mg.speakerLabel.trim().slice(0, 32));
-      const ltFontSize = Math.max(20, Math.round(Math.min(outW, outH) * 0.032));
-      const ltX = Math.round(outW * 0.06);
-      const ltY = Math.round(outH * 0.17);
-      vfParts.push(
-        `drawtext=font='DejaVu Sans':text='${safeName}':x=${ltX}:y=${ltY}:fontsize=${ltFontSize}:fontcolor=0xF4F5F8:box=1:boxcolor=0x141624@0.82:boxborderw=12:enable='between(t,${ltStart.toFixed(2)},${ltEnd.toFixed(2)})'`
+    if (useBlurredBackdrop) {
+      // Blurred full-bleed background with centered sharp foreground
+      complexFilters.push(
+        `[0:v]split=2[bg_in][fg_in]`,
+        `[bg_in]scale=${outW}:${outH}:force_original_aspect_ratio=increase,crop=${outW}:${outH},boxblur=24:6,eq=brightness=-0.08[bg_blur]`,
+        `[fg_in]scale=${outW}:${outH}:force_original_aspect_ratio=decrease[fg_sharp]`,
+        `[bg_blur][fg_sharp]overlay=(W-w)/2:(H-h)/2[reframed]`
       );
+      videoStreamLabel = '[reframed]';
+    } else {
+      // Smart crop preserving target aspect ratio centered on active speaker focal point
+      let cropW: number;
+      let cropH: number;
+      if (sourceRatio > targetRatio) {
+        cropH = Math.floor(inH / baseZoom);
+        cropW = Math.floor(cropH * targetRatio);
+      } else {
+        cropW = Math.floor(inW / baseZoom);
+        cropH = Math.floor(cropW / targetRatio);
+      }
+      cropW = Math.max(64, Math.min(inW, cropW - (cropW % 2)));
+      cropH = Math.max(64, Math.min(inH, cropH - (cropH % 2)));
+
+      const maxOffsetX = Math.max(0, inW - cropW);
+      const maxOffsetY = Math.max(0, inH - cropH);
+      const baseCropX = Math.round(Math.max(0, Math.min(maxOffsetX, focalX * inW - cropW / 2)));
+      const baseCropY = Math.round(Math.max(0, Math.min(maxOffsetY, focalY * inH - cropH / 2)));
+
+      // Smooth camera drift or face-tracking pan if enabled
+      let cropXExpr = String(baseCropX);
+      if (clip.framing.mode === 'face_track' && clip.framing.focalKeyframes.length >= 2 && maxOffsetX > 8) {
+        const firstX = clip.framing.focalKeyframes[0].x;
+        const lastX = clip.framing.focalKeyframes[clip.framing.focalKeyframes.length - 1].x;
+        const startPx = Math.round(Math.max(0, Math.min(maxOffsetX, firstX * inW - cropW / 2)));
+        const endPx = Math.round(Math.max(0, Math.min(maxOffsetX, lastX * inW - cropW / 2)));
+        cropXExpr = `${startPx}+(${endPx - startPx})*min(1\\,t/${clipDur.toFixed(2)})`;
+      } else if (clip.motionGraphics.cameraMovement === 'subtle_pan' && maxOffsetX > 20) {
+        const swing = Math.min(28, Math.floor(maxOffsetX / 3));
+        cropXExpr = `max(0\\,min(${maxOffsetX}\\,${baseCropX}+${swing}*sin(t*0.45)))`;
+      }
+
+      if (cropW !== inW || cropH !== inH || baseCropX !== 0 || baseCropY !== 0 || cropXExpr !== '0') {
+        vfParts.push(`crop=${cropW}:${cropH}:${cropXExpr}:${baseCropY}`);
+      }
+      if (motionExtraZoom > 1.01) {
+        const scaledW = Math.round((outW * motionExtraZoom) / 2) * 2;
+        const scaledH = Math.round((outH * motionExtraZoom) / 2) * 2;
+        vfParts.push(
+          `scale=${scaledW}:${scaledH}:flags=lanczos`,
+          `crop=${outW}:${outH}:(${scaledW}-${outW})/2:(${scaledH}-${outH})/2`
+        );
+      } else if (cropW !== outW || cropH !== outH) {
+        vfParts.push(`scale=${outW}:${outH}:flags=lanczos`);
+      }
+    }
+
+    // 2. Color Grading & Visual Style (skip entirely if neutral)
+    const cg = clip.colorGrading;
+    const effBrightness = Math.max(-0.5, Math.min(0.5, (cg.brightness || 0) + (cg.exposure || 0) * 0.6 + (cg.aiEnhance ? 0.015 : 0)));
+    const effContrast = Math.max(0.5, Math.min(1.8, (cg.contrast || 1) + (cg.aiEnhance ? 0.04 : 0)));
+    const effSat = Math.max(0, Math.min(2.2, (cg.saturation || 1) + (cg.aiEnhance ? 0.03 : 0)));
+    if (Math.abs(effBrightness) > 0.005 || Math.abs(effContrast - 1) > 0.005 || Math.abs(effSat - 1) > 0.005) {
+      vfParts.push(`eq=brightness=${effBrightness.toFixed(3)}:contrast=${effContrast.toFixed(3)}:saturation=${effSat.toFixed(3)}`);
+    }
+
+    const temp = Math.max(-0.4, Math.min(0.4, cg.temperature || 0));
+    const hi = Math.max(-0.3, Math.min(0.3, cg.highlights || 0));
+    const sh = Math.max(-0.3, Math.min(0.3, cg.shadows || 0));
+    if (Math.abs(temp) > 0.01 || Math.abs(hi) > 0.01 || Math.abs(sh) > 0.01) {
+      vfParts.push(
+        `colorbalance=rs=${sh.toFixed(3)}:bs=${sh.toFixed(3)}:rm=${temp.toFixed(3)}:bm=${(-temp).toFixed(3)}:rh=${hi.toFixed(3)}:bh=${hi.toFixed(3)}`
+      );
+    }
+
+    const sharp = (cg.sharpness || 0) + (cg.aiEnhance ? 0.25 : 0);
+    if (sharp > 0.05) {
+      vfParts.push(`unsharp=5:5:${Math.min(1.8, sharp).toFixed(2)}:5:5:0.0`);
+    }
+
+    // 3. Context-Aware Motion Graphics Overlays
+    const mg = clip.motionGraphics;
+
+    // Subtle fade in/out transitions
+    if (mg.subtleTransitions && clipDur > 2) {
+      vfParts.push(`fade=t=in:st=0:d=0.35`, `fade=t=out:st=${Math.max(0.5, clipDur - 0.35).toFixed(2)}:d=0.35`);
+    }
+
+    // Progress bar
+    if (mg.progressBar !== 'none') {
+      const barH = Math.max(6, Math.round(outH * 0.007));
+      const barY = mg.progressBar === 'top' ? 0 : outH - barH;
+      const barHex = (mg.progressBarColor || '#8B5CF6').replace('#', '0x');
+      vfParts.push(`drawbox=x=0:y=${barY}:w=iw:h=${barH}:color=0x000000@0.45:t=fill`);
+      vfParts.push(
+        `drawbox=x=0:y=${barY}:w=iw*min(1\\,t/${clipDur.toFixed(2)}):h=${barH}:color=${barHex}@0.95:t=fill`
+      );
+    }
+
+    // Animated Hook Title Card (opening few seconds)
+    if (mg.hookTitleEnabled && mg.hookTitleText.trim()) {
+      const hookDur = Math.min(clipDur * 0.5, Math.max(1.5, mg.hookDuration || 3));
+      const hookFontSize = Math.max(24, Math.round(Math.min(outW, outH) * 0.044));
+      const safeHook = escapeDrawtext(mg.hookTitleText.trim().slice(0, 44));
+      const boxY = Math.round(outH * 0.08);
+      vfParts.push(
+        `drawtext=font='DejaVu Sans':text='${safeHook}':x=(w-text_w)/2:y=${boxY}:fontsize=${hookFontSize}:fontcolor=0xFFFFFF:box=1:boxcolor=0x09090D@0.78:boxborderw=18:enable='between(t,0.15,${hookDur.toFixed(2)})'`
+      );
+    }
+
+    // Speaker Lower Third
+    if (mg.lowerThirdEnabled && mg.speakerLabel.trim()) {
+      const ltStart = mg.hookTitleEnabled ? 2.2 : 0.6;
+      const ltEnd = Math.min(clipDur - 0.5, ltStart + 4.5);
+      if (ltEnd > ltStart) {
+        const safeName = escapeDrawtext(mg.speakerLabel.trim().slice(0, 32));
+        const ltFontSize = Math.max(20, Math.round(Math.min(outW, outH) * 0.032));
+        const ltX = Math.round(outW * 0.06);
+        const ltY = Math.round(outH * 0.17);
+        vfParts.push(
+          `drawtext=font='DejaVu Sans':text='${safeName}':x=${ltX}:y=${ltY}:fontsize=${ltFontSize}:fontcolor=0xF4F5F8:box=1:boxcolor=0x141624@0.82:boxborderw=12:enable='between(t,${ltStart.toFixed(2)},${ltEnd.toFixed(2)})'`
+        );
+      }
     }
   }
 
-  // Custom Text Overlays
+  // Custom Text Overlays (only if user explicitly added them)
   for (const ov of clip.textOverlays) {
     if (!ov.text.trim()) continue;
     const safeText = escapeDrawtext(ov.text.trim());
@@ -618,7 +871,7 @@ export async function renderClipWithFFmpeg(params: {
     );
   }
 
-  // 4. Synchronized ASS Captions Burn-in
+  // 4. Synchronized High-End ASS Captions Burn-in
   if (options.embedCaptions && clip.captionStyle.enabled) {
     const assContent = generateAssSubtitles(project, clip, outW, outH);
     fs.writeFileSync(assPath, assContent, 'utf-8');
@@ -626,23 +879,20 @@ export async function renderClipWithFFmpeg(params: {
   }
 
   // Combine video filtergraph
-  const vChain = `${videoStreamLabel}${vfParts.join(',')}[vout]`;
+  const vChain = `${videoStreamLabel}${vfParts.length > 0 ? vfParts.join(',') : 'null'}[vout]`;
   complexFilters.push(vChain);
 
-  // 5. Audio inputs & Mixing (Original voice + Royalty-Free Music + Automatic Speech Ducking + Optional Hook SFX)
-  const inputs: string[] = [
-    '-ss',
-    clip.startTime.toFixed(3),
-    '-t',
-    clipDur.toFixed(3),
-    '-i',
-    project.sourcePath,
-  ];
+  // 5. Audio inputs & Mixing (Bit-exact audio copy in preserveOriginal mode when no music mix is added)
+  const inputs: string[] = isFullVideo
+    ? ['-i', project.sourcePath]
+    : ['-ss', clip.startTime.toFixed(3), '-t', clipDur.toFixed(3), '-i', project.sourcePath];
 
-  const hasSourceAudio = project.metadata.audioCodec !== 'none';
-  const musicPath = options.includeMusic ? await getMusicTrackPath(clip.audioMix.musicTrackId) : null;
+  const srcAudioCodec = (project.metadata.audioCodec || 'none').toLowerCase();
+  const hasSourceAudio = srcAudioCodec !== 'none';
+  const allowMusic = !preserveOriginal && options.includeMusic;
+  const musicPath = allowMusic ? await getMusicTrackPath(clip.audioMix.musicTrackId) : null;
   const sfxPath =
-    options.includeMusic && clip.audioMix.sfxOnHook !== 'none'
+    allowMusic && clip.audioMix.sfxOnHook !== 'none'
       ? await getSfxPath(clip.audioMix.sfxOnHook)
       : null;
 
@@ -659,13 +909,25 @@ export async function renderClipWithFFmpeg(params: {
   }
 
   let audioMapLabel: string | null = null;
+  let copyOriginalAudio = false;
   const origVol = Math.max(0, Math.min(2, clip.audioMix.originalVolume ?? 1));
   const musVol = Math.max(0, Math.min(1, clip.audioMix.musicVolume ?? 0.18));
   const fadeIn = Math.max(0, Math.min(clipDur / 3, clip.audioMix.fadeInSeconds ?? 1));
   const fadeOut = Math.max(0, Math.min(clipDur / 3, clip.audioMix.fadeOutSeconds ?? 1.5));
   const fadeOutStart = Math.max(0, clipDur - fadeOut);
 
-  if (hasSourceAudio && musicInputIdx >= 0) {
+  if (
+    preserveOriginal &&
+    hasSourceAudio &&
+    musicInputIdx < 0 &&
+    sfxInputIdx < 0 &&
+    Math.abs(origVol - 1) < 0.02 &&
+    (srcAudioCodec === 'aac' || srcAudioCodec === 'mp3')
+  ) {
+    // 100% lossless original audio pass-through!
+    copyOriginalAudio = true;
+    audioMapLabel = '0:a:0';
+  } else if (hasSourceAudio && musicInputIdx >= 0) {
     const fadeExpr = [
       fadeIn > 0.05 ? `afade=t=in:st=0:d=${fadeIn.toFixed(2)}` : '',
       fadeOut > 0.05 ? `afade=t=out:st=${fadeOutStart.toFixed(2)}:d=${fadeOut.toFixed(2)}` : '',
@@ -703,7 +965,7 @@ export async function renderClipWithFFmpeg(params: {
   }
 
   // Layer optional hook SFX at 0.15s
-  if (sfxInputIdx >= 0 && audioMapLabel) {
+  if (sfxInputIdx >= 0 && audioMapLabel && !copyOriginalAudio) {
     complexFilters.push(
       `[${sfxInputIdx}:a]aformat=sample_rates=48000:channel_layouts=stereo,adelay=150|150,volume=0.55[sfx_ready]`,
       `${audioMapLabel}[sfx_ready]amix=inputs=2:duration=first:normalize=0[a_final]`
@@ -712,7 +974,7 @@ export async function renderClipWithFFmpeg(params: {
   }
 
   const videoCodec = options.codec === 'h265' ? 'libx265' : 'libx264';
-  const qualityTier = options.quality ?? 'excellent';
+  const qualityTier = preserveOriginal ? (options.quality ?? 'master') : (options.quality ?? 'excellent');
   const crfValue =
     qualityTier === 'master'
       ? options.codec === 'h265'
@@ -725,12 +987,32 @@ export async function renderClipWithFFmpeg(params: {
         : options.resolution === '4k'
           ? '21'
           : '22';
-  const encodePreset = qualityTier === 'master' ? 'slow' : qualityTier === 'excellent' ? 'medium' : 'fast';
+  // Keep long full-video encodes fast while preserving CRF 16 visual fidelity
+  const encodePreset = preserveOriginal
+    ? clipDur > 600
+      ? 'fast'
+      : 'medium'
+    : qualityTier === 'master'
+      ? 'slow'
+      : qualityTier === 'excellent'
+        ? 'medium'
+        : 'fast';
 
   const codecExtraFlags: string[] =
     options.codec === 'h265'
       ? ['-tag:v', 'hvc1']
-      : ['-profile:v', 'high', '-level:v', '4.2'];
+      : outW > 1920 || outH > 1920
+        ? ['-profile:v', 'high', '-level:v', '5.1']
+        : ['-profile:v', 'high', '-level:v', '4.2'];
+
+  const keepOriginalFps = options.fps === 'original' || (preserveOriginal && !options.fps);
+  const fpsFlags: string[] = keepOriginalFps ? [] : ['-r', String(options.fps || 30)];
+
+  const audioEncodeFlags: string[] = !audioMapLabel
+    ? []
+    : copyOriginalAudio
+      ? ['-c:a', 'copy']
+      : ['-c:a', 'aac', '-b:a', preserveOriginal ? '256k' : '192k', '-ar', '48000'];
 
   const ffmpegArgs: string[] = [
     '-y',
@@ -740,8 +1022,7 @@ export async function renderClipWithFFmpeg(params: {
     '-map',
     '[vout]',
     ...(audioMapLabel ? ['-map', audioMapLabel] : ['-an']),
-    '-r',
-    String(options.fps || 30),
+    ...fpsFlags,
     '-c:v',
     videoCodec,
     '-preset',
@@ -751,13 +1032,10 @@ export async function renderClipWithFFmpeg(params: {
     ...codecExtraFlags,
     '-pix_fmt',
     'yuv420p',
-    '-color_primaries',
-    'bt709',
-    '-color_trc',
-    'bt709',
-    '-colorspace',
-    'bt709',
-    ...(audioMapLabel ? ['-c:a', 'aac', '-b:a', '192k', '-ar', '48000'] : []),
+    ...(preserveOriginal
+      ? []
+      : ['-color_primaries', 'bt709', '-color_trc', 'bt709', '-colorspace', 'bt709']),
+    ...audioEncodeFlags,
     '-movflags',
     '+faststart',
     '-f',

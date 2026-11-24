@@ -10,6 +10,9 @@ import {
   Film,
   Sparkles,
   Loader2,
+  Captions,
+  Scissors,
+  ShieldCheck,
 } from 'lucide-react';
 import type {
   AnalysisConfig,
@@ -17,6 +20,7 @@ import type {
   AspectRatio,
   FramingMode,
   MotionIntensity,
+  ProcessingMode,
 } from '../../shared/types.ts';
 import { CAPTION_PRESETS, SUPPORTED_LANGUAGES, VISUAL_STYLE_PRESETS } from '../../shared/presets.ts';
 import { api } from '../lib/api.ts';
@@ -66,6 +70,7 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
   const [config, setConfig] = useState<AnalysisConfig>(
     () =>
       uploadState.savedConfig ?? {
+        mode: 'auto_clips',
         targetClipDuration: settings.defaultClipDuration,
         clipCount: settings.defaultClipCount,
         language: settings.defaultLanguage,
@@ -76,6 +81,7 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
         motionIntensity: settings.defaultMotionIntensity,
       }
   );
+  const processingMode: ProcessingMode = config.mode === 'captions_only' ? 'captions_only' : 'auto_clips';
 
   // Preserve configuration choices if the user explores other pages during an upload
   useEffect(() => {
@@ -431,207 +437,345 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
           )}
         </div>
 
-        {/* Right: Clipping & AI Intelligence Configuration */}
+        {/* Right: Workflow Mode & AI Configuration */}
         <div className="xl:col-span-5 p-6 rounded-xl studio-panel space-y-5">
           <div>
             <h2 className="font-display text-base font-semibold text-white">
-              AI Clipping Configuration
+              Workflow Mode &amp; Configuration
             </h2>
             <p className="text-xs text-zinc-400 mt-0.5">
-              Customize target duration, clip count, spoken language, framing, and visual defaults before analysis.
+              Choose whether to auto-generate viral short clips or keep your entire original video unchanged with high-end captions.
             </p>
           </div>
 
-          {/* Target Clip Duration */}
-          <div>
-            <label className="block text-xs font-medium text-zinc-300 mb-2">
-              Target Clip Duration
-            </label>
-            <div className="grid grid-cols-3 gap-2">
-              {[
-                { val: '60', label: '1 min' },
-                { val: '120', label: '2 min' },
-                { val: '180', label: '3 min' },
-                { val: '240', label: '4 min' },
-                { val: '300', label: '5 min' },
-                { val: 'custom', label: 'Custom' },
-              ].map((opt) => (
-                <button
-                  key={opt.val}
-                  type="button"
-                  onClick={() => setDurationPreset(opt.val)}
-                  className={`h-9 rounded-lg text-xs font-medium transition-colors whitespace-nowrap ${
-                    durationPreset === opt.val
-                      ? 'bg-[#059669] text-white border border-[#D4AF37]/40'
-                      : 'bg-[#0C1510] text-zinc-300 hover:bg-[#132219] border border-[#D4AF37]/12'
-                  }`}
-                >
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-            {durationPreset === 'custom' && (
-              <div className="mt-2.5 flex items-center gap-3">
-                <input
-                  type="number"
-                  min={10}
-                  max={600}
-                  value={customDurationSec}
-                  onChange={(e) => setCustomDurationSec(Number(e.target.value) || 30)}
-                  className="w-28 h-9 px-3 rounded-lg bg-[#0C1510] border border-[#D4AF37]/20 font-mono text-xs text-white tabular-nums focus:outline-none focus:border-[#D4AF37]"
-                />
-                <span className="text-xs text-zinc-400">seconds per clip (10–600s)</span>
+          {/* 2-Card Mode Selector */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+            <button
+              type="button"
+              onClick={() =>
+                setConfig((c) => ({
+                  ...c,
+                  mode: 'auto_clips',
+                  aspectRatio: c.aspectRatio === 'original' ? settings.defaultAspectRatio : c.aspectRatio,
+                }))
+              }
+              className={`p-3.5 rounded-xl border text-left transition-colors ${
+                processingMode === 'auto_clips'
+                  ? 'bg-[#059669]/20 border-[#D4AF37]/70'
+                  : 'bg-[#0C1510] border-[#D4AF37]/15 hover:border-[#D4AF37]/35'
+              }`}
+            >
+              <div className="flex items-center gap-2 text-xs font-semibold text-white">
+                <Scissors className="w-4 h-4 text-[#F5C451] shrink-0" />
+                AI Auto-Clipping
               </div>
-            )}
+              <p className="mt-1 text-[11px] text-zinc-400 leading-relaxed">
+                Detect top hooks, reframe, color grade &amp; cut viral clips.
+              </p>
+            </button>
+
+            <button
+              type="button"
+              onClick={() =>
+                setConfig((c) => ({
+                  ...c,
+                  mode: 'captions_only',
+                  aspectRatio: 'original',
+                  captionPresetId:
+                    c.captionPresetId === settings.defaultCaptionPresetId
+                      ? 'loki-emerald-gold'
+                      : c.captionPresetId,
+                }))
+              }
+              className={`p-3.5 rounded-xl border text-left transition-colors ${
+                processingMode === 'captions_only'
+                  ? 'bg-[#059669]/20 border-[#D4AF37]/70'
+                  : 'bg-[#0C1510] border-[#D4AF37]/15 hover:border-[#D4AF37]/35'
+              }`}
+            >
+              <div className="flex items-center gap-2 text-xs font-semibold text-white">
+                <Captions className="w-4 h-4 text-[#10B981] shrink-0" />
+                Captions Only (Full Video)
+              </div>
+              <p className="mt-1 text-[11px] text-zinc-400 leading-relaxed">
+                Zero video changes · Same original quality · High-end captions.
+              </p>
+            </button>
           </div>
 
-          {/* Number of Clips */}
-          <div>
-            <label className="block text-xs font-medium text-zinc-300 mb-2">
-              Number of Clips to Generate
-            </label>
-            <div className="grid grid-cols-3 gap-2">
-              {[
-                { val: 5, label: '5 clips' },
-                { val: 10, label: '10 clips' },
-                { val: 15, label: '15 clips' },
-                { val: 20, label: '20 clips' },
-                { val: 30, label: '30 clips' },
-                { val: 0, label: 'Maximum' },
-              ].map((opt) => (
-                <button
-                  key={opt.val}
-                  type="button"
-                  onClick={() => setConfig((c) => ({ ...c, clipCount: opt.val }))}
-                  className={`h-9 rounded-lg text-xs font-medium transition-colors whitespace-nowrap ${
-                    config.clipCount === opt.val
-                      ? 'bg-[#059669] text-white border border-[#D4AF37]/40'
-                      : 'bg-[#0C1510] text-zinc-300 hover:bg-[#132219] border border-[#D4AF37]/12'
-                  }`}
+          {processingMode === 'captions_only' ? (
+            <div className="space-y-4">
+              <div className="p-3.5 rounded-xl bg-[#071811] border border-[#10B981]/30 space-y-1.5">
+                <div className="flex items-center gap-2 text-xs font-semibold text-emerald-300">
+                  <ShieldCheck className="w-4 h-4 text-[#F5C451] shrink-0" />
+                  100% Original Video Preserved — Zero Alterations
+                </div>
+                <p className="text-[11px] text-zinc-300 leading-relaxed">
+                  No cutting, no cropping, no zoom/pan, and no color grading. Exports in your video&apos;s exact original resolution, FPS &amp; audio quality — plus instant 0%-re-encode soft-sub MP4, SRT, VTT &amp; ASS files.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-zinc-300 mb-1.5">
+                  Spoken Language
+                </label>
+                <select
+                  value={config.language}
+                  onChange={(e) => setConfig((c) => ({ ...c, language: e.target.value }))}
+                  className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
                 >
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-          </div>
+                  {SUPPORTED_LANGUAGES.map((l) => (
+                    <option key={l.code} value={l.code} className="bg-[#0C1510]">
+                      {l.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
 
-          {/* Language & Aspect Ratio */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs font-medium text-zinc-300 mb-1.5">
-                Spoken Language
-              </label>
-              <select
-                value={config.language}
-                onChange={(e) => setConfig((c) => ({ ...c, language: e.target.value }))}
-                className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
-              >
-                {SUPPORTED_LANGUAGES.map((l) => (
-                  <option key={l.code} value={l.code} className="bg-[#0C1510]">
-                    {l.label}
-                  </option>
-                ))}
-              </select>
+              <div>
+                <label className="block text-xs font-medium text-zinc-300 mb-2">
+                  High-End Caption Style ({CAPTION_PRESETS.length} Studio Presets)
+                </label>
+                <div className="grid grid-cols-2 gap-2 max-h-[260px] overflow-y-auto pr-1">
+                  {CAPTION_PRESETS.map((preset) => {
+                    const active = config.captionPresetId === preset.id;
+                    const c = preset.config;
+                    return (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        onClick={() => setConfig((cfg) => ({ ...cfg, captionPresetId: preset.id }))}
+                        className={`p-2.5 rounded-lg border text-left transition-colors ${
+                          active
+                            ? 'bg-[#059669]/20 border-[#D4AF37]/70'
+                            : 'bg-[#0C1510] border-[#D4AF37]/12 hover:border-[#D4AF37]/35'
+                        }`}
+                      >
+                        <div
+                          style={{
+                            backgroundColor: c.backgroundOpacity > 0.2 ? c.backgroundColor : '#09090D',
+                          }}
+                          className="h-8 rounded flex items-center justify-center px-1.5 mb-1.5 overflow-hidden"
+                        >
+                          <span
+                            style={{
+                              fontFamily: c.fontFamily,
+                              fontWeight: c.fontWeight,
+                              color: c.textColor,
+                              textShadow: c.shadow ? '0 1px 4px rgba(0,0,0,0.9)' : 'none',
+                            }}
+                            className="text-[11px] tracking-tight truncate"
+                          >
+                            {c.uppercase ? 'HIGH END ' : 'High end '}
+                            <span style={{ color: c.highlightColor }}>
+                              {c.uppercase ? 'STYLE' : 'style'}
+                            </span>
+                          </span>
+                        </div>
+                        <div className="text-[11px] font-semibold text-white truncate">{preset.name}</div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
+          ) : (
+            <>
+              {/* Target Clip Duration */}
+              <div>
+                <label className="block text-xs font-medium text-zinc-300 mb-2">
+                  Target Clip Duration
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  {[
+                    { val: '60', label: '1 min' },
+                    { val: '120', label: '2 min' },
+                    { val: '180', label: '3 min' },
+                    { val: '240', label: '4 min' },
+                    { val: '300', label: '5 min' },
+                    { val: 'custom', label: 'Custom' },
+                  ].map((opt) => (
+                    <button
+                      key={opt.val}
+                      type="button"
+                      onClick={() => setDurationPreset(opt.val)}
+                      className={`h-9 rounded-lg text-xs font-medium transition-colors whitespace-nowrap ${
+                        durationPreset === opt.val
+                          ? 'bg-[#059669] text-white border border-[#D4AF37]/40'
+                          : 'bg-[#0C1510] text-zinc-300 hover:bg-[#132219] border border-[#D4AF37]/12'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+                {durationPreset === 'custom' && (
+                  <div className="mt-2.5 flex items-center gap-3">
+                    <input
+                      type="number"
+                      min={10}
+                      max={600}
+                      value={customDurationSec}
+                      onChange={(e) => setCustomDurationSec(Number(e.target.value) || 30)}
+                      className="w-28 h-9 px-3 rounded-lg bg-[#0C1510] border border-[#D4AF37]/20 font-mono text-xs text-white tabular-nums focus:outline-none focus:border-[#D4AF37]"
+                    />
+                    <span className="text-xs text-zinc-400">seconds per clip (10–600s)</span>
+                  </div>
+                )}
+              </div>
 
-            <div>
-              <label className="block text-xs font-medium text-zinc-300 mb-1.5">
-                Output Aspect Ratio
-              </label>
-              <select
-                value={config.aspectRatio}
-                onChange={(e) =>
-                  setConfig((c) => ({ ...c, aspectRatio: e.target.value as AspectRatio }))
-                }
-                className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
-              >
-                <option value="9:16" className="bg-[#0C1510]">9:16 — Shorts / Reels / TikTok</option>
-                <option value="16:9" className="bg-[#0C1510]">16:9 — YouTube Landscape</option>
-                <option value="1:1" className="bg-[#0C1510]">1:1 — Square Social</option>
-                <option value="4:5" className="bg-[#0C1510]">4:5 — Instagram Portrait</option>
-                <option value="4:3" className="bg-[#0C1510]">4:3 — Traditional</option>
-              </select>
-            </div>
-          </div>
+              {/* Number of Clips */}
+              <div>
+                <label className="block text-xs font-medium text-zinc-300 mb-2">
+                  Number of Clips to Generate
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  {[
+                    { val: 5, label: '5 clips' },
+                    { val: 10, label: '10 clips' },
+                    { val: 15, label: '15 clips' },
+                    { val: 20, label: '20 clips' },
+                    { val: 30, label: '30 clips' },
+                    { val: 0, label: 'Maximum' },
+                  ].map((opt) => (
+                    <button
+                      key={opt.val}
+                      type="button"
+                      onClick={() => setConfig((c) => ({ ...c, clipCount: opt.val }))}
+                      className={`h-9 rounded-lg text-xs font-medium transition-colors whitespace-nowrap ${
+                        config.clipCount === opt.val
+                          ? 'bg-[#059669] text-white border border-[#D4AF37]/40'
+                          : 'bg-[#0C1510] text-zinc-300 hover:bg-[#132219] border border-[#D4AF37]/12'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
 
-          {/* Framing, Caption Preset, Visual Style, Motion Intensity */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs font-medium text-zinc-300 mb-1.5">
-                Reframing Mode
-              </label>
-              <select
-                value={config.framingMode}
-                onChange={(e) =>
-                  setConfig((c) => ({ ...c, framingMode: e.target.value as FramingMode }))
-                }
-                className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
-              >
-                <option value="ai_auto" className="bg-[#0C1510]">AI Auto Reframe</option>
-                <option value="face_track" className="bg-[#0C1510]">Face Tracking</option>
-                <option value="manual" className="bg-[#0C1510]">Manual Crop</option>
-              </select>
-            </div>
+              {/* Language & Aspect Ratio */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-zinc-300 mb-1.5">
+                    Spoken Language
+                  </label>
+                  <select
+                    value={config.language}
+                    onChange={(e) => setConfig((c) => ({ ...c, language: e.target.value }))}
+                    className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
+                  >
+                    {SUPPORTED_LANGUAGES.map((l) => (
+                      <option key={l.code} value={l.code} className="bg-[#0C1510]">
+                        {l.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
 
-            <div>
-              <label className="block text-xs font-medium text-zinc-300 mb-1.5">
-                Caption Preset
-              </label>
-              <select
-                value={config.captionPresetId}
-                onChange={(e) => setConfig((c) => ({ ...c, captionPresetId: e.target.value }))}
-                className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
-              >
-                {CAPTION_PRESETS.map((p) => (
-                  <option key={p.id} value={p.id} className="bg-[#0C1510]">
-                    {p.name}
-                  </option>
-                ))}
-              </select>
-            </div>
+                <div>
+                  <label className="block text-xs font-medium text-zinc-300 mb-1.5">
+                    Output Aspect Ratio
+                  </label>
+                  <select
+                    value={config.aspectRatio}
+                    onChange={(e) =>
+                      setConfig((c) => ({ ...c, aspectRatio: e.target.value as AspectRatio }))
+                    }
+                    className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
+                  >
+                    <option value="9:16" className="bg-[#0C1510]">9:16 — Shorts / Reels / TikTok</option>
+                    <option value="16:9" className="bg-[#0C1510]">16:9 — YouTube Landscape</option>
+                    <option value="1:1" className="bg-[#0C1510]">1:1 — Square Social</option>
+                    <option value="4:5" className="bg-[#0C1510]">4:5 — Instagram Portrait</option>
+                    <option value="4:3" className="bg-[#0C1510]">4:3 — Traditional</option>
+                    <option value="original" className="bg-[#0C1510]">Original Source Aspect Ratio</option>
+                  </select>
+                </div>
+              </div>
 
-            <div>
-              <label className="block text-xs font-medium text-zinc-300 mb-1.5">
-                Visual Style
-              </label>
-              <select
-                value={config.stylePresetId}
-                onChange={(e) => setConfig((c) => ({ ...c, stylePresetId: e.target.value }))}
-                className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
-              >
-                {VISUAL_STYLE_PRESETS.map((s) => (
-                  <option key={s.id} value={s.id} className="bg-[#0C1510]">
-                    {s.name}
-                  </option>
-                ))}
-              </select>
-            </div>
+              {/* Framing, Caption Preset, Visual Style, Motion Intensity */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-zinc-300 mb-1.5">
+                    Reframing Mode
+                  </label>
+                  <select
+                    value={config.framingMode}
+                    onChange={(e) =>
+                      setConfig((c) => ({ ...c, framingMode: e.target.value as FramingMode }))
+                    }
+                    className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
+                  >
+                    <option value="ai_auto" className="bg-[#0C1510]">AI Auto Reframe</option>
+                    <option value="face_track" className="bg-[#0C1510]">Face Tracking</option>
+                    <option value="manual" className="bg-[#0C1510]">Manual Crop</option>
+                  </select>
+                </div>
 
-            <div>
-              <label className="block text-xs font-medium text-zinc-300 mb-1.5">
-                Motion Graphics Intensity
-              </label>
-              <select
-                value={config.motionIntensity}
-                onChange={(e) =>
-                  setConfig((c) => ({
-                    ...c,
-                    motionIntensity: e.target.value as MotionIntensity,
-                  }))
-                }
-                className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
-              >
-                <option value="minimal" className="bg-[#0C1510]">Minimal</option>
-                <option value="balanced" className="bg-[#0C1510]">Balanced</option>
-                <option value="dynamic" className="bg-[#0C1510]">Dynamic</option>
-              </select>
-            </div>
-          </div>
+                <div>
+                  <label className="block text-xs font-medium text-zinc-300 mb-1.5">
+                    Caption Preset
+                  </label>
+                  <select
+                    value={config.captionPresetId}
+                    onChange={(e) => setConfig((c) => ({ ...c, captionPresetId: e.target.value }))}
+                    className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
+                  >
+                    {CAPTION_PRESETS.map((p) => (
+                      <option key={p.id} value={p.id} className="bg-[#0C1510]">
+                        {p.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-zinc-300 mb-1.5">
+                    Visual Style
+                  </label>
+                  <select
+                    value={config.stylePresetId}
+                    onChange={(e) => setConfig((c) => ({ ...c, stylePresetId: e.target.value }))}
+                    className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
+                  >
+                    {VISUAL_STYLE_PRESETS.map((s) => (
+                      <option key={s.id} value={s.id} className="bg-[#0C1510]">
+                        {s.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-zinc-300 mb-1.5">
+                    Motion Graphics Intensity
+                  </label>
+                  <select
+                    value={config.motionIntensity}
+                    onChange={(e) =>
+                      setConfig((c) => ({
+                        ...c,
+                        motionIntensity: e.target.value as MotionIntensity,
+                      }))
+                    }
+                    className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
+                  >
+                    <option value="minimal" className="bg-[#0C1510]">Minimal</option>
+                    <option value="balanced" className="bg-[#0C1510]">Balanced</option>
+                    <option value="dynamic" className="bg-[#0C1510]">Dynamic</option>
+                  </select>
+                </div>
+              </div>
+            </>
+          )}
 
           <div className="pt-2 space-y-3">
             <label className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/15 cursor-pointer">
               <span className="text-xs text-zinc-300">
-                Auto-start AI analysis &amp; clip generation when upload finishes
+                {processingMode === 'captions_only'
+                  ? 'Auto-start high-end caption generation when upload finishes'
+                  : 'Auto-start AI analysis & clip generation when upload finishes'}
               </span>
               <input
                 type="checkbox"
@@ -648,14 +792,20 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
             >
               {startingAnalysis ? (
                 <Loader2 className="w-4 h-4 animate-spin" />
+              ) : processingMode === 'captions_only' ? (
+                <Captions className="w-4 h-4 text-[#FEF3C7]" />
               ) : (
                 <Cpu className="w-4 h-4 text-[#FEF3C7]" />
               )}
               {startingAnalysis
-                ? 'Starting AI Pipeline...'
+                ? processingMode === 'captions_only'
+                  ? 'Starting Caption Engine...'
+                  : 'Starting AI Pipeline...'
                 : uploadedProject?.status === 'analyzing'
-                  ? 'View Live AI Analysis'
-                  : 'Analyze Video & Generate Clips'}
+                  ? 'View Live Processing'
+                  : processingMode === 'captions_only'
+                    ? 'Generate High-End Captions (Original Quality)'
+                    : 'Analyze Video & Generate Clips'}
             </button>
           </div>
         </div>

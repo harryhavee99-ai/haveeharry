@@ -49,7 +49,14 @@ export function ClipPreviewPlayer({
   const [mediaError, setMediaError] = useState(false);
 
   const clipDuration = Math.max(0.5, clip.endTime - clip.startTime);
-  const ratio = getAspectRatioNumeric(clip.framing.aspectRatio);
+  const preserveOriginal = Boolean(
+    clip.preserveOriginalVideo || clip.isFullVideoCaption || clip.framing.aspectRatio === 'original'
+  );
+  const ratio = getAspectRatioNumeric(
+    clip.framing.aspectRatio,
+    project.metadata?.width,
+    project.metadata?.height
+  );
   const showingRendered = Boolean(previewRendered && clip.renderedVideoUrl);
   const videoSrc = showingRendered ? clip.renderedVideoUrl : project.sourceUrl;
 
@@ -252,8 +259,8 @@ export function ClipPreviewPlayer({
 
   // Dynamic zoom + punch-in scale factor
   const liveScale = useMemo(() => {
+    if (showingRendered || preserveOriginal) return 1;
     const base = clip.framing.zoom || 1;
-    if (showingRendered) return 1;
     let extra = 1;
     if (clip.motionGraphics.dynamicZoom) {
       const progress = relTime / clipDuration;
@@ -268,11 +275,11 @@ export function ClipPreviewPlayer({
       extra *= 1.05;
     }
     return base * extra;
-  }, [clip.framing.zoom, clip.motionGraphics, relTime, clipDuration, activeKeyword, showingRendered]);
+  }, [clip.framing.zoom, clip.motionGraphics, relTime, clipDuration, activeKeyword, showingRendered, preserveOriginal]);
 
   // Pointer drag handler for Manual Crop mode
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (clip.framing.mode !== 'manual' || !onManualFocalChange || showingRendered) return;
+    if (clip.framing.mode !== 'manual' || !onManualFocalChange || showingRendered || preserveOriginal) return;
     setIsDraggingCrop(true);
     e.currentTarget.setPointerCapture(e.pointerId);
   };
@@ -291,15 +298,22 @@ export function ClipPreviewPlayer({
     setIsDraggingCrop(false);
   };
 
-  const cssFilter = showingRendered ? 'none' : buildCssFilterFromGrading(clip.colorGrading);
+  const cssFilter = showingRendered || preserveOriginal ? 'none' : buildCssFilterFromGrading(clip.colorGrading);
   const progressPct = Math.min(100, Math.max(0, (relTime / clipDuration) * 100));
 
   const cs = clip.captionStyle;
   const mg = clip.motionGraphics;
 
-  const showHook = !showingRendered && mg.hookTitleEnabled && mg.hookTitleText.trim() && relTime >= 0.1 && relTime <= mg.hookDuration;
+  const showHook =
+    !showingRendered &&
+    !preserveOriginal &&
+    mg.hookTitleEnabled &&
+    mg.hookTitleText.trim() &&
+    relTime >= 0.1 &&
+    relTime <= mg.hookDuration;
   const showLowerThird =
     !showingRendered &&
+    !preserveOriginal &&
     mg.lowerThirdEnabled &&
     mg.speakerLabel.trim() &&
     relTime >= (mg.hookTitleEnabled ? 2.2 : 0.5) &&
@@ -316,11 +330,13 @@ export function ClipPreviewPlayer({
         onPointerCancel={handlePointerUp}
         style={{ aspectRatio: String(ratio) }}
         className={`relative w-full ${maxHeightClass} bg-black rounded-xl overflow-hidden border border-white/[0.1] select-none ${
-          clip.framing.mode === 'manual' && !showingRendered ? 'cursor-grab active:cursor-grabbing' : ''
+          clip.framing.mode === 'manual' && !showingRendered && !preserveOriginal
+            ? 'cursor-grab active:cursor-grabbing'
+            : ''
         }`}
       >
         {/* Optional Blurred Background Layer */}
-        {!showingRendered && mg.backgroundBlur && videoSrc && !mediaError && (
+        {!showingRendered && !preserveOriginal && mg.backgroundBlur && videoSrc && !mediaError && (
           <video
             ref={bgVideoRef}
             src={videoSrc}
@@ -354,14 +370,17 @@ export function ClipPreviewPlayer({
             }}
             style={{
               filter: cssFilter,
-              objectPosition: showingRendered
-                ? '50% 50%'
-                : `${(focalPoint.x * 100).toFixed(1)}% ${(focalPoint.y * 100).toFixed(1)}%`,
-              transform: showingRendered ? 'none' : `scale(${liveScale.toFixed(3)})`,
+              objectPosition:
+                showingRendered || preserveOriginal
+                  ? '50% 50%'
+                  : `${(focalPoint.x * 100).toFixed(1)}% ${(focalPoint.y * 100).toFixed(1)}%`,
+              transform: showingRendered || preserveOriginal ? 'none' : `scale(${liveScale.toFixed(3)})`,
               transition: isDraggingCrop ? 'none' : 'transform 160ms ease-out',
             }}
             className={`w-full h-full ${
-              !showingRendered && mg.backgroundBlur ? 'object-contain relative z-10' : 'object-cover'
+              preserveOriginal || (!showingRendered && mg.backgroundBlur)
+                ? 'object-contain relative z-10'
+                : 'object-cover'
             }`}
           />
         ) : (
@@ -382,12 +401,12 @@ export function ClipPreviewPlayer({
         )}
 
         {/* Background Music Sync Audio */}
-        {activeMusicTrack && !showingRendered && (
+        {activeMusicTrack && !showingRendered && !preserveOriginal && (
           <audio ref={audioRef} src={activeMusicTrack.url} loop preload="none" />
         )}
 
         {/* Manual Crop Guidance Indicator */}
-        {clip.framing.mode === 'manual' && !showingRendered && (
+        {clip.framing.mode === 'manual' && !showingRendered && !preserveOriginal && (
           <div className="absolute top-3 right-3 z-30 flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#050A07]/85 border border-[#D4AF37]/25 text-[11px] font-medium text-zinc-200 pointer-events-none">
             <Move className="w-3 h-3 text-[#F5C451]" />
             Drag to crop
@@ -395,7 +414,7 @@ export function ClipPreviewPlayer({
         )}
 
         {/* Progress Bar Motion Graphic */}
-        {!showingRendered && mg.progressBar !== 'none' && (
+        {!showingRendered && !preserveOriginal && mg.progressBar !== 'none' && (
           <div
             className={`absolute left-0 right-0 h-1.5 bg-black/45 z-30 ${
               mg.progressBar === 'top' ? 'top-0' : 'bottom-0'
@@ -435,7 +454,7 @@ export function ClipPreviewPlayer({
         )}
 
         {/* Keyword Emphasis Callout */}
-        {!showingRendered && activeKeyword && (
+        {!showingRendered && !preserveOriginal && activeKeyword && (
           <div className="absolute top-[30%] right-4 z-30 pointer-events-none animate-caption-pop">
             <div className="px-3 py-1 rounded-md bg-[#059669]/95 border border-[#D4AF37]/50 text-[#FEF3C7] text-xs font-bold shadow-lg">
               {activeKeyword.toUpperCase()}
@@ -510,6 +529,8 @@ export function ClipPreviewPlayer({
             >
               {activeCaptionGroup.group.map((w, idx) => {
                 const isActive = cs.wordLevelHighlight && idx === activeCaptionGroup.activeIdx;
+                const isKaraokeLit =
+                  cs.wordLevelHighlight && cs.animation === 'karaoke' && idx <= activeCaptionGroup.activeIdx;
                 const displayWord = cs.uppercase ? w.word.toUpperCase() : w.word;
                 const needBreak = idx > 0 && idx % cs.wordsPerLine === 0;
                 return (
@@ -517,14 +538,19 @@ export function ClipPreviewPlayer({
                     {needBreak ? <br /> : idx > 0 ? ' ' : ''}
                     <span
                       style={{
-                        color: isActive ? cs.highlightColor : cs.textColor,
-                        transform: isActive && cs.animation === 'pop' ? 'scale(1.07)' : 'none',
+                        color: isActive || isKaraokeLit ? cs.highlightColor : cs.textColor,
+                        transform:
+                          isActive && (cs.animation === 'pop' || cs.animation === 'karaoke')
+                            ? 'scale(1.08)'
+                            : isActive && cs.animation === 'glow'
+                              ? 'scale(1.04)'
+                              : 'none',
                         textShadow:
                           isActive && cs.animation === 'glow'
-                            ? `0 0 14px ${cs.highlightColor}, 0 2px 6px rgba(0,0,0,0.9)`
+                            ? `0 0 16px ${cs.highlightColor}, 0 0 6px ${cs.highlightColor}, 0 2px 6px rgba(0,0,0,0.92)`
                             : undefined,
                       }}
-                      className="inline-block transition-colors duration-75"
+                      className="inline-block transition-all duration-100"
                     >
                       {displayWord}
                     </span>

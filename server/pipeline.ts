@@ -19,6 +19,8 @@ import {
   createDefaultAudioMix,
   createDefaultFraming,
   createDefaultMotionGraphics,
+  createDisabledMotionGraphics,
+  createNeutralColorGrading,
   getCaptionPreset,
   getVisualStylePreset,
 } from '../shared/presets.ts';
@@ -762,6 +764,65 @@ export function buildClipFromHookCandidate(project: ProjectRecord, candidate: Ho
 }
 
 /**
+ * Builds a Full-Original-Video Captions-Only ClipRecord that preserves 100% of the source video
+ * (0 to full duration, original aspect ratio & resolution, neutral color grading, zero motion/crop changes).
+ */
+export function buildFullVideoCaptionClip(
+  project: ProjectRecord,
+  captionPresetId?: string,
+  existingClipId?: string
+): ClipRecord {
+  const clipId = existingClipId || uuidv4();
+  const now = new Date().toISOString();
+  const duration = Number(Math.max(1, project.metadata?.duration ?? 1).toFixed(2));
+  const chosenPreset = captionPresetId || project.analysisConfig.captionPresetId || 'loki-emerald-gold';
+
+  return {
+    id: clipId,
+    projectId: project.id,
+    originalVideoId: project.uploadId ?? project.id,
+    isFullVideoCaption: true,
+    preserveOriginalVideo: true,
+    title: `${project.name} — Full Video Captions`,
+    topic: 'Full Original Video',
+    description: 'Complete original video with synchronized high-end captions and zero video alterations.',
+    reasonSelected: 'Captions-Only mode — preserves original framing, duration, color, FPS & resolution.',
+    category: 'informative',
+    startTime: 0,
+    endTime: duration,
+    duration,
+    scores: {
+      overall: 100,
+      hookStrength: 100,
+      engagement: 100,
+      educationalValue: 100,
+      emotionalImpact: 100,
+      humor: 100,
+      informationValue: 100,
+      storyCompleteness: 100,
+    },
+    editingStatus: 'auto_generated',
+    renderStatus: 'not_rendered',
+    thumbnailUrl: project.thumbnailUrl || `/media/projects/${project.id}/thumb.jpg`,
+    framing: {
+      aspectRatio: 'original',
+      mode: 'manual',
+      manualX: 0.5,
+      manualY: 0.5,
+      zoom: 1.0,
+      focalKeyframes: [],
+    },
+    captionStyle: getCaptionPreset(chosenPreset),
+    colorGrading: createNeutralColorGrading(),
+    motionGraphics: createDisabledMotionGraphics(),
+    audioMix: createDefaultAudioMix(),
+    textOverlays: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+/**
  * Fast lightweight FFmpeg scene-change detector (for videos <= 10 min) returning up to 12 cut timestamps.
  */
 async function detectSceneChangeTimestamps(videoPath: string, duration: number): Promise<number[]> {
@@ -1012,11 +1073,19 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
       });
     }
 
+    const isCaptionsOnly = project.analysisConfig.mode === 'captions_only';
+
     // STAGE 3: Silence Detection, Audio Energy Dynamics, Scene Cuts & Keyframe Sampling
     activeStage = 'signal_analysis';
     const signalStage = project.pipelineStages.find((s) => s.key === 'signal_analysis');
     let sampledKeyframes: Array<{ time: number; filePath: string; filename: string }> = [];
-    if (!signalStage || signalStage.status !== 'completed') {
+    if (isCaptionsOnly) {
+      updateStage(project, 'signal_analysis', {
+        status: 'completed',
+        progress: 100,
+        detail: 'Skipped scene slicing (Captions-Only mode keeps full original video untouched)',
+      });
+    } else if (!signalStage || signalStage.status !== 'completed') {
       updateStage(project, 'signal_analysis', {
         status: 'running',
         progress: 20,
@@ -1118,6 +1187,95 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
         progress: 100,
         detail: `${project.transcript.length} timestamped segments · ${wordCount} words (${project.detectedLanguage || 'detected'})`,
       });
+    }
+
+    // CAPTIONS-ONLY FAST PATH: Preserve full original video without cuts/reframe/grading and render same-quality captioned MP4
+    if (isCaptionsOnly) {
+      updateStage(project, 'visual_framing', {
+        status: 'completed',
+        progress: 100,
+        detail: `Preserved original ${meta.width}×${meta.height} framing (zero cropping or reframing)`,
+      });
+      updateStage(project, 'hook_discovery', {
+        status: 'completed',
+        progress: 100,
+        detail: 'Skipped clipping (Captions-Only mode — full original video kept intact)',
+      });
+      updateStage(project, 'hook_scoring', {
+        status: 'completed',
+        progress: 100,
+        detail: 'Skipped highlight scoring (Captions-Only mode)',
+      });
+      updateStage(project, 'hook_verification', {
+        status: 'completed',
+        progress: 100,
+        detail: 'Verified full-length word-level subtitle timeline',
+      });
+
+      activeStage = 'clip_generation';
+      updateStage(project, 'clip_generation', {
+        status: 'running',
+        progress: 50,
+        detail: 'Creating full-video high-end caption track (zero video changes)...',
+      });
+
+      const existingFull = project.clips.find((c) => c.isFullVideoCaption);
+      const fullClip = buildFullVideoCaptionClip(
+        project,
+        project.analysisConfig.captionPresetId,
+        existingFull?.id
+      );
+      if (existingFull) {
+        project.clips = project.clips.map((c) => (c.id === existingFull.id ? fullClip : c));
+      } else {
+        project.clips = [fullClip, ...project.clips];
+      }
+      store.upsertProject(project);
+
+      updateStage(project, 'clip_generation', {
+        status: 'completed',
+        progress: 100,
+        detail: `Full-video caption track ready (${meta.width}×${meta.height} · ${Math.round(meta.duration)}s · original quality)`,
+      });
+
+      activeStage = 'clip_rendering';
+      updateStage(project, 'clip_rendering', {
+        status: 'running',
+        progress: 15,
+        detail: `Burning high-end captions onto original ${meta.width}×${meta.height} video at master quality...`,
+      });
+
+      const latestProj = store.getProject(projectId) ?? project;
+      const latestClip = latestProj.clips.find((c) => c.id === fullClip.id) ?? fullClip;
+      await renderClipWithFFmpeg({
+        project: latestProj,
+        clip: latestClip,
+        options: {
+          resolution: 'original',
+          codec: 'h264',
+          fps: 'original',
+          quality: 'master',
+          embedCaptions: true,
+          includeMusic: false,
+        },
+      });
+
+      const synced = store.getProject(projectId);
+      if (synced) {
+        project.clips = synced.clips;
+      }
+
+      updateStage(project, 'clip_rendering', {
+        status: 'completed',
+        progress: 100,
+        detail: `Captioned MP4 ready in original ${meta.width}×${meta.height} quality (downloadable in Caption Studio & Export Center)`,
+      });
+
+      project.status = 'ready';
+      project.errorMessage = undefined;
+      project.failedStage = undefined;
+      store.upsertProject(project);
+      return;
     }
 
     // STAGE 5: Visual Framing & Active Speaker Detection

@@ -1,20 +1,41 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Save, Layers, CheckCircle2, Loader2, UploadCloud } from 'lucide-react';
+import {
+  Save,
+  Layers,
+  CheckCircle2,
+  Loader2,
+  UploadCloud,
+  Download,
+  FileText,
+  Sparkles,
+  ShieldCheck,
+  Film,
+  AlertCircle,
+  Edit3,
+  ChevronDown,
+  ChevronUp,
+} from 'lucide-react';
 import type {
   CaptionAlignment,
   CaptionAnimation,
   CaptionPosition,
   CaptionStyleConfig,
   ClipRecord,
+  ExportJob,
+  ExportOptions,
   NavPage,
   ProjectRecord,
+  TranscriptSegment,
 } from '../../shared/types.ts';
 import { CAPTION_FONTS, CAPTION_PRESETS, SUPPORTED_LANGUAGES } from '../../shared/presets.ts';
 import { ClipPreviewPlayer } from '../components/ClipPreviewPlayer.tsx';
+import { api } from '../lib/api.ts';
+import { formatBytes, formatTimecode, isRtlText } from '../lib/format.ts';
 
 interface CaptionStudioPageProps {
   project: ProjectRecord | null;
   clipId: string | null;
+  exportJobs: ExportJob[];
   onSelectClip: (clipId: string) => void;
   onSaveClip: (projectId: string, clip: ClipRecord) => Promise<ClipRecord>;
   onApplyToAll: (
@@ -22,39 +43,87 @@ interface CaptionStudioPageProps {
     clipId: string,
     style: CaptionStyleConfig
   ) => Promise<void>;
+  onCreateFullVideoCaptions: (
+    projectId: string,
+    payload?: { captionPresetId?: string; autoRender?: boolean }
+  ) => Promise<void>;
+  onExportClip: (
+    projectId: string,
+    clipId: string,
+    options?: Partial<ExportOptions>
+  ) => Promise<void>;
   onNavigate: (page: NavPage) => void;
+}
+
+function rebuildWordTimings(seg: TranscriptSegment, nextText: string): TranscriptSegment {
+  const cleaned = nextText.replace(/\s+/g, ' ').trim();
+  const tokens = cleaned ? cleaned.split(' ') : [];
+  const totalDur = Math.max(0.2, seg.end - seg.start);
+  const perWord = tokens.length > 0 ? totalDur / tokens.length : totalDur;
+  return {
+    ...seg,
+    text: cleaned,
+    words: tokens.map((word, idx) => ({
+      id: `${seg.id}_w${idx}`,
+      word,
+      start: Number((seg.start + idx * perWord).toFixed(3)),
+      end: Number((seg.start + (idx + 1) * perWord).toFixed(3)),
+    })),
+  };
 }
 
 export function CaptionStudioPage({
   project,
   clipId,
+  exportJobs,
   onSelectClip,
   onSaveClip,
   onApplyToAll,
+  onCreateFullVideoCaptions,
+  onExportClip,
   onNavigate,
 }: CaptionStudioPageProps) {
   const sourceClip = useMemo(() => {
     if (!project || project.clips.length === 0) return null;
-    return project.clips.find((c) => c.id === clipId) ?? project.clips[0];
+    return (
+      project.clips.find((c) => c.id === clipId) ??
+      project.clips.find((c) => c.isFullVideoCaption) ??
+      project.clips[0]
+    );
   }, [project, clipId]);
+
+  const hasFullVideoTrack = useMemo(
+    () => Boolean(project?.clips.some((c) => c.isFullVideoCaption)),
+    [project?.clips]
+  );
 
   const [style, setStyle] = useState<CaptionStyleConfig>(
     sourceClip ? { ...sourceClip.captionStyle } : { ...CAPTION_PRESETS[0].config }
   );
+  const [editedSegments, setEditedSegments] = useState<TranscriptSegment[] | null>(null);
+  const [showTextEditor, setShowTextEditor] = useState(false);
   const [saving, setSaving] = useState(false);
   const [applyingAll, setApplyingAll] = useState(false);
+  const [creatingFull, setCreatingFull] = useState(false);
+  const [renderingMp4, setRenderingMp4] = useState(false);
+  const [downloadingMp4, setDownloadingMp4] = useState(false);
+  const [downloadingSoftSub, setDownloadingSoftSub] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   useEffect(() => {
-    if (sourceClip) setStyle({ ...sourceClip.captionStyle });
+    if (sourceClip) {
+      setStyle({ ...sourceClip.captionStyle });
+      setEditedSegments(sourceClip.customSegments ?? null);
+    }
   }, [sourceClip?.id]);
 
-  if (!project || !sourceClip) {
+  if (!project) {
     return (
       <div className="p-12 rounded-2xl studio-panel text-center">
         <h2 className="font-display text-lg font-semibold text-white">Caption Studio</h2>
         <p className="mt-1.5 text-sm text-zinc-400">
-          Generate clips from an uploaded video to customize word-level captions and preview all 12 styles live.
+          Upload a video to generate high-end synchronized captions on your full original video (zero video changes) or on individual clips.
         </p>
         <button
           onClick={() => onNavigate('upload')}
@@ -66,53 +135,235 @@ export function CaptionStudioPage({
     );
   }
 
+  // Uploaded project with no clips yet -> allow 1-click Full Original Video Captioning directly here!
+  if (!sourceClip) {
+    return (
+      <div className="p-10 rounded-2xl studio-panel max-w-2xl mx-auto text-center space-y-4">
+        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-md bg-[#059669]/18 border border-[#10B981]/35 text-xs font-medium text-emerald-300">
+          <ShieldCheck className="w-4 h-4 text-[#F5C451]" />
+          Original Video Preserved · Zero Video Changes
+        </div>
+        <h2 className="font-display text-xl font-bold text-white">
+          Generate High-End Captions for &ldquo;{project.name}&rdquo;
+        </h2>
+        <p className="text-sm text-zinc-400 leading-relaxed">
+          Create studio-grade synchronized captions across your entire original video without cutting, cropping, or altering colors, and download in the exact same original quality.
+        </p>
+        {errorMsg && (
+          <div className="flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-red-500/12 border border-red-500/30 text-xs text-red-200">
+            <AlertCircle className="w-4 h-4 shrink-0" />
+            {errorMsg}
+          </div>
+        )}
+        <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
+          <button
+            disabled={creatingFull}
+            onClick={async () => {
+              setErrorMsg(null);
+              setCreatingFull(true);
+              try {
+                await onCreateFullVideoCaptions(project.id, {
+                  captionPresetId: style.presetId || 'loki-emerald-gold',
+                  autoRender: true,
+                });
+              } catch (err) {
+                setErrorMsg(err instanceof Error ? err.message : 'Failed to start full-video captioning.');
+              } finally {
+                setCreatingFull(false);
+              }
+            }}
+            className="studio-btn-primary inline-flex items-center gap-2 h-11 px-6 rounded-xl text-sm font-semibold text-white disabled:opacity-50"
+          >
+            {creatingFull ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Sparkles className="w-4 h-4 text-[#FEF3C7]" />
+            )}
+            {creatingFull ? 'Generating High-End Captions...' : 'Caption Full Original Video (Same Quality)'}
+          </button>
+          <button
+            onClick={() => onNavigate('upload')}
+            className="inline-flex items-center gap-2 h-11 px-4 rounded-xl bg-[#0E1913] hover:bg-[#14241B] border border-[#D4AF37]/20 text-xs font-medium text-zinc-200"
+          >
+            <UploadCloud className="w-4 h-4 text-[#F5C451]" /> Upload Different Video
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const baseSegments = useMemo(() => {
+    if (editedSegments && editedSegments.length > 0) return editedSegments;
+    if (sourceClip.customSegments && sourceClip.customSegments.length > 0) {
+      return sourceClip.customSegments;
+    }
+    return project.transcript.filter(
+      (s) => s.end > sourceClip.startTime && s.start < sourceClip.endTime
+    );
+  }, [editedSegments, sourceClip.customSegments, sourceClip.startTime, sourceClip.endTime, project.transcript]);
+
   const previewClip: ClipRecord = {
     ...sourceClip,
     captionStyle: style,
+    customSegments: editedSegments ?? sourceClip.customSegments,
   };
 
+  const isFullOriginal = Boolean(sourceClip.isFullVideoCaption || sourceClip.preserveOriginalVideo);
+  const isLandscapePreview =
+    isFullOriginal &&
+    Boolean(project.metadata && project.metadata.width >= project.metadata.height);
+
+  const latestJob = useMemo(
+    () => exportJobs.find((j) => j.projectId === project.id && j.clipId === sourceClip.id) ?? null,
+    [exportJobs, project.id, sourceClip.id]
+  );
+
+  const isRenderingNow = Boolean(
+    renderingMp4 ||
+      (latestJob && (latestJob.status === 'queued' || latestJob.status === 'rendering')) ||
+      sourceClip.renderStatus === 'queued' ||
+      sourceClip.renderStatus === 'rendering' ||
+      sourceClip.renderStatus === 'validating' ||
+      sourceClip.renderStatus === 'saving'
+  );
+
+  const isMp4Ready = Boolean(
+    !isRenderingNow && (sourceClip.renderStatus === 'export_ready' || sourceClip.renderedVideoUrl)
+  );
+
   const handleSaveCurrent = async () => {
+    setErrorMsg(null);
     setSaving(true);
     try {
       await onSaveClip(project.id, previewClip);
-      setFeedback('Caption style saved to clip.');
-      setTimeout(() => setFeedback(null), 2200);
+      setFeedback('High-end caption style & edits saved.');
+      setTimeout(() => setFeedback(null), 2400);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to save caption style.');
     } finally {
       setSaving(false);
     }
   };
 
   const handleApplyAll = async () => {
+    setErrorMsg(null);
     setApplyingAll(true);
     try {
       await onApplyToAll(project.id, sourceClip.id, style);
-      setFeedback(`Applied style to all ${project.clips.length} clips.`);
+      setFeedback(`Applied style to all ${project.clips.length} items in this project.`);
       setTimeout(() => setFeedback(null), 2600);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to apply style.');
     } finally {
       setApplyingAll(false);
+    }
+  };
+
+  const handleSaveAndRenderSameQuality = async () => {
+    setErrorMsg(null);
+    setRenderingMp4(true);
+    try {
+      await onSaveClip(project.id, previewClip);
+      await onExportClip(project.id, sourceClip.id, {
+        resolution: isFullOriginal ? 'original' : '1080p',
+        codec: 'h264',
+        fps: isFullOriginal ? 'original' : 30,
+        quality: isFullOriginal ? 'master' : 'excellent',
+        embedCaptions: true,
+        includeMusic: !isFullOriginal,
+      });
+      setFeedback(
+        isFullOriginal
+          ? 'Rendering full original video with high-end burned-in captions at original quality...'
+          : 'Rendering clip with updated high-end captions...'
+      );
+      setTimeout(() => setFeedback(null), 3500);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Could not start captioned MP4 render.');
+    } finally {
+      setRenderingMp4(false);
+    }
+  };
+
+  const handleDownloadBurnedMp4 = async () => {
+    setErrorMsg(null);
+    setDownloadingMp4(true);
+    try {
+      await api.downloadClipMp4(project.id, sourceClip.id);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'MP4 download failed.');
+    } finally {
+      setDownloadingMp4(false);
+    }
+  };
+
+  const handleDownloadSoftSubMp4 = async () => {
+    setErrorMsg(null);
+    setDownloadingSoftSub(true);
+    try {
+      await onSaveClip(project.id, previewClip);
+      await api.downloadClipSoftSubMp4(project.id, sourceClip.id, sourceClip.title);
+      setFeedback('Downloaded lossless bit-exact MP4 with embedded selectable captions (0% video re-encode).');
+      setTimeout(() => setFeedback(null), 3200);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Lossless soft-sub MP4 download failed.');
+    } finally {
+      setDownloadingSoftSub(false);
+    }
+  };
+
+  const handleCreateFullVideoTrack = async () => {
+    setErrorMsg(null);
+    setCreatingFull(true);
+    try {
+      await onCreateFullVideoCaptions(project.id, {
+        captionPresetId: style.presetId || 'loki-emerald-gold',
+        autoRender: false,
+      });
+      setFeedback('Full original video caption track created — zero video changes applied.');
+      setTimeout(() => setFeedback(null), 2800);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Could not create full-video caption track.');
+    } finally {
+      setCreatingFull(false);
     }
   };
 
   return (
     <div className="space-y-6">
       {/* Header */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div>
           <h1 className="font-display text-2xl font-bold text-white">Caption Studio</h1>
           <p className="mt-1 text-xs text-zinc-400">
-            12 synchronized word-level caption presets · Multilingual support (English, Urdu, Roman Urdu, Hindi, Arabic) · Rendered verbatim via ASS subtitles.
+            {CAPTION_PRESETS.length} high-end studio presets · Full original video captioning with zero video alterations · Same-quality MP4, lossless soft-sub MP4, SRT, VTT &amp; ASS.
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {!hasFullVideoTrack && (
+            <button
+              onClick={() => void handleCreateFullVideoTrack()}
+              disabled={creatingFull}
+              className="inline-flex items-center gap-1.5 h-9 px-3.5 rounded-lg bg-[#059669]/20 hover:bg-[#059669]/30 border border-[#10B981]/45 text-xs font-semibold text-emerald-200 whitespace-nowrap"
+            >
+              {creatingFull ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Film className="w-3.5 h-3.5 text-[#F5C451]" />
+              )}
+              Caption Full Original Video
+            </button>
+          )}
+
           <select
             value={sourceClip.id}
             onChange={(e) => onSelectClip(e.target.value)}
-            className="h-9 px-3 rounded-lg bg-[#0C1510] border border-[#D4AF37]/20 text-xs text-white max-w-[220px] truncate"
+            className="h-9 px-3 rounded-lg bg-[#0C1510] border border-[#D4AF37]/20 text-xs text-white max-w-[240px] truncate"
           >
             {project.clips.map((c, idx) => (
               <option key={c.id} value={c.id} className="bg-[#0C1510]">
-                Clip {idx + 1}: {c.title}
+                {c.isFullVideoCaption ? `★ Full Original: ${project.name}` : `Clip ${idx + 1}: ${c.title}`}
               </option>
             ))}
           </select>
@@ -123,21 +374,23 @@ export function CaptionStudioPage({
             className="inline-flex items-center gap-1.5 h-9 px-3.5 rounded-lg bg-[#0E1913] hover:bg-[#14241B] border border-[#D4AF37]/25 text-xs font-semibold text-white whitespace-nowrap"
           >
             {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5 text-[#F5C451]" />}
-            Save to Clip
+            Save
           </button>
 
-          <button
-            onClick={() => void handleApplyAll()}
-            disabled={applyingAll}
-            className="studio-btn-primary inline-flex items-center gap-1.5 h-9 px-4 rounded-lg text-xs font-semibold text-white whitespace-nowrap"
-          >
-            {applyingAll ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            ) : (
-              <Layers className="w-3.5 h-3.5 text-[#FEF3C7]" />
-            )}
-            Apply to All Clips
-          </button>
+          {project.clips.length > 1 && (
+            <button
+              onClick={() => void handleApplyAll()}
+              disabled={applyingAll}
+              className="studio-btn-primary inline-flex items-center gap-1.5 h-9 px-4 rounded-lg text-xs font-semibold text-white whitespace-nowrap"
+            >
+              {applyingAll ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Layers className="w-3.5 h-3.5 text-[#FEF3C7]" />
+              )}
+              Apply to All
+            </button>
+          )}
         </div>
       </div>
 
@@ -148,26 +401,164 @@ export function CaptionStudioPage({
         </div>
       )}
 
+      {errorMsg && (
+        <div className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-red-500/12 border border-red-500/30 text-xs text-red-200">
+          <AlertCircle className="w-4 h-4 shrink-0 text-red-400" />
+          {errorMsg}
+        </div>
+      )}
+
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
-        {/* Left: Live Video Caption Preview */}
-        <div className="xl:col-span-5 p-5 rounded-xl studio-panel flex flex-col items-center">
-          <div className="w-full max-w-[320px]">
-            <ClipPreviewPlayer project={project} clip={previewClip} />
+        {/* Left: Live Video Caption Preview + Direct Same-Quality Export & Download Panel */}
+        <div className="xl:col-span-5 space-y-4">
+          <div className="p-5 rounded-xl studio-panel flex flex-col items-center">
+            {isFullOriginal && (
+              <div className="w-full mb-3 flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-lg bg-[#071811] border border-[#10B981]/30 text-[11px]">
+                <span className="inline-flex items-center gap-1.5 font-semibold text-emerald-300">
+                  <ShieldCheck className="w-3.5 h-3.5 text-[#F5C451]" />
+                  Original Video Unchanged
+                </span>
+                <span className="font-mono text-zinc-300 tabular-nums">
+                  {project.metadata
+                    ? `${project.metadata.width}×${project.metadata.height} · ${project.metadata.fps} FPS`
+                    : 'Original Resolution'}
+                </span>
+              </div>
+            )}
+
+            <div className={isLandscapePreview ? 'w-full' : 'w-full max-w-[320px]'}>
+              <ClipPreviewPlayer project={project} clip={previewClip} />
+            </div>
+
+            <div className="mt-4 w-full pt-3 border-t border-[#D4AF37]/12 flex items-center justify-between text-xs text-zinc-400">
+              <span>Language: {project.detectedLanguage || 'Auto'}</span>
+              <span>
+                {SUPPORTED_LANGUAGES.slice(1, 5)
+                  .map((l) => l.label.split(' ')[0])
+                  .join(', ')}{' '}
+                +
+              </span>
+            </div>
           </div>
-          <div className="mt-4 w-full pt-3 border-t border-[#D4AF37]/12 flex items-center justify-between text-xs text-zinc-400">
-            <span>Detected Language: {project.detectedLanguage || 'Auto'}</span>
-            <span>
-              Supported: {SUPPORTED_LANGUAGES.slice(1, 6).map((l) => l.label.split(' ')[0]).join(', ')} +
-            </span>
+
+          {/* Direct Same-Quality Download & Export Panel */}
+          <div className="p-5 rounded-xl studio-panel space-y-3.5">
+            <div>
+              <h2 className="font-display text-sm font-semibold text-white">
+                Export &amp; Download Captioned Video
+              </h2>
+              <p className="text-[11px] text-zinc-400 mt-0.5">
+                {isFullOriginal
+                  ? 'Preserves exact original resolution, frame rate, framing & audio — zero video edits.'
+                  : 'Burns your selected high-end caption preset directly into a playable MP4.'}
+              </p>
+            </div>
+
+            {isRenderingNow && (
+              <div className="p-3 rounded-lg bg-[#0C1510] border border-[#D4AF37]/25 space-y-2">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="inline-flex items-center gap-1.5 text-[#F5C451] font-medium">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    {latestJob?.stageDetail || sourceClip.renderStageDetail || 'Rendering same-quality MP4...'}
+                  </span>
+                  <span className="font-mono text-white tabular-nums">{latestJob?.progress ?? 12}%</span>
+                </div>
+                <div className="h-1.5 rounded-full bg-[#132219] overflow-hidden">
+                  <div
+                    style={{ width: `${Math.max(6, latestJob?.progress ?? 12)}%` }}
+                    className="h-full bg-gradient-to-r from-[#059669] via-[#10B981] to-[#D4AF37] transition-[width] duration-200"
+                  />
+                </div>
+              </div>
+            )}
+
+            <div className="space-y-2">
+              {isMp4Ready && (
+                <button
+                  onClick={() => void handleDownloadBurnedMp4()}
+                  disabled={downloadingMp4}
+                  className="w-full studio-btn-gold h-10 px-4 rounded-lg text-xs font-semibold inline-flex items-center justify-center gap-2 disabled:opacity-50"
+                >
+                  {downloadingMp4 ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Download className="w-4 h-4" />
+                  )}
+                  {downloadingMp4
+                    ? 'Downloading Captioned MP4...'
+                    : `Download High-End Captioned MP4 (${sourceClip.renderedResolution || 'Original'}${sourceClip.renderedFileSize ? ` · ${formatBytes(sourceClip.renderedFileSize)}` : ''})`}
+                </button>
+              )}
+
+              <button
+                onClick={() => void handleSaveAndRenderSameQuality()}
+                disabled={isRenderingNow}
+                className="w-full studio-btn-primary h-10 px-4 rounded-lg text-xs font-semibold text-white inline-flex items-center justify-center gap-2 disabled:opacity-45"
+              >
+                {isRenderingNow ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Sparkles className="w-4 h-4 text-[#FEF3C7]" />
+                )}
+                {isRenderingNow
+                  ? 'Rendering Same-Quality MP4...'
+                  : isMp4Ready
+                    ? 'Save Style & Re-Render Same-Quality MP4'
+                    : 'Render Burned-In Captioned MP4 (Same Quality)'}
+              </button>
+
+              <button
+                onClick={() => void handleDownloadSoftSubMp4()}
+                disabled={downloadingSoftSub}
+                className="w-full h-9 px-3.5 rounded-lg bg-[#0E1913] hover:bg-[#14241B] border border-[#10B981]/30 text-xs font-medium text-emerald-200 inline-flex items-center justify-center gap-2 disabled:opacity-50"
+              >
+                {downloadingSoftSub ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <ShieldCheck className="w-3.5 h-3.5 text-[#10B981]" />
+                )}
+                {downloadingSoftSub
+                  ? 'Packaging Bit-Exact MP4...'
+                  : 'Instant Lossless Soft-Sub MP4 (0% Re-Encode)'}
+              </button>
+            </div>
+
+            <div className="pt-2 border-t border-[#D4AF37]/12 flex items-center justify-between gap-2">
+              <span className="text-[11px] text-zinc-400">Subtitle Tracks:</span>
+              <div className="flex items-center gap-1.5">
+                <a
+                  href={`/api/projects/${project.id}/clips/${sourceClip.id}/subtitles.srt`}
+                  download
+                  className="inline-flex items-center gap-1 h-7 px-2.5 rounded-md bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/18 text-[11px] text-zinc-200"
+                >
+                  <FileText className="w-3 h-3 text-[#F5C451]" />
+                  SRT
+                </a>
+                <a
+                  href={`/api/projects/${project.id}/clips/${sourceClip.id}/subtitles.vtt`}
+                  download
+                  className="inline-flex items-center gap-1 h-7 px-2.5 rounded-md bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/18 text-[11px] text-zinc-200"
+                >
+                  VTT
+                </a>
+                <a
+                  href={`/api/projects/${project.id}/clips/${sourceClip.id}/subtitles.ass`}
+                  download
+                  className="inline-flex items-center gap-1 h-7 px-2.5 rounded-md bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/18 text-[11px] text-zinc-200"
+                >
+                  Styled ASS
+                </a>
+              </div>
+            </div>
           </div>
         </div>
 
-        {/* Right: 12 Presets + Full Granular Controls */}
+        {/* Right: 16 High-End Presets + Granular Typography Controls + Inline Transcript Editor */}
         <div className="xl:col-span-7 space-y-5">
-          {/* 12 Professional Presets Grid */}
+          {/* 16 High-End Presets Grid */}
           <div className="p-5 rounded-xl studio-panel">
             <h2 className="font-display text-sm font-semibold text-white mb-3">
-              12 Professional Caption Presets
+              {CAPTION_PRESETS.length} High-End Studio Caption Presets
             </h2>
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
               {CAPTION_PRESETS.map((preset) => {
@@ -200,7 +591,13 @@ export function CaptionStudioPage({
                         className="text-xs tracking-tight truncate"
                       >
                         {c.uppercase ? 'MAKE IT ' : 'Make it '}
-                        <span style={{ color: c.highlightColor }}>
+                        <span
+                          style={{
+                            color: c.highlightColor,
+                            textShadow:
+                              c.animation === 'glow' ? `0 0 10px ${c.highlightColor}` : undefined,
+                          }}
+                        >
                           {c.uppercase ? 'POP' : 'pop'}
                         </span>
                       </span>
@@ -218,7 +615,7 @@ export function CaptionStudioPage({
           {/* Full Customization Controls */}
           <div className="p-5 rounded-xl studio-panel space-y-5">
             <h2 className="font-display text-sm font-semibold text-white">
-              Typography, Colors, Layout & Timing
+              Typography, Colors, Layout &amp; Timing
             </h2>
 
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -265,12 +662,12 @@ export function CaptionStudioPage({
                   }
                   className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white"
                 >
-                  <option value="pop" className="bg-[#0C1510]">Pop Scale</option>
+                  <option value="pop" className="bg-[#0C1510]">Pop Spring Scale</option>
                   <option value="karaoke" className="bg-[#0C1510]">Karaoke Sweep</option>
                   <option value="fade" className="bg-[#0C1510]">Smooth Fade</option>
                   <option value="slide" className="bg-[#0C1510]">Slide Up</option>
-                  <option value="glow" className="bg-[#0C1510]">Neon Glow</option>
-                  <option value="none" className="bg-[#0C1510]">Static</option>
+                  <option value="glow" className="bg-[#0C1510]">Radiant Glow</option>
+                  <option value="none" className="bg-[#0C1510]">Static Clean</option>
                 </select>
               </div>
             </div>
@@ -420,7 +817,7 @@ export function CaptionStudioPage({
                     setStyle((s) => ({
                       ...s,
                       position: pos,
-                      verticalOffset: pos === 'top' ? 18 : pos === 'middle' ? 50 : 76,
+                      verticalOffset: pos === 'top' ? 18 : pos === 'middle' ? 50 : 82,
                     }));
                   }}
                   className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white"
@@ -493,6 +890,59 @@ export function CaptionStudioPage({
                 Drop Shadow
               </label>
             </div>
+          </div>
+
+          {/* Collapsible Inline Caption Text Editor */}
+          <div className="rounded-xl studio-panel overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setShowTextEditor((v) => !v)}
+              className="w-full px-5 py-3.5 flex items-center justify-between text-left hover:bg-[#059669]/8 transition-colors"
+            >
+              <div className="flex items-center gap-2">
+                <Edit3 className="w-4 h-4 text-[#F5C451]" />
+                <span className="font-display text-sm font-semibold text-white">
+                  Edit Caption Words &amp; Lines ({baseSegments.length} segments)
+                </span>
+              </div>
+              {showTextEditor ? (
+                <ChevronUp className="w-4 h-4 text-zinc-400" />
+              ) : (
+                <ChevronDown className="w-4 h-4 text-zinc-400" />
+              )}
+            </button>
+
+            {showTextEditor && (
+              <div className="px-5 pb-4 pt-2 border-t border-[#D4AF37]/12 space-y-2.5 max-h-[340px] overflow-y-auto">
+                {baseSegments.length === 0 ? (
+                  <p className="text-xs text-zinc-500 py-4 text-center">
+                    No transcript segments found for this video yet.
+                  </p>
+                ) : (
+                  baseSegments.map((seg, idx) => (
+                    <div key={seg.id} className="flex items-start gap-3">
+                      <span className="font-mono text-[11px] text-[#F5C451] tabular-nums pt-2 shrink-0 w-16">
+                        {formatTimecode(Math.max(0, seg.start - sourceClip.startTime))}
+                      </span>
+                      <input
+                        type="text"
+                        dir={isRtlText(seg.text) ? 'rtl' : 'ltr'}
+                        value={seg.text}
+                        onChange={(e) => {
+                          const nextVal = e.target.value;
+                          setEditedSegments((prev) => {
+                            const list = prev ? [...prev] : baseSegments.map((s) => ({ ...s }));
+                            list[idx] = rebuildWordTimings(list[idx], nextVal);
+                            return list;
+                          });
+                        }}
+                        className="flex-1 h-9 px-3 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
+                      />
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
           </div>
         </div>
       </div>

@@ -232,6 +232,7 @@ export function SettingsPage({
               }
               className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white"
             >
+              <option value="original" className="bg-[#0C1510]">Original (Same Quality)</option>
               <option value="720p" className="bg-[#0C1510]">720p HD</option>
               <option value="1080p" className="bg-[#0C1510]">1080p Full HD</option>
               <option value="4k" className="bg-[#0C1510]">4K Ultra HD</option>
@@ -253,15 +254,20 @@ export function SettingsPage({
           <div>
             <label className="block text-xs text-zinc-400 mb-1">Frame Rate</label>
             <select
-              value={draft.defaultExportFps}
-              onChange={(e) =>
-                setDraft((d) => ({ ...d, defaultExportFps: Number(e.target.value) as ExportFps }))
-              }
+              value={String(draft.defaultExportFps)}
+              onChange={(e) => {
+                const raw = e.target.value;
+                setDraft((d) => ({
+                  ...d,
+                  defaultExportFps: (raw === 'original' ? 'original' : Number(raw)) as ExportFps,
+                }));
+              }}
               className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white"
             >
-              <option value={24} className="bg-[#0C1510]">24 FPS</option>
-              <option value={30} className="bg-[#0C1510]">30 FPS</option>
-              <option value={60} className="bg-[#0C1510]">60 FPS</option>
+              <option value="original" className="bg-[#0C1510]">Original Source FPS</option>
+              <option value="24" className="bg-[#0C1510]">24 FPS</option>
+              <option value="30" className="bg-[#0C1510]">30 FPS</option>
+              <option value="60" className="bg-[#0C1510]">60 FPS</option>
             </select>
           </div>
         </div>

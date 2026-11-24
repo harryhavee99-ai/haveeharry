@@ -9,6 +9,7 @@ import {
   Search,
   ArrowRight,
   UploadCloud,
+  Captions,
 } from 'lucide-react';
 import type { NavPage, ProjectRecord } from '../../shared/types.ts';
 import { formatDurationHuman, formatTimecode, isRtlText } from '../lib/format.ts';
@@ -131,21 +132,34 @@ export function AnalysisPage({ project, onResumeOrStart, onNavigate }: AnalysisP
           )}
           {project.status === 'ready' && (
             <>
-              <button
-                onClick={() => void handleAction(true)}
-                disabled={triggering}
-                className="inline-flex items-center gap-2 h-10 px-3.5 rounded-lg bg-[#0E1913] hover:bg-[#14241B] border border-[#D4AF37]/20 text-xs font-medium text-zinc-200 whitespace-nowrap"
-              >
-                <RefreshCw className="w-3.5 h-3.5 text-[#F5C451]" />
-                Re-Select Highlights
-              </button>
-              <button
-                onClick={() => onNavigate('clips')}
-                className="studio-btn-primary inline-flex items-center gap-2 h-10 px-4 rounded-lg text-sm font-semibold text-white whitespace-nowrap"
-              >
-                View {project.clips.length} Clips
-                <ArrowRight className="w-4 h-4 text-[#FEF3C7]" />
-              </button>
+              {project.analysisConfig.mode === 'captions_only' ? (
+                <button
+                  onClick={() => onNavigate('captions')}
+                  className="studio-btn-primary inline-flex items-center gap-2 h-10 px-4 rounded-lg text-sm font-semibold text-white whitespace-nowrap"
+                >
+                  <Captions className="w-4 h-4 text-[#FEF3C7]" />
+                  Open Caption Studio &amp; Download
+                  <ArrowRight className="w-4 h-4 text-[#FEF3C7]" />
+                </button>
+              ) : (
+                <>
+                  <button
+                    onClick={() => void handleAction(true)}
+                    disabled={triggering}
+                    className="inline-flex items-center gap-2 h-10 px-3.5 rounded-lg bg-[#0E1913] hover:bg-[#14241B] border border-[#D4AF37]/20 text-xs font-medium text-zinc-200 whitespace-nowrap"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5 text-[#F5C451]" />
+                    Re-Select Highlights
+                  </button>
+                  <button
+                    onClick={() => onNavigate('clips')}
+                    className="studio-btn-primary inline-flex items-center gap-2 h-10 px-4 rounded-lg text-sm font-semibold text-white whitespace-nowrap"
+                  >
+                    View {project.clips.length} Clips
+                    <ArrowRight className="w-4 h-4 text-[#FEF3C7]" />
+                  </button>
+                </>
+              )}
             </>
           )}
         </div>

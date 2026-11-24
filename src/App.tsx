@@ -448,6 +448,26 @@ export default function App() {
     }
   };
 
+  const handleCreateFullVideoCaptions = async (
+    projectId: string,
+    payload?: { captionPresetId?: string; autoRender?: boolean }
+  ) => {
+    const res = await api.createFullVideoCaptions(projectId, payload);
+    if (res.project) {
+      const normalized = normalizeProject(res.project);
+      setProjects((prev) => prev.map((p) => (p.id === projectId ? normalized : p)));
+    }
+    if (res.exportJob) {
+      setExportJobs((prev) => [res.exportJob!, ...prev]);
+    }
+    if (res.clip) {
+      setActiveClipId(res.clip.id);
+    }
+    if (res.startedPipeline) {
+      setActivePage('analysis');
+    }
+  };
+
   const handleSaveSettings = async (patch: Partial<AppSettings>) => {
     const updated = await api.updateSettings(patch);
     setSettings(updated);
@@ -741,9 +761,12 @@ export default function App() {
             <CaptionStudioPage
               project={activeProject}
               clipId={activeClipId}
+              exportJobs={exportJobs}
               onSelectClip={setActiveClipId}
               onSaveClip={handleSaveClip}
               onApplyToAll={handleApplyCaptionsToAll}
+              onCreateFullVideoCaptions={handleCreateFullVideoCaptions}
+              onExportClip={handleExportSingle}
               onNavigate={setActivePage}
             />
           )}

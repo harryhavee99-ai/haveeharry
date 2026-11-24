@@ -211,6 +211,7 @@ export function ExportCenterPage({
             }
             className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white"
           >
+            <option value="original" className="bg-[#0C1510]">Original (Same Quality)</option>
             <option value="720p" className="bg-[#0C1510]">720p HD (Fast)</option>
             <option value="1080p" className="bg-[#0C1510]">1080p Full HD</option>
             <option value="4k" className="bg-[#0C1510]">4K Ultra HD (2160p)</option>
@@ -254,15 +255,20 @@ export function ExportCenterPage({
         <div>
           <label className="block text-xs font-medium text-zinc-400 mb-1.5">Frame Rate</label>
           <select
-            value={options.fps}
-            onChange={(e) =>
-              setOptions((o) => ({ ...o, fps: Number(e.target.value) as ExportFps }))
-            }
+            value={String(options.fps)}
+            onChange={(e) => {
+              const raw = e.target.value;
+              setOptions((o) => ({
+                ...o,
+                fps: (raw === 'original' ? 'original' : Number(raw)) as ExportFps,
+              }));
+            }}
             className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white"
           >
-            <option value={24} className="bg-[#0C1510]">24 FPS (Cinematic)</option>
-            <option value={30} className="bg-[#0C1510]">30 FPS (Standard)</option>
-            <option value={60} className="bg-[#0C1510]">60 FPS (Smooth)</option>
+            <option value="original" className="bg-[#0C1510]">Original Source FPS</option>
+            <option value="24" className="bg-[#0C1510]">24 FPS (Cinematic)</option>
+            <option value="30" className="bg-[#0C1510]">30 FPS (Standard)</option>
+            <option value="60" className="bg-[#0C1510]">60 FPS (Smooth)</option>
           </select>
         </div>
 
@@ -385,10 +391,26 @@ export function ExportCenterPage({
                   <a
                     href={`/api/projects/${project.id}/clips/${clip.id}/subtitles.srt`}
                     download
-                    className="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-lg bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/18 text-xs text-zinc-300 whitespace-nowrap"
+                    className="inline-flex items-center gap-1 h-8 px-2.5 rounded-lg bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/18 text-xs text-zinc-300 whitespace-nowrap"
                   >
                     <FileText className="w-3.5 h-3.5 text-[#F5C451]" />
                     SRT
+                  </a>
+
+                  <a
+                    href={`/api/projects/${project.id}/clips/${clip.id}/subtitles.vtt`}
+                    download
+                    className="inline-flex items-center gap-1 h-8 px-2.5 rounded-lg bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/18 text-xs text-zinc-300 whitespace-nowrap"
+                  >
+                    VTT
+                  </a>
+
+                  <a
+                    href={`/api/projects/${project.id}/clips/${clip.id}/subtitles.ass`}
+                    download
+                    className="inline-flex items-center gap-1 h-8 px-2.5 rounded-lg bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/18 text-xs text-zinc-300 whitespace-nowrap"
+                  >
+                    ASS
                   </a>
 
                   <button

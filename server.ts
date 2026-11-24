@@ -21,6 +21,7 @@ import { ensureMusicFileByName, getMusicTracks } from './server/music.ts';
 import { isGeminiConfigured } from './server/gemini.ts';
 import {
   buildClipFromHookCandidate,
+  buildFullVideoCaptionClip,
   createInitialPipelineStages,
   createRealSampleVideoProject,
   extractThumbnail,
@@ -32,8 +33,11 @@ import {
 } from './server/pipeline.ts';
 import {
   buildClipDownloadFilename,
+  generateAssSubtitles,
   generateSrtSubtitles,
+  generateVttSubtitles,
   renderClipWithFFmpeg,
+  renderSoftSubtitledMp4,
   resolveClipMp4Path,
   streamProjectClipsZip,
 } from './server/renderer.ts';
@@ -336,10 +340,14 @@ async function createServer() {
       totalChunks: computedChunks,
       fileSize,
       analysisConfig: {
+        mode: analysisConfig?.mode === 'captions_only' ? 'captions_only' : 'auto_clips',
         targetClipDuration: analysisConfig?.targetClipDuration ?? settings.defaultClipDuration,
         clipCount: analysisConfig?.clipCount ?? settings.defaultClipCount,
         language: analysisConfig?.language ?? settings.defaultLanguage,
-        aspectRatio: analysisConfig?.aspectRatio ?? settings.defaultAspectRatio,
+        aspectRatio:
+          analysisConfig?.mode === 'captions_only'
+            ? 'original'
+            : (analysisConfig?.aspectRatio ?? settings.defaultAspectRatio),
         framingMode: analysisConfig?.framingMode ?? settings.defaultFramingMode,
         captionPresetId: analysisConfig?.captionPresetId ?? settings.defaultCaptionPresetId,
         stylePresetId: analysisConfig?.stylePresetId ?? settings.defaultStylePresetId,
@@ -786,10 +794,14 @@ async function createServer() {
         totalChunks: 1,
         fileSize: 0,
         analysisConfig: {
+          mode: bodyConfig.mode === 'captions_only' ? 'captions_only' : 'auto_clips',
           targetClipDuration: bodyConfig.targetClipDuration ?? 18,
           clipCount: bodyConfig.clipCount ?? 3,
           language: bodyConfig.language ?? 'en',
-          aspectRatio: bodyConfig.aspectRatio ?? settings.defaultAspectRatio,
+          aspectRatio:
+            bodyConfig.mode === 'captions_only'
+              ? 'original'
+              : (bodyConfig.aspectRatio ?? settings.defaultAspectRatio),
           framingMode: bodyConfig.framingMode ?? settings.defaultFramingMode,
           captionPresetId: bodyConfig.captionPresetId ?? settings.defaultCaptionPresetId,
           stylePresetId: bodyConfig.stylePresetId ?? settings.defaultStylePresetId,
@@ -1124,16 +1136,197 @@ async function createServer() {
     res.json({ deleted: true });
   });
 
+  // Create or activate a Full-Original-Video Captions-Only track on any uploaded project (zero video changes)
+  app.post('/api/projects/:id/captions-full-video', async (req, res) => {
+    const project = store.getProject(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Project not found.' });
+    if (!project.sourcePath || !fs.existsSync(project.sourcePath)) {
+      return res.status(400).json({ error: 'Source video file is not available on disk.' });
+    }
+
+    const body = (req.body ?? {}) as {
+      captionPresetId?: string;
+      autoRender?: boolean;
+      language?: string;
+    };
+
+    const chosenPresetId =
+      typeof body.captionPresetId === 'string' && body.captionPresetId.trim()
+        ? body.captionPresetId.trim()
+        : project.analysisConfig.captionPresetId || 'loki-emerald-gold';
+
+    if (typeof body.language === 'string' && body.language.trim()) {
+      project.analysisConfig.language = body.language.trim();
+    }
+    project.analysisConfig.captionPresetId = chosenPresetId;
+
+    // If the project has not been transcribed yet, kick off the fast Captions-Only pipeline
+    if (project.transcript.length === 0 && project.metadata?.audioCodec !== 'none') {
+      if (!isGeminiConfigured()) {
+        return res.status(400).json({
+          error: 'GEMINI_API_KEY is not configured. Configure it in Settings > Secrets to transcribe speech.',
+        });
+      }
+      project.analysisConfig.mode = 'captions_only';
+      project.analysisConfig.aspectRatio = 'original';
+      store.upsertProject(project);
+      if (!isPipelineRunning(project.id)) {
+        void runAnalysisPipeline(project.id);
+      }
+      return res.json({
+        startedPipeline: true,
+        project: store.getProject(project.id) ?? project,
+      });
+    }
+
+    // Transcript already exists — create or update the Full-Original-Video caption track immediately
+    const existing = project.clips.find((c) => c.isFullVideoCaption);
+    const fullClip = buildFullVideoCaptionClip(project, chosenPresetId, existing?.id);
+    if (existing) {
+      fullClip.captionStyle = existing.captionStyle;
+      fullClip.customSegments = existing.customSegments;
+      fullClip.renderStatus = existing.renderStatus;
+      fullClip.renderedVideoUrl = existing.renderedVideoUrl;
+      fullClip.storageObjectPath = existing.storageObjectPath;
+      fullClip.mp4Filename = existing.mp4Filename;
+      fullClip.renderedFileSize = existing.renderedFileSize;
+      fullClip.renderedDuration = existing.renderedDuration;
+      fullClip.renderedResolution = existing.renderedResolution;
+      fullClip.renderedAt = existing.renderedAt;
+      project.clips = project.clips.map((c) => (c.id === existing.id ? fullClip : c));
+    } else {
+      project.clips.unshift(fullClip);
+    }
+    store.upsertProject(project);
+
+    let exportJob: ExportJob | undefined;
+    if (body.autoRender) {
+      const options: ExportOptions = {
+        resolution: 'original',
+        codec: 'h264',
+        fps: 'original',
+        quality: 'master',
+        embedCaptions: true,
+        includeMusic: false,
+      };
+      exportJob = {
+        id: uuidv4(),
+        projectId: project.id,
+        clipId: fullClip.id,
+        clipTitle: fullClip.title,
+        status: 'queued',
+        stage: 'queued',
+        stageDetail: 'Queued for original-quality captioned MP4 render...',
+        progress: 0,
+        options,
+        createdAt: new Date().toISOString(),
+      };
+      fullClip.renderStatus = 'queued';
+      fullClip.renderStageDetail = 'Queued for original-quality captioned MP4 render...';
+      fullClip.renderError = undefined;
+      store.upsertProject(project);
+      store.upsertExportJob(exportJob);
+      renderQueue.push({ projectId: project.id, clipId: fullClip.id, jobId: exportJob.id, options });
+      void processRenderQueue();
+    }
+
+    res.json({
+      startedPipeline: false,
+      clip: fullClip,
+      exportJob,
+      project: store.getProject(project.id) ?? project,
+    });
+  });
+
   // Download SRT subtitles for a clip
   app.get('/api/projects/:id/clips/:clipId/subtitles.srt', (req, res) => {
     const project = store.getProject(req.params.id);
     const clip = project?.clips.find((c) => c.id === req.params.clipId);
     if (!project || !clip) return res.status(404).json({ error: 'Clip not found.' });
     const srt = generateSrtSubtitles(project, clip);
-    const safeName = clip.title.replace(/[^a-zA-Z0-9-_ ]/g, '').trim() || 'captions';
+    const safeName = clip.title.replace(/[^a-zA-Z0-9-_]/g, '_').replace(/_+/g, '_').slice(0, 60) || 'captions';
     res.setHeader('Content-Type', 'application/x-subrip; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${safeName}.srt"`);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     res.send(srt);
+  });
+
+  // Download WebVTT subtitles for a clip
+  app.get('/api/projects/:id/clips/:clipId/subtitles.vtt', (req, res) => {
+    const project = store.getProject(req.params.id);
+    const clip = project?.clips.find((c) => c.id === req.params.clipId);
+    if (!project || !clip) return res.status(404).json({ error: 'Clip not found.' });
+    const vtt = generateVttSubtitles(project, clip);
+    const safeName = clip.title.replace(/[^a-zA-Z0-9-_]/g, '_').replace(/_+/g, '_').slice(0, 60) || 'captions';
+    res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.vtt"`);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.send(vtt);
+  });
+
+  // Download Styled High-End ASS subtitles for a clip
+  app.get('/api/projects/:id/clips/:clipId/subtitles.ass', (req, res) => {
+    const project = store.getProject(req.params.id);
+    const clip = project?.clips.find((c) => c.id === req.params.clipId);
+    if (!project || !clip) return res.status(404).json({ error: 'Clip not found.' });
+    const outW = project.metadata?.width || 1920;
+    const outH = project.metadata?.height || 1080;
+    const ass = generateAssSubtitles(project, clip, outW, outH);
+    const safeName = clip.title.replace(/[^a-zA-Z0-9-_]/g, '_').replace(/_+/g, '_').slice(0, 60) || 'captions';
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.ass"`);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.send(ass);
+  });
+
+  // Download 0%-re-encode bit-exact MP4 with embedded selectable mov_text captions
+  app.get('/api/projects/:id/clips/:clipId/download-softsub', async (req, res) => {
+    const project = store.getProject(req.params.id);
+    const clip = project?.clips.find((c) => c.id === req.params.clipId);
+    if (!project || !clip) return res.status(404).json({ error: 'Clip not found.' });
+
+    try {
+      const { filePath, fileSize } = await renderSoftSubtitledMp4({ project, clip });
+      const baseName =
+        clip.title.replace(/[^a-zA-Z0-9-_]/g, '_').replace(/_+/g, '_').slice(0, 56) || 'video';
+      const downloadFilename = `${baseName}_softsub_original.mp4`;
+
+      res.status(200);
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Content-Disposition', `attachment; filename="${downloadFilename}"`);
+      res.setHeader('Content-Length', String(fileSize));
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'no-store');
+
+      const stream = fs.createReadStream(filePath);
+      res.on('close', () => {
+        if (!stream.destroyed) stream.destroy();
+      });
+      stream.on('error', (err) => {
+        logBackendError({
+          projectId: project.id,
+          stage: 'softsub_download',
+          httpStatus: 500,
+          route: 'GET /api/projects/:id/clips/:clipId/download-softsub',
+          error: err,
+        });
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Failed to stream soft-subtitled MP4.' });
+        } else {
+          res.end();
+        }
+      });
+      stream.pipe(res);
+    } catch (err) {
+      const safeErr = logBackendError({
+        projectId: project.id,
+        stage: 'softsub_mux',
+        httpStatus: 500,
+        route: 'GET /api/projects/:id/clips/:clipId/download-softsub',
+        error: err,
+      });
+      res.status(500).json({ error: safeErr });
+    }
   });
 
   // Generate fresh signed download URL after verifying persistent MP4 exists and is non-empty
@@ -1260,13 +1453,14 @@ async function createServer() {
 
     const settings = store.getSettings();
     const body = (req.body ?? {}) as Partial<ExportOptions>;
+    const preserveOrig = Boolean(clip.preserveOriginalVideo || clip.isFullVideoCaption);
     const options: ExportOptions = {
-      resolution: body.resolution ?? settings.defaultExportResolution,
+      resolution: body.resolution ?? (preserveOrig ? 'original' : settings.defaultExportResolution),
       codec: body.codec ?? settings.defaultExportCodec,
-      fps: body.fps ?? settings.defaultExportFps,
-      quality: body.quality ?? 'excellent',
+      fps: body.fps ?? (preserveOrig ? 'original' : settings.defaultExportFps),
+      quality: body.quality ?? (preserveOrig ? 'master' : 'excellent'),
       embedCaptions: body.embedCaptions ?? true,
-      includeMusic: body.includeMusic ?? true,
+      includeMusic: body.includeMusic ?? (preserveOrig ? false : true),
     };
 
     const job: ExportJob = {

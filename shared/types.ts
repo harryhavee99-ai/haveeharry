@@ -1,12 +1,13 @@
-export type AspectRatio = '9:16' | '16:9' | '1:1' | '4:5' | '4:3';
+export type ProcessingMode = 'auto_clips' | 'captions_only';
+export type AspectRatio = '9:16' | '16:9' | '1:1' | '4:5' | '4:3' | 'original';
 export type FramingMode = 'ai_auto' | 'face_track' | 'manual';
 export type MotionIntensity = 'minimal' | 'balanced' | 'dynamic';
 export type CaptionAnimation = 'pop' | 'karaoke' | 'fade' | 'slide' | 'glow' | 'none';
 export type CaptionPosition = 'top' | 'middle' | 'bottom';
 export type CaptionAlignment = 'left' | 'center' | 'right';
-export type ExportResolution = '720p' | '1080p' | '4k';
+export type ExportResolution = '720p' | '1080p' | '4k' | 'original';
 export type ExportCodec = 'h264' | 'h265';
-export type ExportFps = 24 | 30 | 60;
+export type ExportFps = 24 | 30 | 60 | 'original';
 
 export type ClipCategory =
   | 'interesting'
@@ -264,6 +265,8 @@ export interface ClipRecord {
   projectId: string;
   originalVideoId?: string;
   candidateId?: string;
+  isFullVideoCaption?: boolean;
+  preserveOriginalVideo?: boolean;
   title: string;
   topic?: string;
   openingDialogue?: string;
@@ -301,6 +304,7 @@ export interface ClipRecord {
 }
 
 export interface AnalysisConfig {
+  mode?: ProcessingMode;
   targetClipDuration: number; // seconds (60, 120, 180, 240, 300 or custom)
   clipCount: number; // 5, 10, 15, 20, 30 or 0 for max
   language: string; // 'auto', 'en', 'ur', 'roman_ur', 'hi', 'ar', etc.

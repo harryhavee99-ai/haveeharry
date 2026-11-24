@@ -231,6 +231,21 @@ export const api = {
       body: JSON.stringify(patch),
     }),
 
+  createFullVideoCaptions: (
+    projectId: string,
+    payload?: { captionPresetId?: string; autoRender?: boolean; language?: string }
+  ) =>
+    requestJson<{
+      startedPipeline: boolean;
+      clip?: ClipRecord;
+      exportJob?: ExportJob;
+      project: ProjectRecord;
+    }>(`/api/projects/${projectId}/captions-full-video`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload ?? {}),
+    }),
+
   applyCaptionsToAll: (projectId: string, clipId: string, captionStyle: ClipRecord['captionStyle']) =>
     requestJson<{ updatedCount: number; project: ProjectRecord }>(
       `/api/projects/${projectId}/clips/${clipId}/apply-captions-all`,
@@ -352,6 +367,54 @@ export const api = {
     }
 
     return { filename: info.filename, fileSize: blob.size };
+  },
+
+  downloadClipSoftSubMp4: async (
+    projectId: string,
+    clipId: string,
+    fallbackName = 'SkaDoosh_Captioned_Original'
+  ): Promise<{ filename: string; fileSize: number }> => {
+    const res = await fetch(`/api/projects/${projectId}/clips/${clipId}/download-softsub`, {
+      method: 'GET',
+      credentials: 'include',
+      cache: 'no-store',
+    });
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (!res.ok) {
+      const errText = await res.text();
+      throw classifyResponseError(res.status, errText, `Soft-sub MP4 download failed (${res.status})`, res.url);
+    }
+    if (contentType.includes('text/html') || contentType.includes('application/json')) {
+      const errText = await res.text();
+      throw classifyResponseError(res.status, errText, 'Server did not return a valid MP4 stream.', res.url);
+    }
+
+    const blob = await res.blob();
+    if (!blob || blob.size === 0) {
+      throw new Error('Downloaded soft-subtitled MP4 was empty.');
+    }
+
+    const disp = res.headers.get('content-disposition') || '';
+    const match = disp.match(/filename="?([^"]+)"?/i);
+    const filename =
+      match?.[1] || `${fallbackName.replace(/[^a-zA-Z0-9-_]/g, '_') || 'video'}_softsub_original.mp4`;
+
+    const mp4Blob = blob.type === 'video/mp4' ? blob : new Blob([blob], { type: 'video/mp4' });
+    const objectUrl = URL.createObjectURL(mp4Blob);
+    try {
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = filename;
+      link.rel = 'noopener';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 15_000);
+    }
+
+    return { filename, fileSize: blob.size };
   },
 
   downloadProjectZip: async (projectId: string, fallbackName = 'clipgenius_clips'): Promise<void> => {

@@ -42,8 +42,17 @@ export function formatRelativeDate(iso: string): string {
   });
 }
 
-export function getAspectRatioNumeric(ar: AspectRatio): number {
+export function getAspectRatioNumeric(
+  ar: AspectRatio,
+  sourceWidth?: number,
+  sourceHeight?: number
+): number {
   switch (ar) {
+    case 'original':
+      if (sourceWidth && sourceHeight && sourceWidth > 0 && sourceHeight > 0) {
+        return sourceWidth / sourceHeight;
+      }
+      return 16 / 9;
     case '9:16':
       return 9 / 16;
     case '16:9':
