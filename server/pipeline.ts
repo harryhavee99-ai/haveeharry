@@ -38,8 +38,8 @@ import { renderClipWithFFmpeg } from './renderer.ts';
 
 const execFileAsync = promisify(execFile);
 
-const AUDIO_CHUNK_STRIDE_SECONDS = 300; // 5-minute stride -> ~60 compact chunks for a 5-hour video
-const AUDIO_CHUNK_OVERLAP_SECONDS = 10; // 10s overlap prevents cutting words/sentences at chunk boundaries
+const AUDIO_CHUNK_STRIDE_SECONDS = 210; // 3.5-min stride -> keeps audio chunks safely under 10k input token/min quota while scaling to 5-hour videos
+const AUDIO_CHUNK_OVERLAP_SECONDS = 8; // 8s overlap prevents cutting words/sentences at chunk boundaries
 const AUTO_RENDER_CLIP_LIMIT = 5; // Auto-render top 5 clips to verified MP4 immediately so downloads work out of the box
 
 export interface AudioChunkDescriptor {
@@ -55,7 +55,7 @@ const activePipelines = new Set<string>();
 export function createInitialPipelineStages(): PipelineStageState[] {
   return [
     { key: 'probe', label: 'Preparing & Validating Video', status: 'pending', progress: 0, detail: 'Waiting to validate video file & extract metadata' },
-    { key: 'audio_chunks', label: 'Extracting Audio Segments', status: 'pending', progress: 0, detail: 'Splits long audio into overlapping 5-min chunks' },
+    { key: 'audio_chunks', label: 'Extracting Audio Segments', status: 'pending', progress: 0, detail: 'Splits long audio into overlapping 3.5-min chunks' },
     { key: 'signal_analysis', label: 'Scene, Pause & Audio Energy Analysis', status: 'pending', progress: 0, detail: 'Maps speech pauses, audio energy dynamics, scene cuts & frames' },
     { key: 'transcription', label: 'Transcribing Speech (AI)', status: 'pending', progress: 0, detail: 'Generates verbatim timestamped transcript across segments' },
     { key: 'visual_framing', label: 'Analyzing Visual Framing', status: 'pending', progress: 0, detail: 'Detects active speaker positions for smart reframing' },

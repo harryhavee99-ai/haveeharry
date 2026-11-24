@@ -141,7 +141,19 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
       throw apiErr;
     }
 
-    if (!text) return null as T;
+    if (!text) {
+      if (method === 'GET' && attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
+        continue;
+      }
+      if (method === 'GET') {
+        throw new ApiResponseError('Server returned an empty response while waking up. Retrying shortly.', {
+          status: res.status,
+          code: 'warmup',
+        });
+      }
+      return null as T;
+    }
 
     // Detect Nginx 200 warmup.html / __cookie_check.html / SPA HTML masquerading as 200 OK
     const looksHtml =

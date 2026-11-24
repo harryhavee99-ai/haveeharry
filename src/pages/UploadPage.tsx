@@ -55,6 +55,7 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
   const [localError, setLocalError] = useState<string | null>(null);
   const [startingAnalysis, setStartingAnalysis] = useState(false);
   const [generatingSample, setGeneratingSample] = useState(false);
+  const [previewError, setPreviewError] = useState(false);
 
   const [durationPreset, setDurationPreset] = useState<string>(
     () => uploadState.savedDurationPreset ?? String(settings.defaultClipDuration)
@@ -88,6 +89,10 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
   const uploadedProject = uploadState.completedProject;
   const displayError = localError || uploadState.error;
   const hasActiveUploadCard = Boolean(uploadState.fileName && uploadInfo && !uploadedProject);
+
+  useEffect(() => {
+    setPreviewError(false);
+  }, [uploadedProject?.sourceUrl]);
 
   const validateAndStartUpload = (file: File) => {
     setLocalError(null);
@@ -344,13 +349,31 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
           {uploadedProject && (
             <div className="rounded-xl studio-panel overflow-hidden">
               <div className="aspect-video bg-black relative">
-                {uploadedProject.sourceUrl && (
+                {uploadedProject.sourceUrl && !previewError ? (
                   <video
                     src={uploadedProject.sourceUrl}
                     poster={uploadedProject.thumbnailUrl}
                     controls
+                    playsInline
+                    preload="metadata"
+                    onError={() => setPreviewError(true)}
                     className="w-full h-full object-contain"
                   />
+                ) : (
+                  <div className="w-full h-full flex items-center justify-center relative text-center p-4">
+                    {uploadedProject.thumbnailUrl && (
+                      <img
+                        src={uploadedProject.thumbnailUrl}
+                        alt={uploadedProject.originalFilename}
+                        className="absolute inset-0 w-full h-full object-cover opacity-35"
+                      />
+                    )}
+                    <div className="relative z-10 px-4 py-2.5 rounded-lg bg-black/75 border border-[#D4AF37]/25 text-xs text-zinc-200 max-w-md">
+                      {uploadedProject.browserProxyStatus === 'transcoding'
+                        ? 'Preparing H.264 browser preview in background — you can start AI analysis immediately.'
+                        : 'Video uploaded and verified by FFprobe. Rendered MP4 clips will play in universal H.264/AAC.'}
+                    </div>
+                  </div>
                 )}
               </div>
               <div className="p-5 space-y-4">

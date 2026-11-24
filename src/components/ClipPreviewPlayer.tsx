@@ -46,10 +46,16 @@ export function ClipPreviewPlayer({
   const [isMuted, setIsMuted] = useState(false);
   const [relTime, setRelTime] = useState(0);
   const [isDraggingCrop, setIsDraggingCrop] = useState(false);
+  const [mediaError, setMediaError] = useState(false);
 
   const clipDuration = Math.max(0.5, clip.endTime - clip.startTime);
   const ratio = getAspectRatioNumeric(clip.framing.aspectRatio);
   const showingRendered = Boolean(previewRendered && clip.renderedVideoUrl);
+  const videoSrc = showingRendered ? clip.renderedVideoUrl : project.sourceUrl;
+
+  useEffect(() => {
+    setMediaError(false);
+  }, [videoSrc]);
 
   const activeMusicTrack = useMemo(
     () => musicTracks.find((t) => t.id === clip.audioMix.musicTrackId) ?? null,
@@ -107,11 +113,11 @@ export function ClipPreviewPlayer({
         await vid.play();
         if (bgVideoRef.current) {
           bgVideoRef.current.currentTime = vid.currentTime;
-          void bgVideoRef.current.play();
+          void bgVideoRef.current.play().catch(() => {});
         }
         if (audioRef.current && activeMusicTrack && !showingRendered) {
           audioRef.current.currentTime = relTime % Math.max(1, activeMusicTrack.duration);
-          void audioRef.current.play();
+          void audioRef.current.play().catch(() => {});
         }
         setIsPlaying(true);
       } catch {
@@ -287,7 +293,6 @@ export function ClipPreviewPlayer({
 
   const cssFilter = showingRendered ? 'none' : buildCssFilterFromGrading(clip.colorGrading);
   const progressPct = Math.min(100, Math.max(0, (relTime / clipDuration) * 100));
-  const videoSrc = showingRendered ? clip.renderedVideoUrl : project.sourceUrl;
 
   const cs = clip.captionStyle;
   const mg = clip.motionGraphics;
@@ -315,31 +320,38 @@ export function ClipPreviewPlayer({
         }`}
       >
         {/* Optional Blurred Background Layer */}
-        {!showingRendered && mg.backgroundBlur && videoSrc && (
+        {!showingRendered && mg.backgroundBlur && videoSrc && !mediaError && (
           <video
             ref={bgVideoRef}
             src={videoSrc}
             muted
             playsInline
             preload="metadata"
+            onError={() => {}}
             className="absolute inset-0 w-full h-full object-cover scale-125 blur-2xl opacity-55 pointer-events-none"
           />
         )}
 
         {/* Primary Video Stream */}
-        {videoSrc ? (
+        {videoSrc && !mediaError ? (
           <video
             ref={videoRef}
             src={videoSrc}
+            poster={clip.thumbnailUrl || project.thumbnailUrl}
             playsInline
             preload="metadata"
             onLoadedMetadata={() => {
+              setMediaError(false);
               if (videoRef.current && !showingRendered) {
                 videoRef.current.currentTime = clip.startTime;
               }
             }}
             onTimeUpdate={handleVideoTimeUpdate}
             onEnded={() => setIsPlaying(false)}
+            onError={() => {
+              setIsPlaying(false);
+              setMediaError(true);
+            }}
             style={{
               filter: cssFilter,
               objectPosition: showingRendered
@@ -353,8 +365,19 @@ export function ClipPreviewPlayer({
             }`}
           />
         ) : (
-          <div className="w-full h-full flex items-center justify-center text-sm text-zinc-500">
-            No video source available
+          <div className="relative w-full h-full flex flex-col items-center justify-center text-center p-4 text-xs text-zinc-300 bg-[#07100B]">
+            {(clip.thumbnailUrl || project.thumbnailUrl) && (
+              <img
+                src={clip.thumbnailUrl || project.thumbnailUrl}
+                alt={clip.title}
+                className="absolute inset-0 w-full h-full object-cover opacity-35"
+              />
+            )}
+            <div className="relative z-10 max-w-xs px-3 py-2 rounded-lg bg-black/70 border border-[#D4AF37]/25">
+              {project.browserProxyStatus === 'transcoding' && !showingRendered
+                ? 'Preparing browser-compatible H.264 preview in background...'
+                : 'Preview stream unavailable in this browser codec — rendered H.264 MP4 exports will play cleanly.'}
+            </div>
           </div>
         )}
 

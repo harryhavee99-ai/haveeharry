@@ -133,7 +133,12 @@ export function ClipsPage({
 
   // Inline Preview Modal state
   const [previewTarget, setPreviewTarget] = useState<PreviewTarget | null>(null);
+  const [previewMediaError, setPreviewMediaError] = useState(false);
   const previewVideoRef = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    setPreviewMediaError(false);
+  }, [previewTarget?.src]);
 
   // Auto-download clip as soon as its queued render reaches export_ready
   useEffect(() => {
@@ -153,21 +158,21 @@ export function ClipsPage({
   }, [project, pendingAutoDownloadIds]);
 
   const sortedClips = useMemo(() => {
-    if (!project) return [];
+    if (!project || !Array.isArray(project.clips)) return [];
     const list = [...project.clips];
     switch (sortBy) {
       case 'overall':
-        return list.sort((a, b) => (b.hookBreakdown?.total ?? b.scores.overall) - (a.hookBreakdown?.total ?? a.scores.overall));
+        return list.sort((a, b) => (b.hookBreakdown?.total ?? b.scores?.overall ?? 0) - (a.hookBreakdown?.total ?? a.scores?.overall ?? 0));
       case 'emotional':
-        return list.sort((a, b) => (b.hookBreakdown?.emotionalScore ?? b.scores.emotionalImpact) - (a.hookBreakdown?.emotionalScore ?? a.scores.emotionalImpact));
+        return list.sort((a, b) => (b.hookBreakdown?.emotionalScore ?? b.scores?.emotionalImpact ?? 0) - (a.hookBreakdown?.emotionalScore ?? a.scores?.emotionalImpact ?? 0));
       case 'informative':
-        return list.sort((a, b) => (b.hookBreakdown?.informativeScore ?? b.scores.informationValue) - (a.hookBreakdown?.informativeScore ?? a.scores.informationValue));
+        return list.sort((a, b) => (b.hookBreakdown?.informativeScore ?? b.scores?.informationValue ?? 0) - (a.hookBreakdown?.informativeScore ?? a.scores?.informationValue ?? 0));
       case 'entertaining':
-        return list.sort((a, b) => (b.hookBreakdown?.entertainingScore ?? b.scores.humor) - (a.hookBreakdown?.entertainingScore ?? a.scores.humor));
+        return list.sort((a, b) => (b.hookBreakdown?.entertainingScore ?? b.scores?.humor ?? 0) - (a.hookBreakdown?.entertainingScore ?? a.scores?.humor ?? 0));
       case 'surprising':
-        return list.sort((a, b) => (b.hookBreakdown?.surprisingScore ?? b.scores.hookStrength) - (a.hookBreakdown?.surprisingScore ?? a.scores.hookStrength));
+        return list.sort((a, b) => (b.hookBreakdown?.surprisingScore ?? b.scores?.hookStrength ?? 0) - (a.hookBreakdown?.surprisingScore ?? a.scores?.hookStrength ?? 0));
       case 'storytelling':
-        return list.sort((a, b) => (b.hookBreakdown?.storytellingScore ?? b.scores.storyCompleteness) - (a.hookBreakdown?.storytellingScore ?? a.scores.storyCompleteness));
+        return list.sort((a, b) => (b.hookBreakdown?.storytellingScore ?? b.scores?.storyCompleteness ?? 0) - (a.hookBreakdown?.storytellingScore ?? a.scores?.storyCompleteness ?? 0));
       case 'chronological':
         return list.sort((a, b) => a.startTime - b.startTime);
       default:
@@ -176,24 +181,24 @@ export function ClipsPage({
   }, [project, sortBy]);
 
   const sortedHookCandidates = useMemo(() => {
-    if (!project?.hookCandidates) return [];
+    if (!Array.isArray(project?.hookCandidates)) return [];
     const filtered = showRejectedHooks
       ? [...project.hookCandidates]
       : project.hookCandidates.filter((c) => c.status !== 'rejected');
 
     switch (sortBy) {
       case 'overall':
-        return filtered.sort((a, b) => b.hookBreakdown.total - a.hookBreakdown.total);
+        return filtered.sort((a, b) => (b.hookBreakdown?.total ?? 0) - (a.hookBreakdown?.total ?? 0));
       case 'emotional':
-        return filtered.sort((a, b) => b.hookBreakdown.emotionalScore - a.hookBreakdown.emotionalScore);
+        return filtered.sort((a, b) => (b.hookBreakdown?.emotionalScore ?? 0) - (a.hookBreakdown?.emotionalScore ?? 0));
       case 'informative':
-        return filtered.sort((a, b) => b.hookBreakdown.informativeScore - a.hookBreakdown.informativeScore);
+        return filtered.sort((a, b) => (b.hookBreakdown?.informativeScore ?? 0) - (a.hookBreakdown?.informativeScore ?? 0));
       case 'entertaining':
-        return filtered.sort((a, b) => b.hookBreakdown.entertainingScore - a.hookBreakdown.entertainingScore);
+        return filtered.sort((a, b) => (b.hookBreakdown?.entertainingScore ?? 0) - (a.hookBreakdown?.entertainingScore ?? 0));
       case 'surprising':
-        return filtered.sort((a, b) => b.hookBreakdown.surprisingScore - a.hookBreakdown.surprisingScore);
+        return filtered.sort((a, b) => (b.hookBreakdown?.surprisingScore ?? 0) - (a.hookBreakdown?.surprisingScore ?? 0));
       case 'storytelling':
-        return filtered.sort((a, b) => b.hookBreakdown.storytellingScore - a.hookBreakdown.storytellingScore);
+        return filtered.sort((a, b) => (b.hookBreakdown?.storytellingScore ?? 0) - (a.hookBreakdown?.storytellingScore ?? 0));
       case 'chronological':
         return filtered.sort((a, b) => a.startTime - b.startTime);
       default:
@@ -906,7 +911,7 @@ export function ClipsPage({
                       <div className="flex items-center gap-3 shrink-0">
                         <div className="text-right">
                           <div className="font-mono text-xl font-bold text-[#F5C451] tabular-nums">
-                            {cand.hookBreakdown.total}
+                            {cand.hookBreakdown?.total ?? 0}
                             <span className="text-xs text-zinc-500 font-normal">/100</span>
                           </div>
                           <div className="text-[10px] uppercase tracking-wider text-zinc-500">
@@ -937,13 +942,13 @@ export function ClipsPage({
                     {/* 7-Criterion Scoring Breakdown Grid */}
                     <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2 font-mono text-[11px] tabular-nums">
                       {[
-                        ['Opening Hook', cand.hookBreakdown.openingHook, 20],
-                        ['Curiosity', cand.hookBreakdown.curiosityInterest, 15],
-                        ['Emotion', cand.hookBreakdown.emotionalEngagement, 15],
-                        ['Info / Ent.', cand.hookBreakdown.infoEntertainment, 15],
-                        ['Completeness', cand.hookBreakdown.storyCompleteness, 15],
-                        ['Standalone', cand.hookBreakdown.standaloneContext, 10],
-                        ['A/V Quality', cand.hookBreakdown.audioVisualQuality, 10],
+                        ['Opening Hook', cand.hookBreakdown?.openingHook ?? 0, 20],
+                        ['Curiosity', cand.hookBreakdown?.curiosityInterest ?? 0, 15],
+                        ['Emotion', cand.hookBreakdown?.emotionalEngagement ?? 0, 15],
+                        ['Info / Ent.', cand.hookBreakdown?.infoEntertainment ?? 0, 15],
+                        ['Completeness', cand.hookBreakdown?.storyCompleteness ?? 0, 15],
+                        ['Standalone', cand.hookBreakdown?.standaloneContext ?? 0, 10],
+                        ['A/V Quality', cand.hookBreakdown?.audioVisualQuality ?? 0, 10],
                       ].map(([label, pts, max]) => (
                         <div
                           key={String(label)}
@@ -1147,34 +1152,45 @@ export function ClipsPage({
                 <X className="w-4 h-4" />
               </button>
             </div>
-            <div className="bg-black flex items-center justify-center max-h-[70vh]">
-              <video
-                ref={previewVideoRef}
-                src={previewTarget.src}
-                controls
-                autoPlay
-                playsInline
-                onLoadedMetadata={(e) => {
-                  const vid = e.currentTarget;
-                  if (!previewTarget.isRenderedMp4 && typeof previewTarget.startTime === 'number') {
-                    vid.currentTime = previewTarget.startTime;
-                  }
-                }}
-                onTimeUpdate={(e) => {
-                  const vid = e.currentTarget;
-                  if (
-                    !previewTarget.isRenderedMp4 &&
-                    typeof previewTarget.endTime === 'number' &&
-                    vid.currentTime >= previewTarget.endTime
-                  ) {
-                    vid.pause();
-                    if (typeof previewTarget.startTime === 'number') {
+            <div className="bg-black flex items-center justify-center min-h-[260px] max-h-[70vh]">
+              {previewTarget.src && !previewMediaError ? (
+                <video
+                  ref={previewVideoRef}
+                  src={previewTarget.src}
+                  controls
+                  autoPlay
+                  playsInline
+                  preload="metadata"
+                  onError={() => setPreviewMediaError(true)}
+                  onLoadedMetadata={(e) => {
+                    const vid = e.currentTarget;
+                    if (!previewTarget.isRenderedMp4 && typeof previewTarget.startTime === 'number') {
                       vid.currentTime = previewTarget.startTime;
                     }
-                  }
-                }}
-                className="max-h-[70vh] w-full object-contain"
-              />
+                    void vid.play().catch(() => {});
+                  }}
+                  onTimeUpdate={(e) => {
+                    const vid = e.currentTarget;
+                    if (
+                      !previewTarget.isRenderedMp4 &&
+                      typeof previewTarget.endTime === 'number' &&
+                      vid.currentTime >= previewTarget.endTime
+                    ) {
+                      vid.pause();
+                      if (typeof previewTarget.startTime === 'number') {
+                        vid.currentTime = previewTarget.startTime;
+                      }
+                    }
+                  }}
+                  className="max-h-[70vh] w-full object-contain"
+                />
+              ) : (
+                <div className="p-8 text-center text-xs text-zinc-300 max-w-md">
+                  {project.browserProxyStatus === 'transcoding' && !previewTarget.isRenderedMp4
+                    ? 'The browser-compatible H.264 preview of the source video is still transcoding in the background. Try again shortly or render the MP4 clip directly.'
+                    : 'This video stream is not directly supported by your browser codec. Click Render / Download MP4 to generate a universally playable H.264 MP4 clip.'}
+                </div>
+              )}
             </div>
           </div>
         </div>

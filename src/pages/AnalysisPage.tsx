@@ -23,6 +23,11 @@ export function AnalysisPage({ project, onResumeOrStart, onNavigate }: AnalysisP
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [triggering, setTriggering] = useState(false);
+  const [videoError, setVideoError] = useState(false);
+
+  React.useEffect(() => {
+    setVideoError(false);
+  }, [project?.sourceUrl]);
 
   const filteredTranscript = useMemo(() => {
     if (!project) return [];
@@ -57,9 +62,13 @@ export function AnalysisPage({ project, onResumeOrStart, onNavigate }: AnalysisP
   );
 
   const jumpToTime = (sec: number) => {
-    if (videoRef.current) {
-      videoRef.current.currentTime = sec;
-      void videoRef.current.play();
+    if (videoRef.current && !videoError) {
+      try {
+        videoRef.current.currentTime = sec;
+        void videoRef.current.play().catch(() => {});
+      } catch {
+        // ignore seek errors when media is not yet ready
+      }
     }
   };
 
@@ -218,16 +227,36 @@ export function AnalysisPage({ project, onResumeOrStart, onNavigate }: AnalysisP
 
         {/* Right: Source Video + Timestamped Transcript */}
         <div className="xl:col-span-7 space-y-5">
-          {project.sourceUrl && (
+          {(project.sourceUrl || project.browserProxyStatus === 'transcoding' || project.thumbnailUrl) && (
             <div className="rounded-xl studio-panel overflow-hidden">
-              <div className="aspect-video bg-black">
-                <video
-                  ref={videoRef}
-                  src={project.sourceUrl}
-                  poster={project.thumbnailUrl}
-                  controls
-                  className="w-full h-full object-contain"
-                />
+              <div className="aspect-video bg-black relative">
+                {project.sourceUrl && !videoError ? (
+                  <video
+                    ref={videoRef}
+                    src={project.sourceUrl}
+                    poster={project.thumbnailUrl}
+                    controls
+                    playsInline
+                    preload="metadata"
+                    onError={() => setVideoError(true)}
+                    className="w-full h-full object-contain"
+                  />
+                ) : (
+                  <div className="w-full h-full flex items-center justify-center relative text-center p-4">
+                    {project.thumbnailUrl && (
+                      <img
+                        src={project.thumbnailUrl}
+                        alt={project.name}
+                        className="absolute inset-0 w-full h-full object-cover opacity-35"
+                      />
+                    )}
+                    <div className="relative z-10 px-4 py-2.5 rounded-lg bg-black/75 border border-[#D4AF37]/25 text-xs text-zinc-200 max-w-md">
+                      {project.browserProxyStatus === 'transcoding'
+                        ? 'Converting source video to browser-playable H.264 preview in background — AI analysis continues at full speed.'
+                        : 'Browser cannot decode the raw source codec directly; generated MP4 clips are encoded in standard H.264/AAC.'}
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           )}

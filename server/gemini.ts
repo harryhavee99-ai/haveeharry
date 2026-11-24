@@ -80,6 +80,20 @@ function parseJsonSafely<T>(rawText: string | undefined, fallback: T): T {
   }
 }
 
+let transcribeCooldownUntil = 0;
+
+function extractRetryDelayMs(msg: string, fallbackMs: number): number {
+  const retryField = msg.match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/i);
+  if (retryField) {
+    return Math.min(90_000, Math.ceil(Number(retryField[1]) * 1000) + 1500);
+  }
+  const pleaseRetry = msg.match(/retry in\s+(\d+(?:\.\d+)?)s/i);
+  if (pleaseRetry) {
+    return Math.min(90_000, Math.ceil(Number(pleaseRetry[1]) * 1000) + 1500);
+  }
+  return fallbackMs;
+}
+
 async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 4): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -104,7 +118,9 @@ async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 4): Promise<T> {
       if (attempt < maxAttempts) {
         const isRateLimit = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED');
         const baseDelay = isRateLimit ? 2500 : 1200;
-        const backoff = Math.min(20000, baseDelay * Math.pow(2, attempt - 1));
+        const backoff = isRateLimit
+          ? extractRetryDelayMs(msg, Math.min(25000, baseDelay * Math.pow(2, attempt - 1)))
+          : Math.min(20000, baseDelay * Math.pow(2, attempt - 1));
         const jitter = Math.round(Math.random() * 400);
         await new Promise((r) => setTimeout(r, backoff + jitter));
       }
@@ -244,46 +260,68 @@ export async function transcribeAudioChunk(params: {
         ? 'Transcribe the spoken Urdu/Hindi verbatim using Roman Urdu (Latin script) with natural punctuation and capitalization.'
         : `Transcribe the spoken audio verbatim in language code "${params.language}" with accurate punctuation and capitalization.`;
 
-  // Step 1: Fast single-pass timestamped speech-to-text via gemini-3.5-transcribe (35s timeout guard)
+  // Step 1: Fast single-pass timestamped speech-to-text via gemini-3.5-transcribe
+  // Guard against Free Tier 10,000 input tokens/min limit (~32 audio tokens/sec -> max ~240s per chunk)
+  // and skip immediately during active rate-limit cooldowns to route cleanly to gemini-4-hydrogen.
   let verbatimReference = '';
-  try {
-    const t0 = Date.now();
-    const transcribeRes = await withTimeout(
-      withRetry(
-        () =>
-          ai.models.generateContent({
-            model: 'gemini-3.5-transcribe',
-            contents: {
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: 'audio/mp3',
-                    data: base64Audio,
+  const canUseFastTranscribe =
+    params.chunkDurationSeconds <= 240 && Date.now() >= transcribeCooldownUntil;
+
+  if (canUseFastTranscribe) {
+    try {
+      const t0 = Date.now();
+      const transcribeRes = await withTimeout(
+        withRetry(
+          () =>
+            ai.models.generateContent({
+              model: 'gemini-3.5-transcribe',
+              contents: {
+                parts: [
+                  {
+                    inlineData: {
+                      mimeType: 'audio/mp3',
+                      data: base64Audio,
+                    },
                   },
-                },
-                {
-                  text: [
-                    `${languageDirective}`,
-                    `Audio duration is ${params.chunkDurationSeconds.toFixed(1)} seconds (0.0 to ${params.chunkDurationSeconds.toFixed(1)}).`,
-                    `Format each spoken sentence/phrase on its own line with exact timestamps in seconds like:`,
-                    `[0.0 - 4.5] Speaker 1: Exact spoken words here.`,
-                    `Only transcribe words actually spoken in the audio. If there is silence or only music with no speech, respond with "[NO_SPEECH]".`,
-                  ].join('\n'),
-                },
-              ],
-            },
-          }),
-        1
-      ),
-      35_000,
-      'gemini-3.5-transcribe'
-    );
-    verbatimReference = (transcribeRes.text ?? '').trim();
+                  {
+                    text: [
+                      `${languageDirective}`,
+                      `Audio duration is ${params.chunkDurationSeconds.toFixed(1)} seconds (0.0 to ${params.chunkDurationSeconds.toFixed(1)}).`,
+                      `Format each spoken sentence/phrase on its own line with exact timestamps in seconds like:`,
+                      `[0.0 - 4.5] Speaker 1: Exact spoken words here.`,
+                      `Only transcribe words actually spoken in the audio. If there is silence or only music with no speech, respond with "[NO_SPEECH]".`,
+                    ].join('\n'),
+                  },
+                ],
+              },
+            }),
+          1
+        ),
+        35_000,
+        'gemini-3.5-transcribe'
+      );
+      verbatimReference = (transcribeRes.text ?? '').trim();
+      console.log(
+        `[Gemini] gemini-3.5-transcribe chunk ${params.chunkIndex} finished in ${Date.now() - t0}ms (${verbatimReference.length} chars)`
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
+        const cooldownMs = extractRetryDelayMs(msg, 65_000);
+        transcribeCooldownUntil = Date.now() + cooldownMs;
+        console.log(
+          `[Gemini] gemini-3.5-transcribe rate-limited (cooldown ${Math.round(cooldownMs / 1000)}s); routing chunk ${params.chunkIndex} to gemini-4-hydrogen.`
+        );
+      } else {
+        console.log(
+          `[Gemini] Routing chunk ${params.chunkIndex} transcription to gemini-4-hydrogen (${msg.slice(0, 120)}).`
+        );
+      }
+    }
+  } else {
     console.log(
-      `[Gemini] gemini-3.5-transcribe chunk ${params.chunkIndex} finished in ${Date.now() - t0}ms (${verbatimReference.length} chars)`
+      `[Gemini] Chunk ${params.chunkIndex} (${params.chunkDurationSeconds.toFixed(0)}s) routed directly to gemini-4-hydrogen audio alignment.`
     );
-  } catch (err) {
-    console.warn('gemini-3.5-transcribe fallback to gemini-4-hydrogen audio pass:', err instanceof Error ? err.message : err);
   }
 
   if (verbatimReference === '[NO_SPEECH]') {

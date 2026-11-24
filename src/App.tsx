@@ -101,6 +101,18 @@ function readInitialWorkspaceState(): {
   }
 }
 
+function normalizeProject(raw: ProjectRecord): ProjectRecord {
+  return {
+    ...raw,
+    clips: Array.isArray(raw.clips) ? raw.clips : [],
+    transcript: Array.isArray(raw.transcript) ? raw.transcript : [],
+    pipelineStages: Array.isArray(raw.pipelineStages) ? raw.pipelineStages : [],
+    silences: Array.isArray(raw.silences) ? raw.silences : [],
+    scenes: Array.isArray(raw.scenes) ? raw.scenes : [],
+    hookCandidates: Array.isArray(raw.hookCandidates) ? raw.hookCandidates : [],
+  };
+}
+
 export default function App() {
   const initial = useMemo(() => readInitialWorkspaceState(), []);
   const [activePage, setActivePage] = useState<NavPage>(initial.page);
@@ -137,14 +149,21 @@ export default function App() {
         api.getSettings(),
         api.getCapabilities(),
       ]);
-      setProjects(projList);
-      setExportJobs(jobs);
-      setMusicTracks(tracks);
-      setSettings(prefs);
-      setCapabilities(sys.capabilities);
-      setStorage(sys.storage);
+      const safeProjects = Array.isArray(projList) ? projList.filter(Boolean).map(normalizeProject) : [];
+      const safeJobs = Array.isArray(jobs) ? jobs.filter(Boolean) : [];
+      const safeTracks = Array.isArray(tracks) ? tracks.filter(Boolean) : [];
+      setProjects(safeProjects);
+      setExportJobs(safeJobs);
+      setMusicTracks(safeTracks);
+      if (prefs && typeof prefs === 'object') {
+        setSettings({ ...DEFAULT_APP_SETTINGS, ...prefs });
+      }
+      if (sys && typeof sys === 'object') {
+        if (sys.capabilities) setCapabilities(sys.capabilities);
+        if (sys.storage) setStorage(sys.storage);
+      }
       setActiveProjectId((curr) =>
-        curr && projList.some((p) => p.id === curr) ? curr : projList[0]?.id ?? null
+        curr && safeProjects.some((p) => p.id === curr) ? curr : safeProjects[0]?.id ?? null
       );
     } catch (err) {
       setToastError(err instanceof Error ? err.message : 'Failed to connect to ClipGenius server.');
@@ -190,11 +209,12 @@ export default function App() {
     return () => window.removeEventListener('hashchange', onHashChange);
   }, []);
 
-  // Real background polling whenever an AI analysis pipeline or FFmpeg export render is active
+  // Real background polling whenever an AI analysis pipeline, H.264 browser preview transcode, or FFmpeg export render is active
   const hasActiveWork = useMemo(() => {
     const analyzing = projects.some((p) => p.status === 'analyzing');
+    const transcodingProxy = projects.some((p) => p.browserProxyStatus === 'transcoding');
     const rendering = exportJobs.some((j) => j.status === 'queued' || j.status === 'rendering');
-    return analyzing || rendering;
+    return analyzing || transcodingProxy || rendering;
   }, [projects, exportJobs]);
 
   useEffect(() => {
@@ -202,8 +222,12 @@ export default function App() {
     const timer = setInterval(async () => {
       try {
         const [projList, jobs] = await Promise.all([api.getProjects(), api.getExports()]);
-        setProjects(projList);
-        setExportJobs(jobs);
+        if (Array.isArray(projList)) {
+          setProjects(projList.filter(Boolean).map(normalizeProject));
+        }
+        if (Array.isArray(jobs)) {
+          setExportJobs(jobs.filter(Boolean));
+        }
       } catch {
         // retry on next interval
       }
@@ -223,12 +247,12 @@ export default function App() {
           project?: ProjectRecord;
           exports?: ExportJob[];
         };
-        if (payload.project) {
-          const updated = payload.project;
+        if (payload.project && payload.project.id) {
+          const updated = normalizeProject(payload.project);
           setProjects((prev) => [updated, ...prev.filter((p) => p.id !== updated.id)]);
         }
-        if (payload.exports) {
-          const projExports = payload.exports;
+        if (Array.isArray(payload.exports)) {
+          const projExports = payload.exports.filter(Boolean);
           setExportJobs((prev) => [
             ...projExports,
             ...prev.filter((j) => j.projectId !== activeProject.id),

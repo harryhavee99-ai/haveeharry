@@ -231,11 +231,40 @@ async function createServer() {
     res.flushHeaders?.();
 
     let lastPayload = '';
+    let closed = false;
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      clearInterval(interval);
+      clearInterval(heartbeat);
+    };
+
+    const safeWrite = (chunk: string) => {
+      if (closed || res.writableEnded || res.destroyed) {
+        cleanup();
+        return;
+      }
+      try {
+        res.write(chunk);
+      } catch {
+        cleanup();
+      }
+    };
+
     const sendSnapshot = () => {
+      if (closed || res.writableEnded || res.destroyed) {
+        cleanup();
+        return;
+      }
       const current = store.getProject(projectId);
       if (!current) {
-        res.write(`event: deleted\ndata: ${JSON.stringify({ projectId })}\n\n`);
-        res.end();
+        safeWrite(`event: deleted\ndata: ${JSON.stringify({ projectId })}\n\n`);
+        cleanup();
+        try {
+          if (!res.writableEnded) res.end();
+        } catch {
+          // ignore close errors
+        }
         return;
       }
       const snapshot = JSON.stringify({
@@ -244,20 +273,19 @@ async function createServer() {
       });
       if (snapshot !== lastPayload) {
         lastPayload = snapshot;
-        res.write(`event: update\ndata: ${snapshot}\n\n`);
+        safeWrite(`event: update\ndata: ${snapshot}\n\n`);
       }
     };
 
-    sendSnapshot();
     const interval = setInterval(sendSnapshot, 1200);
     const heartbeat = setInterval(() => {
-      res.write(': heartbeat\n\n');
+      safeWrite(': heartbeat\n\n');
     }, 15000);
 
-    req.on('close', () => {
-      clearInterval(interval);
-      clearInterval(heartbeat);
-    });
+    sendSnapshot();
+
+    req.on('close', cleanup);
+    res.on('error', cleanup);
   });
 
   app.delete('/api/projects/:id', (req, res) => {
@@ -561,17 +589,20 @@ async function createServer() {
         console.warn('Thumbnail extraction skipped:', thumbErr);
       }
 
-      // Ensure MKV, MOV, AVI, or non-H.264 uploads get a browser-playable MP4 preview
-      // WITHOUT ever blocking /complete past HTTP proxy timeouts.
-      let browserPreviewUrl = `/media/projects/${project.id}/${targetFilename}`;
+      // Ensure MKV, MOV, AVI, or non-H.264 (e.g. HEVC/H.265) uploads get a browser-playable MP4 preview
+      // WITHOUT ever blocking /complete past HTTP proxy timeouts or serving unplayable HEVC to <video>.
+      let browserPreviewUrl: string | undefined = `/media/projects/${project.id}/${targetFilename}`;
+      let browserProxyStatus: 'ready' | 'transcoding' | 'failed' = 'ready';
       const isH264 = meta.codec === 'h264' || meta.codec === 'avc1';
-      const needsBrowserProxy =
-        (ext !== '.mp4' && ext !== '.webm') ||
-        (!isH264 && ext !== '.webm') ||
-        (meta.audioCodec !== 'aac' && meta.audioCodec !== 'mp3' && meta.audioCodec !== 'opus' && meta.audioCodec !== 'none');
+      const isWebmNative = ext === '.webm' && (meta.codec === 'vp8' || meta.codec === 'vp9' || meta.codec === 'av1');
+      const isDirectlyBrowserPlayable =
+        ((ext === '.mp4' && isH264) || isWebmNative) &&
+        (meta.audioCodec === 'aac' || meta.audioCodec === 'mp3' || meta.audioCodec === 'opus' || meta.audioCodec === 'none');
+      const needsBrowserProxy = !isDirectlyBrowserPlayable;
 
       if (needsBrowserProxy) {
         const previewPath = path.join(projectDir, 'preview_browser.mp4');
+        const previewTmpPath = path.join(projectDir, 'preview_browser.tmp.mp4');
         if (isH264 && meta.fileSize <= 500 * 1024 * 1024) {
           // Ultra-fast container remux (typically 1-3s)
           try {
@@ -585,21 +616,33 @@ async function createServer() {
                 targetPath,
                 '-c:v',
                 'copy',
-                ...(meta.audioCodec !== 'none' ? ['-c:a', 'aac', '-b:a', '160k'] : ['-an']),
+                ...(meta.audioCodec !== 'none' ? ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000'] : ['-an']),
+                '-f',
+                'mp4',
                 '-movflags',
                 '+faststart',
-                previewPath,
+                previewTmpPath,
               ],
               { maxBuffer: 16 * 1024 * 1024, timeout: 25000 }
             );
-            if (fs.existsSync(previewPath) && fs.statSync(previewPath).size > 0) {
+            if (fs.existsSync(previewTmpPath) && fs.statSync(previewTmpPath).size > 0) {
+              fs.renameSync(previewTmpPath, previewPath);
               browserPreviewUrl = `/media/projects/${project.id}/preview_browser.mp4`;
+              browserProxyStatus = 'ready';
             }
           } catch (proxyErr) {
-            console.warn('Fast preview remux skipped, using original file:', proxyErr);
+            try {
+              if (fs.existsSync(previewTmpPath)) fs.unlinkSync(previewTmpPath);
+            } catch {
+              // ignore cleanup error
+            }
+            console.warn('Fast preview remux skipped:', proxyErr);
           }
         } else {
-          // Background proxy transcode for large MKV/MOV/HEVC/ProRes files so upload completes immediately
+          // Background H.264 proxy transcode for large MKV/MOV/HEVC/ProRes files so upload completes immediately.
+          // Defer browser <video src> until atomic H.264 proxy finishes to prevent "The element has no supported sources."
+          browserPreviewUrl = undefined;
+          browserProxyStatus = 'transcoding';
           const proxyArgs = isH264
             ? [
                 '-loglevel',
@@ -609,10 +652,12 @@ async function createServer() {
                 targetPath,
                 '-c:v',
                 'copy',
-                ...(meta.audioCodec !== 'none' ? ['-c:a', 'aac', '-b:a', '160k'] : ['-an']),
+                ...(meta.audioCodec !== 'none' ? ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000'] : ['-an']),
+                '-f',
+                'mp4',
                 '-movflags',
                 '+faststart',
-                previewPath,
+                previewTmpPath,
               ]
             : [
                 '-loglevel',
@@ -630,23 +675,45 @@ async function createServer() {
                 '24',
                 '-pix_fmt',
                 'yuv420p',
-                ...(meta.audioCodec !== 'none' ? ['-c:a', 'aac', '-b:a', '160k'] : ['-an']),
+                ...(meta.audioCodec !== 'none' ? ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000'] : ['-an']),
+                '-f',
+                'mp4',
                 '-movflags',
                 '+faststart',
-                previewPath,
+                previewTmpPath,
               ];
           const bgProc = spawn('ffmpeg', proxyArgs, { stdio: 'ignore' });
           bgProc.on('close', (code) => {
-            if (code === 0 && fs.existsSync(previewPath) && fs.statSync(previewPath).size > 0) {
-              const latest = store.getProject(project.id);
-              if (latest) {
-                latest.sourceUrl = `/media/projects/${project.id}/preview_browser.mp4`;
-                store.upsertProject(latest);
+            const latest = store.getProject(project.id);
+            if (code === 0 && fs.existsSync(previewTmpPath) && fs.statSync(previewTmpPath).size > 0) {
+              try {
+                fs.renameSync(previewTmpPath, previewPath);
+                if (latest) {
+                  latest.sourceUrl = `/media/projects/${project.id}/preview_browser.mp4`;
+                  latest.browserProxyStatus = 'ready';
+                  store.upsertProject(latest);
+                }
+                return;
+              } catch {
+                // fall through to failure state
               }
+            }
+            try {
+              if (fs.existsSync(previewTmpPath)) fs.unlinkSync(previewTmpPath);
+            } catch {
+              // ignore cleanup
+            }
+            if (latest && !latest.sourceUrl) {
+              latest.browserProxyStatus = 'failed';
+              store.upsertProject(latest);
             }
           });
           bgProc.on('error', () => {
-            // Non-fatal; original source remains playable/renderable
+            const latest = store.getProject(project.id);
+            if (latest && !latest.sourceUrl) {
+              latest.browserProxyStatus = 'failed';
+              store.upsertProject(latest);
+            }
           });
         }
       }
@@ -654,6 +721,7 @@ async function createServer() {
       project.sourcePath = targetPath;
       project.storageRef = `local://projects/${project.id}/${targetFilename}`;
       project.sourceUrl = browserPreviewUrl;
+      project.browserProxyStatus = browserProxyStatus;
       project.originalContainer = ext.replace('.', '').toUpperCase();
       project.thumbnailUrl = hasThumbnail ? `/media/projects/${project.id}/thumb.jpg` : undefined;
       project.fileSize = meta.fileSize;
@@ -1164,6 +1232,9 @@ async function createServer() {
     res.setHeader('Cache-Control', 'no-store');
 
     const readStream = fs.createReadStream(fullPath);
+    res.on('close', () => {
+      if (!readStream.destroyed) readStream.destroy();
+    });
     readStream.on('error', (err) => {
       logBackendError({
         projectId: project.id,
@@ -1342,6 +1413,17 @@ async function createServer() {
     }
   });
 
+  // Prevent browsers/proxies from caching stale HTML entry pages pointing to outdated Vite dep hashes
+  app.use((req, res, next) => {
+    const accept = req.headers.accept || '';
+    if (req.method === 'GET' && (req.path === '/' || req.path.endsWith('.html') || accept.includes('text/html'))) {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+    }
+    next();
+  });
+
   // Mount Vite dev server middleware or serve built dist/
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
@@ -1377,6 +1459,14 @@ async function createServer() {
   httpServer.headersTimeout = 70_000;
   httpServer.requestTimeout = 0;
 }
+
+process.on('uncaughtException', (err) => {
+  console.error('[ClipGenius Server] Caught uncaughtException (keeping server alive):', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[ClipGenius Server] Caught unhandledRejection (keeping server alive):', reason);
+});
 
 createServer().catch((err) => {
   console.error('Fatal error starting ClipGenius AI server:', err);

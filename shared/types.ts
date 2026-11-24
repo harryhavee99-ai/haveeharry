@@ -354,6 +354,7 @@ export interface ProjectRecord {
   detectedLanguage?: string;
   hookCandidates?: HookCandidate[];
   hookSelectionNote?: string;
+  browserProxyStatus?: 'ready' | 'transcoding' | 'failed';
   clips: ClipRecord[];
   createdAt: string;
   updatedAt: string;
