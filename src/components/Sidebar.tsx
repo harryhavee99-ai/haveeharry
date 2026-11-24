@@ -82,7 +82,7 @@ export function Sidebar({
             <Scissors className="h-4 w-4" />
           </div>
           <span className="font-display text-base font-bold tracking-tight text-[#F6F8F5] whitespace-nowrap">
-            ClipGenius <span className="text-[#F5C451]">AI</span>
+            Ska<span className="text-[#F5C451]">Doosh</span>
           </span>
         </button>
         <button
