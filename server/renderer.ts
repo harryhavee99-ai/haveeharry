@@ -291,8 +291,19 @@ export function getClipSegments(project: ProjectRecord, clip: ClipRecord): Trans
   return project.transcript.filter((seg) => seg.end > clip.startTime && seg.start < clip.endTime);
 }
 
+function formatWordCase(raw: string, style: CaptionStyleConfig): string {
+  const mode = style.textTransform || (style.uppercase ? 'uppercase' : 'none');
+  if (mode === 'uppercase' || style.uppercase) return raw.toUpperCase();
+  if (mode === 'lowercase') return raw.toLowerCase();
+  if (mode === 'capitalize') {
+    return raw.charAt(0).toUpperCase() + raw.slice(1).toLowerCase();
+  }
+  return raw;
+}
+
 /**
  * Generates an Advanced SubStation Alpha (.ass) subtitle file with synchronized word-level highlighting
+ * and 12 studio animations (including Waving Flow, Bounce, Typewriter, Shake, Neon Pulse, Flip, Karaoke, Pop, Glow)
  * matching the clip's caption preset and customizations.
  */
 export function generateAssSubtitles(
@@ -323,28 +334,33 @@ export function generateAssSubtitles(
   const outlineCol = hasBox
     ? hexToAssColor(style.backgroundColor, style.backgroundOpacity)
     : hexToAssColor(style.strokeColor, 1);
+  const shadowHex = style.shadowColor || '#000000';
   const backCol = hasBox
     ? hexToAssColor(style.backgroundColor, style.backgroundOpacity)
-    : hexToAssColor('#000000', style.shadow ? 0.65 : 0);
+    : hexToAssColor(shadowHex, style.shadow ? 0.7 : 0);
 
   const borderStyle = hasBox ? 3 : 1;
+  const padExtra = style.backgroundPadding ? Math.max(2, style.backgroundPadding * 0.5) : 6;
   const outlineWidth = Number(
     (hasBox
-      ? Math.max(7, (style.strokeWidth + 6) * scaleFactor)
+      ? Math.max(6, (style.strokeWidth + padExtra) * scaleFactor)
       : Math.max(0.5, style.strokeWidth * scaleFactor)
     ).toFixed(1)
   );
-  const shadowDepth = style.shadow ? Number(((hasBox ? 1.5 : 2.8) * scaleFactor).toFixed(1)) : 0;
+  const shadowBase = style.shadowBlur !== undefined ? Math.max(0.8, style.shadowBlur * 0.22) : hasBox ? 1.5 : 2.8;
+  const shadowDepth = style.shadow ? Number((shadowBase * scaleFactor).toFixed(1)) : 0;
   const boldFlag = style.fontWeight >= 700 ? -1 : 0;
-  const letterSpacing = style.uppercase ? Number((0.8 * scaleFactor).toFixed(1)) : 0;
+  const italicFlag = style.italic ? -1 : 0;
+  const rawSpacing = style.letterSpacing !== undefined ? style.letterSpacing : style.uppercase ? 0.8 : 0;
+  const letterSpacing = Number((rawSpacing * scaleFactor).toFixed(1));
 
   const marginV =
     style.position === 'top'
-      ? Math.max(28, Math.round((style.verticalOffset / 100) * outHeight))
+      ? Math.max(24, Math.round((style.verticalOffset / 100) * outHeight))
       : style.position === 'bottom'
-        ? Math.max(36, Math.round(((100 - style.verticalOffset) / 100) * outHeight))
+        ? Math.max(28, Math.round(((100 - style.verticalOffset) / 100) * outHeight))
         : 20;
-  const marginH = Math.round(outWidth * (isLandscape ? 0.08 : 0.065));
+  const marginH = Math.round(outWidth * (isLandscape ? 0.075 : 0.06));
 
   const header = [
     '[Script Info]',
@@ -356,17 +372,26 @@ export function generateAssSubtitles(
     '',
     '[V4+ Styles]',
     'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
-    `Style: Default,${assFont},${assFontSize},${primaryCol},${highlightCol},${outlineCol},${backCol},${boldFlag},0,0,0,100,100,${letterSpacing},0,${borderStyle},${outlineWidth},${shadowDepth},${alignment},${marginH},${marginH},${marginV},1`,
+    `Style: Default,${assFont},${assFontSize},${primaryCol},${highlightCol},${outlineCol},${backCol},${boldFlag},${italicFlag},0,0,100,100,${letterSpacing},0,${borderStyle},${outlineWidth},${shadowDepth},${alignment},${marginH},${marginH},${marginV},1`,
     '',
     '[Events]',
     'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
   ];
 
-  const offsetSec = (style.timingOffsetMs || 0) / 1000;
-  const effectiveWordsPerLine = isLandscape
-    ? Math.max(style.wordsPerLine, Math.min(9, style.wordsPerLine + 2))
-    : style.wordsPerLine;
-  const wordsPerGroup = Math.max(1, Math.min(14, effectiveWordsPerLine * style.maxLines));
+  // Combine user timingOffsetMs with perceptual vocal onset lead-in (default 35ms earlier so active word locks to voice plosive)
+  const leadInSec = (style.wordLeadInMs ?? 35) / 1000;
+  const offsetSec = (style.timingOffsetMs || 0) / 1000 - leadInSec;
+  const effectiveWordsPerLine = Math.max(1, Math.min(12, style.wordsPerLine || 4));
+  const wordsPerGroup = Math.max(1, Math.min(18, effectiveWordsPerLine * style.maxLines));
+  const speed = Math.max(0.4, Math.min(2.5, style.animationSpeed ?? 1.0));
+  const waveAmp = Math.max(2, Math.min(20, style.waveAmplitude ?? 7));
+  const activeScalePct = Math.round(Math.max(100, Math.min(140, (style.activeWordScale ?? 1.1) * 100)));
+  const glowBlur = Number(Math.max(1.2, Math.min(7.5, ((style.glowIntensity ?? 14) / 6) * scaleFactor)).toFixed(1));
+  const hasActivePill = (style.activeWordBgOpacity ?? 0) > 0.08 && Boolean(style.activeWordBgColor);
+  const activePillCol = hasActivePill
+    ? hexToAssColor(style.activeWordBgColor || '#10B981', style.activeWordBgOpacity ?? 0.9)
+    : outlineCol;
+
   const lines: string[] = [];
 
   for (const seg of segments) {
@@ -374,7 +399,7 @@ export function generateAssSubtitles(
       ? seg.words
       : [{ id: seg.id, word: seg.text, start: seg.start, end: seg.end }];
 
-    // Group words into concise readable chunks
+    // Group words into concise readable chunks matching live preview 1:1
     for (let i = 0; i < words.length; i += wordsPerGroup) {
       const group = words.slice(i, i + wordsPerGroup);
       if (group.length === 0) continue;
@@ -394,7 +419,7 @@ export function generateAssSubtitles(
           const wEnd = Math.min(
             clip.duration,
             Math.max(
-              wStart + 0.06,
+              wStart + 0.05,
               (activeIdx === group.length - 1 ? group[activeIdx].end : group[activeIdx + 1].start) -
                 clip.startTime +
                 offsetSec
@@ -403,12 +428,13 @@ export function generateAssSubtitles(
           if (wEnd <= 0 || wStart >= clip.duration) continue;
 
           const baseBlur = hasBox ? '' : '\\blur0.4';
+          const fadeMs = Math.round(90 / speed);
           const linePrefix =
             style.animation === 'fade' || style.animation === 'slide'
               ? activeIdx === 0
-                ? `{\\fad(90,0)${baseBlur}}`
+                ? `{\\fad(${fadeMs},0)${baseBlur}}`
                 : activeIdx === group.length - 1
-                  ? `{\\fad(0,80)${baseBlur}}`
+                  ? `{\\fad(0,${fadeMs})${baseBlur}}`
                   : baseBlur
                     ? `{${baseBlur}}`
                     : ''
@@ -416,24 +442,62 @@ export function generateAssSubtitles(
                 ? `{${baseBlur}}`
                 : '';
 
+          const animDur1 = Math.max(40, Math.round(110 / speed));
+          const animDur2 = Math.max(80, Math.round(220 / speed));
+          const waveTilt = Math.max(2, Math.min(9, Math.round(waveAmp * 0.55)));
+          const waveScaleHi = Math.min(138, activeScalePct + Math.round(waveAmp * 0.9));
+
           const formattedTokens = group.map((token, idx) => {
-            const rawWord = style.uppercase ? token.word.toUpperCase() : token.word;
+            const rawWord = formatWordCase(token.word, style);
             const safeWord = escapeAssText(rawWord);
             const lineBreak = idx > 0 && idx % effectiveWordsPerLine === 0 ? '\\N' : idx > 0 ? ' ' : '';
 
+            // Typewriter mode: hide words that haven't been spoken yet
+            if (style.animation === 'typewriter' && idx > activeIdx) {
+              return `${lineBreak}{\\alpha&HFF&}${safeWord}{\\alpha&H00&}`;
+            }
+
+            const pillApply = hasActivePill ? `\\3c${activePillCol}` : '';
+            const pillReset = hasActivePill ? `\\3c${outlineCol}` : '';
+
             if (idx === activeIdx) {
+              if (style.animation === 'wave') {
+                return `${lineBreak}{\\c${highlightCol}${pillApply}\\fscx${activeScalePct}\\fscy${waveScaleHi}\\frz${waveTilt}\\t(0,${animDur1},\\fscy${Math.max(96, activeScalePct - 4)}\\frz-${waveTilt})\\t(${animDur1},${animDur2},\\fscy${activeScalePct}\\frz0)}${safeWord}{\\c${primaryCol}${pillReset}\\fscx100\\fscy100\\frz0}`;
+              }
+              if (style.animation === 'bounce') {
+                const bounceY = Math.min(142, activeScalePct + Math.round(waveAmp * 1.4));
+                return `${lineBreak}{\\c${highlightCol}${pillApply}\\fscx${activeScalePct}\\fscy${bounceY}\\t(0,${animDur1},\\fscx${Math.max(102, activeScalePct - 4)}\\fscy${Math.max(102, activeScalePct - 4)})}${safeWord}{\\c${primaryCol}${pillReset}\\fscx100\\fscy100}`;
+              }
+              if (style.animation === 'shake') {
+                const shakeDeg = Math.max(2, Math.min(8, Math.round(waveAmp * 0.5)));
+                const s1 = Math.max(25, Math.round(45 / speed));
+                const s2 = s1 * 2;
+                const s3 = s1 * 3;
+                return `${lineBreak}{\\c${highlightCol}${pillApply}\\fscx${activeScalePct}\\fscy${activeScalePct}\\frz${shakeDeg}\\t(0,${s1},\\frz-${shakeDeg})\\t(${s1},${s2},\\frz${Math.round(shakeDeg * 0.6)})\\t(${s2},${s3},\\frz0)}${safeWord}{\\c${primaryCol}${pillReset}\\fscx100\\fscy100\\frz0}`;
+              }
+              if (style.animation === 'neon_pulse' || style.animation === 'glow') {
+                const haloTag = hasBox ? pillApply : `\\3c${highlightCol}\\blur${glowBlur}`;
+                const resetHalo = hasBox ? pillReset : `\\3c${outlineCol}\\blur0.4`;
+                const pulseScale = style.animation === 'neon_pulse' ? Math.max(108, activeScalePct) : activeScalePct;
+                return `${lineBreak}{\\c${highlightCol}${haloTag}\\fscx${pulseScale}\\fscy${pulseScale}\\t(0,${animDur1},\\fscx104\\fscy104)}${safeWord}{\\c${primaryCol}${resetHalo}\\fscx100\\fscy100}`;
+              }
+              if (style.animation === 'flip') {
+                return `${lineBreak}{\\c${highlightCol}${pillApply}\\frx70\\fscx${activeScalePct}\\fscy${activeScalePct}\\t(0,${animDur1},\\frx0)}${safeWord}{\\c${primaryCol}${pillReset}\\frx0\\fscx100\\fscy100}`;
+              }
               if (style.animation === 'pop') {
-                return `${lineBreak}{\\c${highlightCol}\\fscx114\\fscy114\\t(0,110,\\fscx105\\fscy105)}${safeWord}{\\c${primaryCol}\\fscx100\\fscy100}`;
+                const popPeak = Math.min(140, activeScalePct + 6);
+                return `${lineBreak}{\\c${highlightCol}${pillApply}\\fscx${popPeak}\\fscy${popPeak}\\t(0,${animDur1},\\fscx${activeScalePct}\\fscy${activeScalePct})}${safeWord}{\\c${primaryCol}${pillReset}\\fscx100\\fscy100}`;
               }
-              if (style.animation === 'glow') {
-                const haloTag = hasBox ? '' : `\\3c${highlightCol}\\blur2.2`;
-                const resetHalo = hasBox ? '' : `\\3c${outlineCol}\\blur0.4`;
-                return `${lineBreak}{\\c${highlightCol}${haloTag}\\fscx105\\fscy105}${safeWord}{\\c${primaryCol}${resetHalo}\\fscx100\\fscy100}`;
+              if (style.animation === 'karaoke' || style.animation === 'typewriter') {
+                return `${lineBreak}{\\c${highlightCol}${pillApply}\\fscx${activeScalePct}\\fscy${activeScalePct}}${safeWord}{\\c${primaryCol}${pillReset}\\fscx100\\fscy100}`;
               }
-              if (style.animation === 'karaoke') {
-                return `${lineBreak}{\\c${highlightCol}\\fscx106\\fscy106}${safeWord}{\\c${primaryCol}\\fscx100\\fscy100}`;
-              }
-              return `${lineBreak}{\\c${highlightCol}}${safeWord}{\\c${primaryCol}}`;
+              return `${lineBreak}{\\c${highlightCol}${pillApply}}${safeWord}{\\c${primaryCol}${pillReset}}`;
+            }
+
+            // In Wave mode, neighboring words gently ripple with phase offset
+            if (style.animation === 'wave') {
+              const phaseTilt = (idx + activeIdx) % 2 === 0 ? Math.max(1, Math.round(waveTilt * 0.45)) : -Math.max(1, Math.round(waveTilt * 0.45));
+              return `${lineBreak}{\\frz${phaseTilt}\\t(0,${animDur2},\\frz${-phaseTilt})}${safeWord}{\\frz0}`;
             }
 
             // In Karaoke mode, keep already-spoken words warmly illuminated
@@ -450,7 +514,7 @@ export function generateAssSubtitles(
         }
       } else {
         const formattedTokens = group.map((token, idx) => {
-          const rawWord = style.uppercase ? token.word.toUpperCase() : token.word;
+          const rawWord = formatWordCase(token.word, style);
           const safeWord = escapeAssText(rawWord);
           const lineBreak = idx > 0 && idx % effectiveWordsPerLine === 0 ? '\\N' : idx > 0 ? ' ' : '';
           return `${lineBreak}${safeWord}`;
@@ -458,11 +522,13 @@ export function generateAssSubtitles(
         const animTag =
           style.animation === 'fade' || style.animation === 'slide'
             ? '{\\fad(120,120)\\blur0.4}'
-            : style.animation === 'pop'
-              ? '{\\fscx96\\fscy96\\t(0,100,\\fscx100\\fscy100)\\blur0.4}'
-              : hasBox
-                ? ''
-                : '{\\blur0.4}';
+            : style.animation === 'pop' || style.animation === 'bounce'
+              ? '{\\fscx95\\fscy95\\t(0,110,\\fscx100\\fscy100)\\blur0.4}'
+              : style.animation === 'wave'
+                ? '{\\frz2\\t(0,180,\\frz-2)\\t(180,360,\\frz0)\\blur0.4}'
+                : hasBox
+                  ? ''
+                  : '{\\blur0.4}';
         lines.push(
           `Dialogue: 0,${formatAssTime(grpStart)},${formatAssTime(grpEnd)},Default,,0,0,0,,${animTag}${formattedTokens.join('')}`
         );
@@ -616,6 +682,172 @@ export async function renderSoftSubtitledMp4(params: {
     fs.renameSync(tmpOutPath, outPath);
     const stat = fs.statSync(outPath);
     return { filePath: outPath, fileSize: stat.size, remuxedLossless };
+  } catch (err) {
+    if (fs.existsSync(tmpOutPath)) fs.rmSync(tmpOutPath, { force: true });
+    throw err;
+  }
+}
+
+/**
+ * Renders an Animated Captions-Only Chroma Key Green Screen (or Blue / Black Matte) MP4 video file.
+ * Creators can import this MP4 into Premiere Pro, CapCut, After Effects, DaVinci Resolve, or Filmora,
+ * remove the green screen with 1-click Chroma Key / Ultra Key, and overlay the animated captions onto any timeline.
+ */
+export async function renderChromaCaptionsMp4(params: {
+  project: ProjectRecord;
+  clip: ClipRecord;
+  chromaColor?: string; // Default '#00FF00' (Pure Chroma Green)
+  includeAudio?: boolean; // Default true (includes synchronized voiceover audio for effortless timeline sync)
+  resolution?: ExportResolution;
+}): Promise<{
+  filePath: string;
+  fileSize: number;
+  width: number;
+  height: number;
+  duration: number;
+  chromaHex: string;
+}> {
+  const { project, clip } = params;
+  if (!project.metadata) {
+    throw new Error('Video metadata is missing.');
+  }
+
+  const segments = getClipSegments(project, clip);
+  if (segments.length === 0) {
+    throw new Error('No caption segments available yet. Please generate captions first.');
+  }
+
+  const clipDir = path.resolve(store.getProjectDir(project.id), 'clips', clip.id);
+  fs.mkdirSync(clipDir, { recursive: true });
+
+  const rawHex = (params.chromaColor || '#00FF00').trim().replace(/^#/, '');
+  const cleanHex = /^[0-9A-Fa-f]{6}$/.test(rawHex) ? rawHex.toUpperCase() : '00FF00';
+
+  const inW = project.metadata.width || 1920;
+  const inH = project.metadata.height || 1080;
+  const preserveOriginal = Boolean(
+    clip.preserveOriginalVideo ||
+      clip.isFullVideoCaption ||
+      clip.framing.aspectRatio === 'original'
+  );
+  const effectiveAspectRatio: AspectRatio = preserveOriginal ? 'original' : clip.framing.aspectRatio;
+  const effectiveResolution: ExportResolution =
+    params.resolution ?? (preserveOriginal ? 'original' : '1080p');
+  const { width: outW, height: outH } = getOutputDimensions(
+    effectiveAspectRatio,
+    effectiveResolution,
+    inW,
+    inH
+  );
+
+  const outFps = Math.min(60, Math.max(24, Math.round(project.metadata.fps || 30)));
+  const clipDur = Math.max(1, Number((clip.endTime - clip.startTime).toFixed(3)));
+  const isFullVideo =
+    Boolean(clip.isFullVideoCaption) ||
+    (clip.startTime <= 0.05 && clip.endTime >= (project.metadata.duration || 0) - 0.15);
+
+  // Ensure crisp dark outline stroke around text when rendering over bright Chroma Green (#00FF00)
+  // so external Chroma Key / Ultra Key filters cut cleanly without edge spill
+  const isGreenChroma = cleanHex === '00FF00' || cleanHex === '00B140';
+  const chromaSafeStyle: CaptionStyleConfig = {
+    ...clip.captionStyle,
+    enabled: true,
+    strokeWidth:
+      isGreenChroma && clip.captionStyle.strokeWidth < 2 && clip.captionStyle.backgroundOpacity < 0.15
+        ? 2.5
+        : clip.captionStyle.strokeWidth,
+    strokeColor:
+      isGreenChroma && clip.captionStyle.strokeWidth < 2
+        ? '#050A07'
+        : clip.captionStyle.strokeColor,
+  };
+  const chromaClip: ClipRecord = {
+    ...clip,
+    captionStyle: chromaSafeStyle,
+  };
+
+  const assPath = path.resolve(clipDir, `chroma_${cleanHex}.ass`);
+  const tmpOutPath = path.resolve(clipDir, `chroma_${cleanHex}_${Date.now()}.tmp.mp4`);
+  const outPath = path.resolve(clipDir, `chroma_${cleanHex}_captions.mp4`);
+  if (!assPath.startsWith(clipDir + path.sep) || !outPath.startsWith(clipDir + path.sep)) {
+    throw new Error('Invalid output path for Chroma Green Screen MP4.');
+  }
+
+  const assContent = generateAssSubtitles(project, chromaClip, outW, outH);
+  fs.writeFileSync(assPath, assContent, 'utf-8');
+
+  const hasSourceAudio =
+    Boolean(project.sourcePath && fs.existsSync(project.sourcePath)) &&
+    (project.metadata.audioCodec || 'none').toLowerCase() !== 'none';
+  const includeAudio = params.includeAudio !== false && hasSourceAudio;
+
+  const args: string[] = [
+    '-loglevel',
+    'error',
+    '-y',
+    '-f',
+    'lavfi',
+    '-i',
+    `color=c=0x${cleanHex}:s=${outW}x${outH}:r=${outFps}:d=${clipDur.toFixed(3)}`,
+  ];
+
+  if (includeAudio && project.sourcePath) {
+    if (!isFullVideo) {
+      args.push('-accurate_seek', '-ss', clip.startTime.toFixed(3), '-t', clipDur.toFixed(3));
+    }
+    args.push('-i', project.sourcePath);
+  }
+
+  args.push(
+    '-vf',
+    `ass='${escapeFilterPath(assPath)}'`,
+    '-map',
+    '0:v:0',
+    ...(includeAudio ? ['-map', '1:a:0?'] : []),
+    '-c:v',
+    'libx264',
+    '-preset',
+    'veryfast',
+    '-crf',
+    '16',
+    '-pix_fmt',
+    'yuv420p',
+    ...(includeAudio ? ['-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-shortest'] : ['-an']),
+    '-movflags',
+    '+faststart',
+    '-f',
+    'mp4',
+    tmpOutPath
+  );
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const proc = spawn('ffmpeg', args);
+      let stderr = '';
+      proc.stderr.on('data', (d: Buffer) => {
+        stderr = (stderr + d.toString()).slice(-2000);
+      });
+      proc.on('close', (code) => {
+        if (code === 0 && fs.existsSync(tmpOutPath) && fs.statSync(tmpOutPath).size > 0) {
+          resolve();
+        } else {
+          reject(new Error(`FFmpeg Chroma Green Screen render failed (${code}): ${stderr.slice(-350)}`));
+        }
+      });
+      proc.on('error', reject);
+    });
+
+    const validation = await validateRenderedMp4WithFFprobe(tmpOutPath, false);
+    fs.renameSync(tmpOutPath, outPath);
+
+    return {
+      filePath: outPath,
+      fileSize: validation.fileSize,
+      width: validation.width,
+      height: validation.height,
+      duration: validation.duration,
+      chromaHex: `#${cleanHex}`,
+    };
   } catch (err) {
     if (fs.existsSync(tmpOutPath)) fs.rmSync(tmpOutPath, { force: true });
     throw err;
@@ -885,7 +1117,7 @@ export async function renderClipWithFFmpeg(params: {
   // 5. Audio inputs & Mixing (Bit-exact audio copy in preserveOriginal mode when no music mix is added)
   const inputs: string[] = isFullVideo
     ? ['-i', project.sourcePath]
-    : ['-ss', clip.startTime.toFixed(3), '-t', clipDur.toFixed(3), '-i', project.sourcePath];
+    : ['-accurate_seek', '-ss', clip.startTime.toFixed(3), '-t', clipDur.toFixed(3), '-i', project.sourcePath];
 
   const srcAudioCodec = (project.metadata.audioCodec || 'none').toLowerCase();
   const hasSourceAudio = srcAudioCodec !== 'none';

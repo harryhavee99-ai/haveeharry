@@ -468,6 +468,27 @@ export default function App() {
     }
   };
 
+  const handleResyncAudioCaptions = async (projectId: string, clipId?: string): Promise<number> => {
+    const res = await api.resyncAudioCaptions(projectId, clipId);
+    if (res.project) {
+      const normalized = normalizeProject(res.project);
+      setProjects((prev) => prev.map((p) => (p.id === projectId ? normalized : p)));
+    }
+    return res.alignedSegments;
+  };
+
+  const handleAnalyzeClipAudioCaptions = async (
+    projectId: string,
+    clipId: string
+  ): Promise<{ alignedSegments: number; wordCount: number }> => {
+    const res = await api.analyzeClipAudioCaptions(projectId, clipId);
+    if (res.project) {
+      const normalized = normalizeProject(res.project);
+      setProjects((prev) => prev.map((p) => (p.id === projectId ? normalized : p)));
+    }
+    return { alignedSegments: res.alignedSegments, wordCount: res.wordCount };
+  };
+
   const handleSaveSettings = async (patch: Partial<AppSettings>) => {
     const updated = await api.updateSettings(patch);
     setSettings(updated);
@@ -766,6 +787,8 @@ export default function App() {
               onSaveClip={handleSaveClip}
               onApplyToAll={handleApplyCaptionsToAll}
               onCreateFullVideoCaptions={handleCreateFullVideoCaptions}
+              onResyncAudioCaptions={handleResyncAudioCaptions}
+              onAnalyzeClipAudioCaptions={handleAnalyzeClipAudioCaptions}
               onExportClip={handleExportSingle}
               onNavigate={setActivePage}
             />

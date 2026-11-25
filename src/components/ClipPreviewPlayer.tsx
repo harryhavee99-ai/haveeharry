@@ -24,6 +24,7 @@ interface ClipPreviewPlayerProps {
   maxHeightClass?: string;
   showControls?: boolean;
   previewRendered?: boolean;
+  chromaPreviewColor?: string | null;
 }
 
 export function ClipPreviewPlayer({
@@ -36,6 +37,7 @@ export function ClipPreviewPlayer({
   maxHeightClass = 'max-h-[540px]',
   showControls = true,
   previewRendered = false,
+  chromaPreviewColor = null,
 }: ClipPreviewPlayerProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const bgVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -171,6 +173,31 @@ export function ClipPreviewPlayer({
     onTimeUpdate?.(r);
   };
 
+  // High-precision 60fps requestAnimationFrame playhead tracker while playing
+  // (Eliminates HTML5 ~250ms timeupdate lag so word highlights & wave animations lock to voiceover audio)
+  useEffect(() => {
+    if (!isPlaying) return;
+    let rafId = 0;
+    const tick = () => {
+      const vid = videoRef.current;
+      if (vid && !vid.paused) {
+        if (showingRendered) {
+          setRelTime(vid.currentTime);
+        } else if (vid.currentTime >= clip.endTime) {
+          vid.currentTime = clip.startTime;
+          if (bgVideoRef.current) bgVideoRef.current.currentTime = clip.startTime;
+          if (audioRef.current) audioRef.current.currentTime = 0;
+          setRelTime(0);
+        } else {
+          setRelTime(Math.max(0, vid.currentTime - clip.startTime));
+        }
+      }
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [isPlaying, showingRendered, clip.startTime, clip.endTime]);
+
   // Compute active focal coordinates (AI Auto / Face Tracking / Manual)
   const focalPoint = useMemo(() => {
     if (clip.framing.mode === 'manual') {
@@ -212,15 +239,18 @@ export function ClipPreviewPlayer({
     return project.transcript.filter((s) => s.end > clip.startTime && s.start < clip.endTime);
   }, [clip.customSegments, project.transcript, clip.startTime, clip.endTime]);
 
-  // Compute active caption chunk + active word for live synchronized preview
+  // Compute active caption chunk + active word for live synchronized preview (60fps audio-locked)
   const activeCaptionGroup = useMemo(() => {
     const cs = clip.captionStyle;
     if (!cs.enabled) return null;
-    const absTime = clip.startTime + relTime - (cs.timingOffsetMs || 0) / 1000;
-    const wordsPerGroup = Math.max(1, Math.min(12, cs.wordsPerLine * cs.maxLines));
+    const leadInSec = (cs.wordLeadInMs ?? 35) / 1000;
+    const offsetSec = (cs.timingOffsetMs || 0) / 1000 - leadInSec;
+    const absTime = clip.startTime + relTime - offsetSec;
+    const wordsPerLine = Math.max(1, Math.min(12, cs.wordsPerLine || 4));
+    const wordsPerGroup = Math.max(1, Math.min(18, wordsPerLine * cs.maxLines));
 
     for (const seg of clipSegments) {
-      if (absTime < seg.start - 0.08 || absTime > seg.end + 0.08) continue;
+      if (absTime < seg.start - 0.04 || absTime > seg.end + 0.06) continue;
       const words: WordTiming[] = seg.words.length
         ? seg.words
         : [{ id: seg.id, word: seg.text, start: seg.start, end: seg.end }];
@@ -230,11 +260,18 @@ export function ClipPreviewPlayer({
         if (group.length === 0) continue;
         const gStart = group[0].start;
         const gEnd = group[group.length - 1].end;
-        if (absTime >= gStart - 0.06 && absTime <= gEnd + 0.08) {
-          let activeIdx = group.findIndex((w) => absTime >= w.start && absTime <= w.end);
-          if (activeIdx < 0) {
-            activeIdx = group.findIndex((w) => w.start >= absTime);
-            if (activeIdx < 0) activeIdx = group.length - 1;
+        // Extend group visibility until the next group starts (if within the same segment) so no flicker occurs
+        const nextGroupStart = i + wordsPerGroup < words.length ? words[i + wordsPerGroup].start : gEnd + 0.06;
+        if (absTime >= gStart - 0.04 && absTime <= Math.max(gEnd + 0.04, nextGroupStart)) {
+          // Find the latest word whose start timestamp has been reached (matches ASS subtitle burn-in 1:1
+          // and never jumps prematurely to the next word during a comma/breath micro-pause)
+          let activeIdx = 0;
+          for (let wIdx = 0; wIdx < group.length; wIdx++) {
+            if (absTime >= group[wIdx].start - 0.01) {
+              activeIdx = wIdx;
+            } else {
+              break;
+            }
           }
           return { group, activeIdx, speaker: seg.speaker };
         }
@@ -370,6 +407,7 @@ export function ClipPreviewPlayer({
             }}
             style={{
               filter: cssFilter,
+              opacity: chromaPreviewColor ? 0 : 1,
               objectPosition:
                 showingRendered || preserveOriginal
                   ? '50% 50%'
@@ -385,18 +423,32 @@ export function ClipPreviewPlayer({
           />
         ) : (
           <div className="relative w-full h-full flex flex-col items-center justify-center text-center p-4 text-xs text-zinc-300 bg-[#07100B]">
-            {(clip.thumbnailUrl || project.thumbnailUrl) && (
+            {(clip.thumbnailUrl || project.thumbnailUrl) && !chromaPreviewColor && (
               <img
                 src={clip.thumbnailUrl || project.thumbnailUrl}
                 alt={clip.title}
                 className="absolute inset-0 w-full h-full object-cover opacity-35"
               />
             )}
-            <div className="relative z-10 max-w-xs px-3 py-2 rounded-lg bg-black/70 border border-[#D4AF37]/25">
-              {project.browserProxyStatus === 'transcoding' && !showingRendered
-                ? 'Preparing browser-compatible H.264 preview in background...'
-                : 'Preview stream unavailable in this browser codec — rendered H.264 MP4 exports will play cleanly.'}
-            </div>
+            {!chromaPreviewColor && (
+              <div className="relative z-10 max-w-xs px-3 py-2 rounded-lg bg-black/70 border border-[#D4AF37]/25">
+                {project.browserProxyStatus === 'transcoding' && !showingRendered
+                  ? 'Preparing browser-compatible H.264 preview in background...'
+                  : 'Preview stream unavailable in this browser codec — rendered H.264 MP4 exports will play cleanly.'}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Live Chroma Key Green/Blue/Black Screen Preview Layer */}
+        {chromaPreviewColor && (
+          <div
+            style={{ backgroundColor: chromaPreviewColor }}
+            className="absolute inset-0 z-20 pointer-events-none flex items-start justify-between p-2.5"
+          >
+            <span className="px-2 py-0.5 rounded bg-black/75 border border-white/20 font-mono text-[10px] font-semibold text-white">
+              CHROMA KEY PREVIEW ({chromaPreviewColor.toUpperCase()})
+            </span>
           </div>
         )}
 
@@ -488,13 +540,22 @@ export function ClipPreviewPlayer({
             style={{
               top:
                 cs.position === 'top'
-                  ? `${Math.max(8, Math.min(40, cs.verticalOffset))}%`
+                  ? `${Math.max(6, Math.min(45, cs.verticalOffset))}%`
                   : cs.position === 'middle'
-                    ? `${Math.max(35, Math.min(68, cs.verticalOffset))}%`
-                    : `${Math.max(60, Math.min(90, cs.verticalOffset))}%`,
+                    ? `${Math.max(30, Math.min(72, cs.verticalOffset))}%`
+                    : `${Math.max(55, Math.min(93, cs.verticalOffset))}%`,
+              left: `${Math.max(8, Math.min(92, cs.horizontalOffset ?? 50))}%`,
+              transform: 'translate(-50%, -50%)',
+              width: '92%',
               textAlign: cs.alignment,
             }}
-            className="absolute left-3 right-3 -translate-y-1/2 z-30 pointer-events-none flex justify-center"
+            className={`absolute z-30 pointer-events-none flex ${
+              cs.alignment === 'left'
+                ? 'justify-start'
+                : cs.alignment === 'right'
+                  ? 'justify-end'
+                  : 'justify-center'
+            }`}
           >
             <div
               dir={
@@ -504,7 +565,11 @@ export function ClipPreviewPlayer({
                 fontFamily: cs.fontFamily,
                 fontSize: `${Math.max(13, Math.round(cs.fontSize * 0.58))}px`,
                 fontWeight: cs.fontWeight,
+                fontStyle: cs.italic ? 'italic' : 'normal',
+                letterSpacing: cs.letterSpacing !== undefined ? `${cs.letterSpacing}px` : undefined,
                 lineHeight: cs.lineSpacing,
+                borderRadius: `${cs.backgroundRadius ?? 10}px`,
+                padding: `${Math.max(4, Math.round((cs.backgroundPadding ?? 10) * 0.55))}px ${Math.max(8, Math.round((cs.backgroundPadding ?? 12) * 0.95))}px`,
                 backgroundColor:
                   cs.backgroundOpacity > 0.04
                     ? `${cs.backgroundColor}${Math.round(cs.backgroundOpacity * 255)
@@ -512,45 +577,120 @@ export function ClipPreviewPlayer({
                         .padStart(2, '0')}`
                     : 'transparent',
                 textShadow: cs.shadow
-                  ? '0 2px 10px rgba(0,0,0,0.9), 0 1px 2px rgba(0,0,0,0.95)'
+                  ? `0 2px ${cs.shadowBlur ?? 10}px ${cs.shadowColor || 'rgba(0,0,0,0.92)'}, 0 1px 2px rgba(0,0,0,0.95)`
                   : 'none',
                 WebkitTextStroke:
                   cs.strokeWidth > 0
                     ? `${Math.max(0.5, cs.strokeWidth * 0.45)}px ${cs.strokeColor}`
                     : undefined,
               }}
-              className={`inline-block px-3 py-1.5 rounded-lg max-w-[95%] ${
+              className={`inline-block max-w-[96%] ${
                 cs.animation === 'pop'
                   ? 'animate-caption-pop'
                   : cs.animation === 'slide'
                     ? 'animate-caption-slide'
-                    : ''
+                    : cs.animation === 'fade'
+                      ? 'animate-caption-fade'
+                      : ''
               }`}
             >
               {activeCaptionGroup.group.map((w, idx) => {
                 const isActive = cs.wordLevelHighlight && idx === activeCaptionGroup.activeIdx;
                 const isKaraokeLit =
-                  cs.wordLevelHighlight && cs.animation === 'karaoke' && idx <= activeCaptionGroup.activeIdx;
-                const displayWord = cs.uppercase ? w.word.toUpperCase() : w.word;
-                const needBreak = idx > 0 && idx % cs.wordsPerLine === 0;
+                  cs.wordLevelHighlight &&
+                  (cs.animation === 'karaoke' || cs.animation === 'typewriter') &&
+                  idx <= activeCaptionGroup.activeIdx;
+                const isTypewriterHidden =
+                  cs.wordLevelHighlight &&
+                  cs.animation === 'typewriter' &&
+                  idx > activeCaptionGroup.activeIdx;
+
+                const transformMode = cs.textTransform || (cs.uppercase ? 'uppercase' : 'none');
+                const displayWord =
+                  transformMode === 'uppercase' || cs.uppercase
+                    ? w.word.toUpperCase()
+                    : transformMode === 'lowercase'
+                      ? w.word.toLowerCase()
+                      : transformMode === 'capitalize'
+                        ? w.word.charAt(0).toUpperCase() + w.word.slice(1).toLowerCase()
+                        : w.word;
+
+                const needBreak = idx > 0 && idx % Math.max(1, cs.wordsPerLine) === 0;
+                const speed = cs.animationSpeed ?? 1.0;
+                const waveAmp = cs.waveAmplitude ?? 7;
+                const activeScale = cs.activeWordScale ?? 1.1;
+                const glowRadius = cs.glowIntensity ?? 14;
+                const wordGap = cs.wordSpacing ?? 4;
+
+                // Continuous 60fps sinusoidal wave displacement when Waving Animation is enabled
+                const waveY =
+                  cs.animation === 'wave'
+                    ? Math.sin(relTime * 6.2 * speed + idx * 0.9) *
+                      (isActive ? waveAmp * 0.85 : waveAmp * 0.45)
+                    : 0;
+                const waveRot =
+                  cs.animation === 'wave'
+                    ? Math.cos(relTime * 6.2 * speed + idx * 0.9) * (isActive ? 2.8 : 1.2)
+                    : 0;
+
+                let wordTransform = 'none';
+                if (cs.animation === 'wave') {
+                  const sc = isActive ? activeScale : 1;
+                  wordTransform = `translateY(${waveY.toFixed(1)}px) rotate(${waveRot.toFixed(1)}deg) scale(${sc})`;
+                } else if (isActive) {
+                  if (cs.animation === 'bounce') {
+                    wordTransform = `translateY(-${Math.round(waveAmp * 0.65)}px) scale(${activeScale})`;
+                  } else if (
+                    cs.animation === 'pop' ||
+                    cs.animation === 'karaoke' ||
+                    cs.animation === 'typewriter'
+                  ) {
+                    wordTransform = `scale(${activeScale})`;
+                  } else if (cs.animation === 'glow' || cs.animation === 'neon_pulse') {
+                    wordTransform = `scale(${Math.max(1.04, activeScale)})`;
+                  }
+                }
+
+                const hasActivePill =
+                  isActive && (cs.activeWordBgOpacity ?? 0) > 0.05 && Boolean(cs.activeWordBgColor);
+                const pillBg = hasActivePill
+                  ? `${cs.activeWordBgColor}${Math.round((cs.activeWordBgOpacity ?? 0.9) * 255)
+                      .toString(16)
+                      .padStart(2, '0')}`
+                  : undefined;
+
                 return (
                   <React.Fragment key={w.id}>
-                    {needBreak ? <br /> : idx > 0 ? ' ' : ''}
+                    {needBreak ? <br /> : null}
                     <span
+                      key={isActive ? `${w.id}_active` : w.id}
                       style={{
                         color: isActive || isKaraokeLit ? cs.highlightColor : cs.textColor,
-                        transform:
-                          isActive && (cs.animation === 'pop' || cs.animation === 'karaoke')
-                            ? 'scale(1.08)'
-                            : isActive && cs.animation === 'glow'
-                              ? 'scale(1.04)'
-                              : 'none',
+                        opacity: isTypewriterHidden ? 0 : 1,
+                        marginRight: `${wordGap}px`,
+                        backgroundColor: pillBg,
+                        padding: hasActivePill ? '1px 6px' : undefined,
+                        borderRadius: hasActivePill ? '6px' : undefined,
+                        transform: wordTransform,
                         textShadow:
-                          isActive && cs.animation === 'glow'
-                            ? `0 0 16px ${cs.highlightColor}, 0 0 6px ${cs.highlightColor}, 0 2px 6px rgba(0,0,0,0.92)`
+                          isActive &&
+                          (cs.animation === 'glow' ||
+                            cs.animation === 'neon_pulse' ||
+                            cs.animation === 'wave')
+                            ? `0 0 ${glowRadius}px ${cs.highlightColor}, 0 0 ${Math.round(glowRadius * 0.45)}px ${cs.highlightColor}, 0 2px 6px rgba(0,0,0,0.92)`
                             : undefined,
                       }}
-                      className="inline-block transition-all duration-100"
+                      className={`inline-block ${
+                        cs.animation === 'wave'
+                          ? ''
+                          : isActive && cs.animation === 'bounce'
+                            ? 'animate-caption-bounce'
+                            : isActive && cs.animation === 'shake'
+                              ? 'animate-caption-shake'
+                              : isActive && cs.animation === 'flip'
+                                ? 'animate-caption-flip'
+                                : 'transition-all duration-75'
+                      }`}
                     >
                       {displayWord}
                     </span>

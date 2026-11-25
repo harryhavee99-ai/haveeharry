@@ -20,6 +20,7 @@ import { logBackendError, sanitizeErrorMessage } from './server/logger.ts';
 import { ensureMusicFileByName, getMusicTracks } from './server/music.ts';
 import { isGeminiConfigured } from './server/gemini.ts';
 import {
+  analyzeClipAudioAndGenerateCaptions,
   buildClipFromHookCandidate,
   buildFullVideoCaptionClip,
   createInitialPipelineStages,
@@ -29,6 +30,7 @@ import {
   probeVideoFile,
   refreshHookCandidateTranscriptFields,
   regenerateSingleClip,
+  resyncProjectCaptionsWithAudio,
   runAnalysisPipeline,
 } from './server/pipeline.ts';
 import {
@@ -36,6 +38,7 @@ import {
   generateAssSubtitles,
   generateSrtSubtitles,
   generateVttSubtitles,
+  renderChromaCaptionsMp4,
   renderClipWithFFmpeg,
   renderSoftSubtitledMp4,
   resolveClipMp4Path,
@@ -1236,6 +1239,117 @@ async function createServer() {
       exportJob,
       project: store.getProject(project.id) ?? project,
     });
+  });
+
+  // Acoustic Voiceover-to-Caption Re-Sync endpoint (snaps segment & word timestamps to exact speech waveform onsets)
+  app.post('/api/projects/:id/resync-audio', async (req, res) => {
+    try {
+      const clipId = typeof req.body?.clipId === 'string' ? req.body.clipId : undefined;
+      const result = await resyncProjectCaptionsWithAudio(req.params.id, clipId);
+      res.json(result);
+    } catch (err) {
+      const safeErr = logBackendError({
+        projectId: req.params.id,
+        stage: 'caption_audio_resync',
+        httpStatus: 500,
+        route: 'POST /api/projects/:id/resync-audio',
+        error: err,
+      });
+      res.status(500).json({ error: safeErr });
+    }
+  });
+
+  // High-End Clip Audio Analysis & Dedicated Caption Generation for a specific clip or full video
+  app.post('/api/projects/:id/clips/:clipId/analyze-audio-captions', async (req, res) => {
+    try {
+      const language = typeof req.body?.language === 'string' ? req.body.language : undefined;
+      const result = await analyzeClipAudioAndGenerateCaptions(
+        req.params.id,
+        req.params.clipId,
+        { language }
+      );
+      res.json(result);
+    } catch (err) {
+      const safeErr = logBackendError({
+        projectId: req.params.id,
+        stage: 'clip_audio_caption_analysis',
+        httpStatus: 500,
+        route: 'POST /api/projects/:id/clips/:clipId/analyze-audio-captions',
+        error: err,
+      });
+      res.status(500).json({ error: safeErr });
+    }
+  });
+
+  // Download Animated Captions-Only Chroma Green Screen MP4 (for Premiere Pro, CapCut, After Effects, DaVinci Resolve, Filmora)
+  app.get('/api/projects/:id/clips/:clipId/download-chroma-captions', async (req, res) => {
+    const project = store.getProject(req.params.id);
+    const clip = project?.clips.find((c) => c.id === req.params.clipId);
+    if (!project || !clip) return res.status(404).json({ error: 'Clip not found.' });
+
+    try {
+      const rawColor = typeof req.query.color === 'string' ? req.query.color : '#00FF00';
+      const includeAudio = req.query.includeAudio !== 'false';
+      const rawRes = typeof req.query.resolution === 'string' ? req.query.resolution : undefined;
+      const resolution =
+        rawRes === '720p' || rawRes === '1080p' || rawRes === '4k' || rawRes === 'original'
+          ? rawRes
+          : undefined;
+
+      const { filePath, fileSize, chromaHex } = await renderChromaCaptionsMp4({
+        project,
+        clip,
+        chromaColor: rawColor,
+        includeAudio,
+        resolution,
+      });
+
+      const baseName =
+        clip.title.replace(/[^a-zA-Z0-9-_]/g, '_').replace(/_+/g, '_').slice(0, 50) || 'captions';
+      const colorTag =
+        chromaHex === '#00FF00' || chromaHex === '#00B140'
+          ? 'chroma_green'
+          : chromaHex === '#0047AB'
+            ? 'chroma_blue'
+            : 'chroma_matte';
+      const downloadFilename = `${baseName}_${colorTag}_captions.mp4`;
+
+      res.status(200);
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Content-Disposition', `attachment; filename="${downloadFilename}"`);
+      res.setHeader('Content-Length', String(fileSize));
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'no-store');
+
+      const stream = fs.createReadStream(filePath);
+      res.on('close', () => {
+        if (!stream.destroyed) stream.destroy();
+      });
+      stream.on('error', (err) => {
+        logBackendError({
+          projectId: project.id,
+          stage: 'chroma_captions_download',
+          httpStatus: 500,
+          route: 'GET /api/projects/:id/clips/:clipId/download-chroma-captions',
+          error: err,
+        });
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Failed to stream Chroma Green Screen captions MP4.' });
+        } else {
+          res.end();
+        }
+      });
+      stream.pipe(res);
+    } catch (err) {
+      const safeErr = logBackendError({
+        projectId: project.id,
+        stage: 'chroma_captions_render',
+        httpStatus: 500,
+        route: 'GET /api/projects/:id/clips/:clipId/download-chroma-captions',
+        error: err,
+      });
+      res.status(500).json({ error: safeErr });
+    }
   });
 
   // Download SRT subtitles for a clip

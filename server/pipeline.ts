@@ -28,6 +28,7 @@ import { store } from './store.ts';
 import { logBackendError } from './logger.ts';
 import {
   analyzeKeyframesForFraming,
+  buildWordTimings,
   computeWeightedHookScore,
   discoverHookCandidatesWithGemini,
   generateSampleSpokenAudio,
@@ -345,7 +346,11 @@ function mergeOverlappingTranscriptSegments(
 /**
  * Audio-only (-vn) streaming silence detector — constant O(1) memory and 10x-20x faster on 5-hour HD/4K files.
  */
-async function detectSilences(videoPath: string): Promise<Array<{ start: number; end: number }>> {
+async function detectSilences(
+  videoPath: string,
+  noiseDb = -30,
+  minSilenceDur = 0.18
+): Promise<Array<{ start: number; end: number }>> {
   return new Promise((resolve) => {
     const proc = spawn('ffmpeg', [
       '-hide_banner',
@@ -353,7 +358,7 @@ async function detectSilences(videoPath: string): Promise<Array<{ start: number;
       '-i',
       videoPath,
       '-af',
-      'silencedetect=noise=-32dB:d=0.6',
+      `silencedetect=noise=${noiseDb}dB:d=${minSilenceDur}`,
       '-f',
       'null',
       '-',
@@ -381,6 +386,309 @@ async function detectSilences(videoPath: string): Promise<Array<{ start: number;
     proc.on('close', () => resolve(silences));
     proc.on('error', () => resolve([]));
   });
+}
+
+/**
+ * Aligns transcribed segments & word-level timestamps directly against the acoustic speech waveform
+ * (non-silent voiceover activity islands detected by FFmpeg) so captions lock onto exact vocal onsets
+ * and never start early during leading silence or linger lazily across trailing breath pauses.
+ */
+export function alignTranscriptWithVoiceActivity(
+  segments: TranscriptSegment[],
+  silences: Array<{ start: number; end: number }>,
+  totalDuration?: number
+): TranscriptSegment[] {
+  if (!segments || segments.length === 0) return [];
+  const sortedSegs = [...segments].sort((a, b) => a.start - b.start);
+  const sortedSilences = [...(silences || [])]
+    .filter((s) => Number.isFinite(s.start) && Number.isFinite(s.end) && s.end > s.start + 0.08)
+    .sort((a, b) => a.start - b.start);
+  const maxDur = totalDuration && totalDuration > 0 ? totalDuration : 999999;
+
+  let prevEnd = 0;
+  return sortedSegs.map((seg, idx) => {
+    let start = Math.max(prevEnd, Math.max(0, seg.start));
+    const nextSegStart = idx < sortedSegs.length - 1 ? sortedSegs[idx + 1].start : maxDur;
+    let end = Math.min(maxDur, Math.max(start + 0.22, seg.end));
+    if (end > nextSegStart && nextSegStart > start + 0.2) {
+      end = nextSegStart;
+    }
+
+    // 1. Trim leading silence if segment starts inside a silent gap before the voiceover actually speaks
+    for (const sil of sortedSilences) {
+      if (sil.start <= start + 0.08 && sil.end > start && sil.end < end - 0.22) {
+        start = Number(sil.end.toFixed(3));
+      }
+    }
+
+    // 2. Trim trailing silence if segment extends into dead air after the speaker finished the phrase
+    for (const sil of sortedSilences) {
+      if (sil.start > start + 0.22 && sil.start < end && sil.end >= end - 0.08) {
+        end = Number(sil.start.toFixed(3));
+      }
+    }
+
+    // 3. Distribute words across active vocal sub-islands if there are internal breath pauses inside [start, end]
+    const internalSilences = sortedSilences.filter(
+      (sil) => sil.start > start + 0.16 && sil.end < end - 0.16 && sil.end - sil.start >= 0.16
+    );
+
+    const tokens = seg.text
+      .trim()
+      .split(/\s+/)
+      .filter((w) => w.length > 0);
+
+    let words = buildWordTimings(seg.text, start, end);
+
+    if (internalSilences.length > 0 && tokens.length >= 2) {
+      // Build active voiceover islands inside [start, end]
+      const islands: Array<{ start: number; end: number }> = [];
+      let cursor = start;
+      for (const sil of internalSilences) {
+        if (sil.start - cursor >= 0.14) {
+          islands.push({ start: cursor, end: sil.start });
+        }
+        cursor = Math.max(cursor, sil.end);
+      }
+      if (end - cursor >= 0.14) {
+        islands.push({ start: cursor, end });
+      }
+
+      const totalVocalDur = islands.reduce((acc, isl) => acc + (isl.end - isl.start), 0);
+      if (islands.length >= 2 && totalVocalDur >= 0.25) {
+        // Assign tokens to islands proportionally to each island's spoken duration & punctuation splits
+        const alignedWords = [];
+        let tokenCursor = 0;
+        for (let k = 0; k < islands.length; k++) {
+          const isl = islands[k];
+          const remainingTokens = tokens.length - tokenCursor;
+          if (remainingTokens <= 0) break;
+          let countForIsland: number;
+          if (k === islands.length - 1) {
+            countForIsland = remainingTokens;
+          } else {
+            const shareRatio = (isl.end - isl.start) / totalVocalDur;
+            countForIsland = Math.max(1, Math.min(remainingTokens - (islands.length - 1 - k), Math.round(tokens.length * shareRatio)));
+            // Prefer splitting right at a comma/period token near countForIsland
+            for (let offset = 0; offset <= 1; offset++) {
+              const cand = countForIsland + offset;
+              if (cand >= 1 && cand < remainingTokens && /[,.;:!?—–\-]$/.test(tokens[tokenCursor + cand - 1])) {
+                countForIsland = cand;
+                break;
+              }
+            }
+          }
+          const subText = tokens.slice(tokenCursor, tokenCursor + countForIsland).join(' ');
+          alignedWords.push(...buildWordTimings(subText, isl.start, isl.end));
+          tokenCursor += countForIsland;
+        }
+        if (alignedWords.length === tokens.length) {
+          words = alignedWords;
+        }
+      }
+    }
+
+    prevEnd = end;
+    return {
+      ...seg,
+      start: Number(start.toFixed(3)),
+      end: Number(end.toFixed(3)),
+      words,
+    };
+  });
+}
+
+/**
+ * Runs on-demand acoustic voiceover re-synchronization for a project (and optional specific clip's customSegments).
+ */
+export async function resyncProjectCaptionsWithAudio(
+  projectId: string,
+  clipId?: string
+): Promise<{ project: ProjectRecord; alignedSegments: number }> {
+  const project = store.getProject(projectId);
+  if (!project || !project.sourcePath || !fs.existsSync(project.sourcePath)) {
+    throw new Error('Project or source video file not found.');
+  }
+  const fineSilences = await detectSilences(project.sourcePath, -29, 0.16);
+  project.silences = fineSilences;
+  const maxDur = project.metadata?.duration;
+
+  if (project.transcript && project.transcript.length > 0) {
+    project.transcript = alignTranscriptWithVoiceActivity(project.transcript, fineSilences, maxDur);
+  }
+
+  let alignedCount = project.transcript.length;
+  for (const clip of project.clips) {
+    if (clipId && clip.id !== clipId) continue;
+    if (clip.customSegments && clip.customSegments.length > 0) {
+      clip.customSegments = alignTranscriptWithVoiceActivity(clip.customSegments, fineSilences, maxDur);
+      alignedCount = clip.customSegments.length;
+    }
+  }
+
+  store.upsertProject(project);
+  return { project, alignedSegments: alignedCount };
+}
+
+/**
+ * Dedicated High-End Clip Audio Analyzer & Caption Generator:
+ * Extracts the exact audio slice of a clip (or full video), maps its millisecond voiceover onsets & pauses
+ * with FFmpeg acoustic waveform inspection, runs Gemini speech-to-text transcription across the clip's audio,
+ * and locks every word's start/end timestamp to the voiceover waveform.
+ */
+export async function analyzeClipAudioAndGenerateCaptions(
+  projectId: string,
+  clipId: string,
+  options?: { language?: string }
+): Promise<{
+  project: ProjectRecord;
+  clip: ClipRecord;
+  alignedSegments: number;
+  wordCount: number;
+  mode: 'ai_transcribed_and_waveform_synced' | 'waveform_synced';
+}> {
+  const project = store.getProject(projectId);
+  if (!project || !project.sourcePath || !fs.existsSync(project.sourcePath)) {
+    throw new Error('Project or source video file not found on disk.');
+  }
+  const clipIdx = project.clips.findIndex((c) => c.id === clipId);
+  if (clipIdx < 0) {
+    throw new Error('Clip not found in this project.');
+  }
+  const clip = project.clips[clipIdx];
+  if (project.metadata?.audioCodec === 'none') {
+    throw new Error('This video has no audio track to analyze for voiceover captions.');
+  }
+
+  const clipDir = path.join(store.getProjectDir(project.id), 'clips', clip.id);
+  fs.mkdirSync(clipDir, { recursive: true });
+
+  const clipDur = Math.max(1, clip.endTime - clip.startTime);
+  const isFullVideo =
+    Boolean(clip.isFullVideoCaption) ||
+    (clip.startTime <= 0.05 && clip.endTime >= (project.metadata?.duration || 0) - 0.15);
+
+  const clipAudioPath = path.join(clipDir, 'clip_hq_speech.mp3');
+  const extractArgs = [
+    '-loglevel',
+    'error',
+    '-y',
+    ...(!isFullVideo ? ['-accurate_seek', '-ss', clip.startTime.toFixed(3)] : []),
+    '-i',
+    project.sourcePath,
+    ...(!isFullVideo ? ['-t', clipDur.toFixed(3)] : []),
+    '-vn',
+    '-af',
+    'aresample=async=1:first_pts=0',
+    '-ac',
+    '1',
+    '-ar',
+    '16000',
+    '-c:a',
+    'libmp3lame',
+    '-b:a',
+    '48k',
+    clipAudioPath,
+  ];
+  await runFFmpegSpawn(extractArgs);
+
+  // Detect fine-grained acoustic speech silences & vocal onsets directly on the extracted clip audio
+  const localSilences = await detectSilences(clipAudioPath, -28, 0.14);
+  const absSilences = localSilences.map((s) => ({
+    start: Number((clip.startTime + s.start).toFixed(3)),
+    end: Number((clip.startTime + s.end).toFixed(3)),
+  }));
+
+  const lang = options?.language?.trim() || project.analysisConfig.language || 'auto';
+  let rawSegments: TranscriptSegment[] = [];
+  let mode: 'ai_transcribed_and_waveform_synced' | 'waveform_synced' = 'waveform_synced';
+
+  // Run fresh Gemini audio transcription across the clip's audio (chunked if clip > 210s)
+  try {
+    if (clipDur <= AUDIO_CHUNK_STRIDE_SECONDS + AUDIO_CHUNK_OVERLAP_SECONDS) {
+      const res = await transcribeAudioChunk({
+        audioPath: clipAudioPath,
+        chunkIndex: 0,
+        chunkOffsetSeconds: clip.startTime,
+        chunkDurationSeconds: clipDur,
+        language: lang,
+      });
+      if (res.detectedLanguage) project.detectedLanguage = res.detectedLanguage;
+      rawSegments = res.segments;
+    } else {
+      const subChunksDir = path.join(clipDir, 'audio_subchunks');
+      fs.mkdirSync(subChunksDir, { recursive: true });
+      const plan = buildAudioChunkPlan(clipDur, subChunksDir);
+      let merged: TranscriptSegment[] = [];
+      for (let i = 0; i < plan.length; i++) {
+        const desc = plan[i];
+        await runFFmpegSpawn([
+          '-loglevel',
+          'error',
+          '-y',
+          ...(desc.offsetSeconds > 0 ? ['-accurate_seek', '-ss', desc.offsetSeconds.toFixed(3)] : []),
+          '-i',
+          clipAudioPath,
+          '-t',
+          desc.durationSeconds.toFixed(3),
+          '-c:a',
+          'copy',
+          desc.filePath,
+        ]);
+        const res = await transcribeAudioChunk({
+          audioPath: desc.filePath,
+          chunkIndex: i,
+          chunkOffsetSeconds: clip.startTime + desc.offsetSeconds,
+          chunkDurationSeconds: desc.durationSeconds,
+          language: lang,
+        });
+        if (!project.detectedLanguage && res.detectedLanguage) {
+          project.detectedLanguage = res.detectedLanguage;
+        }
+        merged = mergeOverlappingTranscriptSegments(
+          merged,
+          res.segments,
+          i,
+          clip.startTime + desc.offsetSeconds
+        );
+      }
+      rawSegments = merged;
+    }
+    if (rawSegments.length > 0) {
+      mode = 'ai_transcribed_and_waveform_synced';
+    }
+  } catch (err) {
+    // Fallback to existing transcript segments for this clip window if Gemini is temporarily rate-limited
+    console.warn('[ClipAudioAnalyze] Falling back to existing segments with acoustic waveform alignment:', err);
+  }
+
+  if (rawSegments.length === 0) {
+    rawSegments =
+      clip.customSegments && clip.customSegments.length > 0
+        ? clip.customSegments
+        : project.transcript.filter((s) => s.end > clip.startTime && s.start < clip.endTime);
+  }
+
+  const aligned = alignTranscriptWithVoiceActivity(rawSegments, absSilences, clip.endTime);
+  clip.customSegments = aligned;
+  clip.editingStatus = 'edited';
+  clip.updatedAt = new Date().toISOString();
+  project.clips[clipIdx] = clip;
+
+  if (isFullVideo || project.transcript.length === 0) {
+    project.transcript = aligned;
+    project.silences = absSilences;
+  }
+
+  store.upsertProject(project);
+  const wordCount = aligned.reduce((acc, s) => acc + s.words.length, 0);
+  return {
+    project,
+    clip,
+    alignedSegments: aligned.length,
+    wordCount,
+    mode,
+  };
 }
 
 /**
@@ -1041,11 +1349,13 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
             '-loglevel',
             'error',
             '-y',
-            ...(desc.offsetSeconds > 0 ? ['-ss', desc.offsetSeconds.toFixed(2)] : []),
+            ...(desc.offsetSeconds > 0 ? ['-accurate_seek', '-ss', desc.offsetSeconds.toFixed(3)] : []),
             '-i',
             project.sourcePath,
-            ...(audioPlan.length > 1 ? ['-t', desc.durationSeconds.toFixed(2)] : []),
+            ...(audioPlan.length > 1 ? ['-t', desc.durationSeconds.toFixed(3)] : []),
             '-vn',
+            '-af',
+            'aresample=async=1:first_pts=0',
             '-ac',
             '1',
             '-ar',
@@ -1081,9 +1391,16 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
     let sampledKeyframes: Array<{ time: number; filePath: string; filename: string }> = [];
     if (isCaptionsOnly) {
       updateStage(project, 'signal_analysis', {
+        status: 'running',
+        progress: 40,
+        detail: 'Detecting exact voiceover speech onsets & breath pauses for frame-accurate caption sync...',
+      });
+      const silences = meta.audioCodec !== 'none' ? await detectSilences(project.sourcePath, -29, 0.16) : [];
+      project.silences = silences;
+      updateStage(project, 'signal_analysis', {
         status: 'completed',
         progress: 100,
-        detail: 'Skipped scene slicing (Captions-Only mode keeps full original video untouched)',
+        detail: `Mapped ${silences.length} acoustic speech pauses for high-end voiceover sync (full original video preserved)`,
       });
     } else if (!signalStage || signalStage.status !== 'completed') {
       updateStage(project, 'signal_analysis', {
@@ -1181,11 +1498,24 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
         store.upsertProject(project);
       }
 
+      // Snap transcribed segments & word timings to the exact acoustic speech envelope
+      if (project.transcript.length > 0) {
+        if (!project.silences || project.silences.length === 0) {
+          project.silences = meta.audioCodec !== 'none' ? await detectSilences(project.sourcePath, -29, 0.16) : [];
+        }
+        project.transcript = alignTranscriptWithVoiceActivity(
+          project.transcript,
+          project.silences,
+          meta.duration
+        );
+        store.upsertProject(project);
+      }
+
       const wordCount = project.transcript.reduce((acc, s) => acc + s.words.length, 0);
       updateStage(project, 'transcription', {
         status: 'completed',
         progress: 100,
-        detail: `${project.transcript.length} timestamped segments · ${wordCount} words (${project.detectedLanguage || 'detected'})`,
+        detail: `${project.transcript.length} voice-synced segments · ${wordCount} words (${project.detectedLanguage || 'detected'})`,
       });
     }
 

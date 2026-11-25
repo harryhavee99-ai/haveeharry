@@ -246,6 +246,29 @@ export const api = {
       body: JSON.stringify(payload ?? {}),
     }),
 
+  resyncAudioCaptions: (projectId: string, clipId?: string) =>
+    requestJson<{ project: ProjectRecord; alignedSegments: number }>(
+      `/api/projects/${projectId}/resync-audio`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clipId }),
+      }
+    ),
+
+  analyzeClipAudioCaptions: (projectId: string, clipId: string, language?: string) =>
+    requestJson<{
+      project: ProjectRecord;
+      clip: ClipRecord;
+      alignedSegments: number;
+      wordCount: number;
+      mode: 'ai_transcribed_and_waveform_synced' | 'waveform_synced';
+    }>(`/api/projects/${projectId}/clips/${clipId}/analyze-audio-captions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ language }),
+    }),
+
   applyCaptionsToAll: (projectId: string, clipId: string, captionStyle: ClipRecord['captionStyle']) =>
     requestJson<{ updatedCount: number; project: ProjectRecord }>(
       `/api/projects/${projectId}/clips/${clipId}/apply-captions-all`,
@@ -399,6 +422,75 @@ export const api = {
     const match = disp.match(/filename="?([^"]+)"?/i);
     const filename =
       match?.[1] || `${fallbackName.replace(/[^a-zA-Z0-9-_]/g, '_') || 'video'}_softsub_original.mp4`;
+
+    const mp4Blob = blob.type === 'video/mp4' ? blob : new Blob([blob], { type: 'video/mp4' });
+    const objectUrl = URL.createObjectURL(mp4Blob);
+    try {
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = filename;
+      link.rel = 'noopener';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 15_000);
+    }
+
+    return { filename, fileSize: blob.size };
+  },
+
+  downloadClipChromaCaptionsMp4: async (
+    projectId: string,
+    clipId: string,
+    fallbackName = 'SkaDoosh_Chroma_Green_Captions',
+    options?: { chromaColor?: string; includeAudio?: boolean; resolution?: string }
+  ): Promise<{ filename: string; fileSize: number }> => {
+    const params = new URLSearchParams();
+    if (options?.chromaColor) params.set('color', options.chromaColor);
+    if (options?.includeAudio !== undefined) params.set('includeAudio', String(options.includeAudio));
+    if (options?.resolution) params.set('resolution', options.resolution);
+    const qs = params.toString();
+
+    const res = await fetch(
+      `/api/projects/${projectId}/clips/${clipId}/download-chroma-captions${qs ? `?${qs}` : ''}`,
+      {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+      }
+    );
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (!res.ok) {
+      const errText = await res.text();
+      throw classifyResponseError(
+        res.status,
+        errText,
+        `Chroma Green Screen MP4 download failed (${res.status})`,
+        res.url
+      );
+    }
+    if (contentType.includes('text/html') || contentType.includes('application/json')) {
+      const errText = await res.text();
+      throw classifyResponseError(
+        res.status,
+        errText,
+        'Server did not return a valid Chroma Green Screen MP4 stream.',
+        res.url
+      );
+    }
+
+    const blob = await res.blob();
+    if (!blob || blob.size === 0) {
+      throw new Error('Downloaded Chroma Green Screen MP4 was empty.');
+    }
+
+    const disp = res.headers.get('content-disposition') || '';
+    const match = disp.match(/filename="?([^"]+)"?/i);
+    const filename =
+      match?.[1] ||
+      `${fallbackName.replace(/[^a-zA-Z0-9-_]/g, '_') || 'captions'}_chroma_green_captions.mp4`;
 
     const mp4Blob = blob.type === 'video/mp4' ? blob : new Blob([blob], { type: 'video/mp4' });
     const objectUrl = URL.createObjectURL(mp4Blob);

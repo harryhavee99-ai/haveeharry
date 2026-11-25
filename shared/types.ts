@@ -2,7 +2,19 @@ export type ProcessingMode = 'auto_clips' | 'captions_only';
 export type AspectRatio = '9:16' | '16:9' | '1:1' | '4:5' | '4:3' | 'original';
 export type FramingMode = 'ai_auto' | 'face_track' | 'manual';
 export type MotionIntensity = 'minimal' | 'balanced' | 'dynamic';
-export type CaptionAnimation = 'pop' | 'karaoke' | 'fade' | 'slide' | 'glow' | 'none';
+export type CaptionAnimation =
+  | 'pop'
+  | 'karaoke'
+  | 'wave'
+  | 'bounce'
+  | 'typewriter'
+  | 'shake'
+  | 'neon_pulse'
+  | 'flip'
+  | 'fade'
+  | 'slide'
+  | 'glow'
+  | 'none';
 export type CaptionPosition = 'top' | 'middle' | 'bottom';
 export type CaptionAlignment = 'left' | 'center' | 'right';
 export type ExportResolution = '720p' | '1080p' | '4k' | 'original';
@@ -167,9 +179,26 @@ export interface CaptionStyleConfig {
   animation: CaptionAnimation;
   wordsPerLine: number; // 2..10
   maxLines: 1 | 2 | 3;
-  timingOffsetMs: number; // -500..500
+  timingOffsetMs: number; // -2000..2000
   uppercase: boolean;
   wordLevelHighlight: boolean;
+  // Advanced Animation, Pill, Typography & Voiceover Sync Controls
+  animationSpeed?: number; // 0.5..2.0 (default 1.0)
+  waveAmplitude?: number; // 2..18 px (default 7)
+  activeWordScale?: number; // 1.0..1.35 (default 1.1)
+  activeWordBgColor?: string; // active word pill color
+  activeWordBgOpacity?: number; // 0..1 (default 0)
+  letterSpacing?: number; // -1..8 px (default 0)
+  wordSpacing?: number; // 0..18 px (default 4)
+  backgroundRadius?: number; // 0..24 px (default 10)
+  backgroundPadding?: number; // 4..24 px (default 12)
+  horizontalOffset?: number; // 10..90 % from left (default 50)
+  italic?: boolean;
+  textTransform?: 'none' | 'uppercase' | 'lowercase' | 'capitalize';
+  glowIntensity?: number; // 0..28 px (default 14)
+  shadowColor?: string; // default '#000000'
+  shadowBlur?: number; // 0..24 px (default 10)
+  wordLeadInMs?: number; // -150..150 ms (default 35ms perceptual vocal onset lead-in)
 }
 
 export interface ColorGradingConfig {

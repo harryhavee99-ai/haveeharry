@@ -130,16 +130,17 @@ async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 4): Promise<T> {
 }
 
 /**
- * Distributes word-level timestamps proportionally across a segment based on syllable/character weight
- * when exact per-word boundaries are not returned, or normalizes returned word timestamps to stay strictly within [segStart, segEnd].
+ * Computes syllable & punctuation-cadence-aware word-level timestamps within [segStart, segEnd].
+ * Allocates realistic micro-pauses after commas, colons, dashes, and sentence-ending punctuation
+ * so word highlighting stays locked to the actual spoken voiceover rhythm instead of drifting ahead.
  */
-function buildWordTimings(
+export function buildWordTimings(
   text: string,
   segStart: number,
   segEnd: number,
   rawWords?: Array<{ word: string; start?: number; end?: number }>
 ): WordTiming[] {
-  const duration = Math.max(0.2, segEnd - segStart);
+  const duration = Math.max(0.16, segEnd - segStart);
   if (rawWords && rawWords.length > 0) {
     const cleaned = rawWords
       .map((w) => ({
@@ -150,12 +151,22 @@ function buildWordTimings(
       .filter((w) => w.word.length > 0);
 
     if (cleaned.length > 0 && cleaned.every((w) => w.start !== undefined && w.end !== undefined)) {
-      return cleaned.map((w) => ({
-        id: uuidv4(),
-        word: w.word,
-        start: Math.max(segStart, Math.min(segEnd, w.start!)),
-        end: Math.max(segStart, Math.min(segEnd, Math.max(w.start! + 0.05, w.end!))),
-      }));
+      let prevEnd = segStart;
+      return cleaned.map((w, idx) => {
+        const clampedStart = Math.max(prevEnd, Math.max(segStart, Math.min(segEnd - 0.04, w.start!)));
+        const maxAllowedEnd = idx === cleaned.length - 1 ? segEnd : Math.min(segEnd, cleaned[idx + 1].start ?? segEnd);
+        const clampedEnd = Math.max(
+          clampedStart + 0.04,
+          Math.min(segEnd, Math.max(w.end!, maxAllowedEnd > clampedStart + 0.04 ? Math.min(w.end!, maxAllowedEnd) : w.end!))
+        );
+        prevEnd = clampedEnd;
+        return {
+          id: uuidv4(),
+          word: w.word,
+          start: Number(clampedStart.toFixed(3)),
+          end: Number(clampedEnd.toFixed(3)),
+        };
+      });
     }
   }
 
@@ -165,20 +176,45 @@ function buildWordTimings(
     .filter((w) => w.length > 0);
   if (tokens.length === 0) return [];
 
-  const weights = tokens.map((t) => Math.max(1.5, t.replace(/[^a-zA-Z0-9\u0600-\u06FF\u0900-\u097F]/g, '').length));
-  const totalWeight = weights.reduce((a, b) => a + b, 0);
+  // Estimate spoken syllable weight + post-word punctuation pause weight for each token
+  const tokenMetrics = tokens.map((t, idx) => {
+    const cleanAlpha = t.replace(/[^a-zA-Z0-9\u0600-\u06FF\u0900-\u097F]/g, '');
+    // Count vowel groups as syllable proxy (fallback to character length)
+    const vowelMatches = cleanAlpha.match(/[aeiouyAEIOUY]+/g);
+    const syllableCount = vowelMatches ? Math.max(1, vowelMatches.length) : Math.max(1, Math.ceil(cleanAlpha.length / 3));
+    const speakWeight = Math.max(1.25, syllableCount * 1.15 + cleanAlpha.length * 0.22);
 
+    // Punctuation at end of token introduces a natural human breath/cadence pause after the word
+    let pauseWeight = 0;
+    if (idx < tokens.length - 1) {
+      if (/[.!?؟۔]+["')\]}]*$/.test(t)) {
+        pauseWeight = 1.65; // ~220-280ms sentence boundary pause
+      } else if (/[,;:—–\-]+["')\]}]*$/.test(t)) {
+        pauseWeight = 1.05; // ~140-180ms clause pause
+      }
+    }
+    return { speakWeight, pauseWeight, totalWeight: speakWeight + pauseWeight };
+  });
+
+  const sumWeights = tokenMetrics.reduce((acc, m) => acc + m.totalWeight, 0);
   let cursor = segStart;
+
   return tokens.map((word, idx) => {
-    const share = (weights[idx] / totalWeight) * duration;
+    const m = tokenMetrics[idx];
+    const slotDuration = (m.totalWeight / sumWeights) * duration;
+    const speakDuration =
+      idx === tokens.length - 1
+        ? slotDuration
+        : slotDuration * (m.speakWeight / Math.max(0.1, m.totalWeight));
     const start = Number(cursor.toFixed(3));
-    const end = Number((idx === tokens.length - 1 ? segEnd : cursor + share).toFixed(3));
-    cursor += share;
+    const rawEnd = idx === tokens.length - 1 ? segEnd : cursor + speakDuration;
+    const end = Number(Math.min(segEnd, Math.max(start + 0.045, rawEnd)).toFixed(3));
+    cursor += slotDuration;
     return {
       id: uuidv4(),
       word,
       start,
-      end: Math.max(start + 0.04, end),
+      end,
     };
   });
 }
@@ -286,9 +322,12 @@ export async function transcribeAudioChunk(params: {
                   {
                     text: [
                       `${languageDirective}`,
-                      `Audio duration is ${params.chunkDurationSeconds.toFixed(1)} seconds (0.0 to ${params.chunkDurationSeconds.toFixed(1)}).`,
-                      `Format each spoken sentence/phrase on its own line with exact timestamps in seconds like:`,
-                      `[0.0 - 4.5] Speaker 1: Exact spoken words here.`,
+                      `Audio duration is ${params.chunkDurationSeconds.toFixed(2)} seconds (0.00 to ${params.chunkDurationSeconds.toFixed(2)}).`,
+                      `CRITICAL SYNC RULE: Split speech into short, tight phrase segments (1.2 to 3.8 seconds each, max 7 words per line).`,
+                      `Set the start timestamp to the EXACT tenth-of-a-second when the speaker's voice begins the first syllable (do NOT include leading silence).`,
+                      `Set the end timestamp to the EXACT tenth-of-a-second when the last syllable finishes (do NOT include trailing silence).`,
+                      `Format each spoken phrase on its own line with exact timestamps in seconds like:`,
+                      `[0.42 - 2.85] Speaker 1: Exact spoken words here.`,
                       `Only transcribe words actually spoken in the audio. If there is silence or only music with no speech, respond with "[NO_SPEECH]".`,
                     ].join('\n'),
                   },
@@ -346,13 +385,16 @@ export async function transcribeAudioChunk(params: {
 
   // Step 2: Structured timestamped diarized alignment via gemini-4-hydrogen (fallback when Step 1 had no timestamps)
   const prompt = [
-    `You are a precision speech-to-text timestamp aligner.`,
-    `This audio chunk is ${params.chunkDurationSeconds.toFixed(1)} seconds long (local timestamps from 0.0 to ${params.chunkDurationSeconds.toFixed(1)} seconds).`,
+    `You are a frame-accurate speech-to-text forced timestamp aligner.`,
+    `This audio chunk is ${params.chunkDurationSeconds.toFixed(2)} seconds long (local timestamps from 0.00 to ${params.chunkDurationSeconds.toFixed(2)} seconds).`,
     languageDirective,
     verbatimReference
       ? `Verbatim ASR reference transcript (use this as ground truth so you never invent dialogue):\n"""\n${verbatimReference}\n"""`
       : 'Transcribe only words genuinely spoken in the audio. NEVER invent or hallucinate speech.',
-    `Return timestamped sentence/phrase segments (ideally 2 to 8 seconds each) with speaker labels (e.g., "Speaker 1", "Speaker 2"), accurate start/end seconds within [0, ${params.chunkDurationSeconds.toFixed(1)}], and natural punctuation.`,
+    `CRITICAL VOICEOVER SYNC RULES:`,
+    `1. Break speech into short, natural breath-group phrases of 1.2 to 4.0 seconds each (4 to 8 words per segment). Whenever the speaker pauses for breath (>0.2s), end the current segment and start a new segment after the pause.`,
+    `2. Set "start" to the exact moment the first syllable of the phrase becomes audible (NEVER start at 0.0 if there is leading music/silence before the voiceover starts).`,
+    `3. Set "end" to the exact moment the final syllable of the phrase stops (NEVER stretch "end" across trailing silence).`,
     `If there is no spoken dialogue in this audio chunk, return an empty segments array.`,
   ].join('\n\n');
 

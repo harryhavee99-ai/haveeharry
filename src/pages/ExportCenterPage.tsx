@@ -413,6 +413,16 @@ export function ExportCenterPage({
                     ASS
                   </a>
 
+                  <a
+                    href={`/api/projects/${project.id}/clips/${clip.id}/download-chroma-captions?color=%2300FF00&includeAudio=true`}
+                    download
+                    title="Download animated captions on a Chroma Green Screen (#00FF00) MP4 for Premiere Pro, CapCut, After Effects, or DaVinci Resolve"
+                    className="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-lg bg-[#071910] hover:bg-[#0D291A] border border-[#22C55E]/40 text-xs font-medium text-[#4ADE80] whitespace-nowrap"
+                  >
+                    <span className="w-2 h-2 rounded-full bg-[#00FF00]" />
+                    Chroma Green MP4
+                  </a>
+
                   <button
                     onClick={() => void onExportSingle(project.id, clip.id, options)}
                     disabled={Boolean(isRendering)}
