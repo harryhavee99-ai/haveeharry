@@ -509,6 +509,72 @@ export const api = {
     return { filename, fileSize: blob.size };
   },
 
+  downloadClipSubtitleFile: async (
+    projectId: string,
+    clipId: string,
+    format: 'srt' | 'vtt' | 'ass',
+    fallbackName = 'SkaDoosh_Captions'
+  ): Promise<{ filename: string; fileSize: number }> => {
+    const res = await fetch(`/api/projects/${projectId}/clips/${clipId}/subtitles.${format}`, {
+      method: 'GET',
+      credentials: 'include',
+      cache: 'no-store',
+    });
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (!res.ok) {
+      const errText = await res.text();
+      throw classifyResponseError(
+        res.status,
+        errText,
+        `${format.toUpperCase()} subtitle download failed (${res.status})`,
+        res.url
+      );
+    }
+    if (contentType.includes('text/html') || contentType.includes('application/json')) {
+      const errText = await res.text();
+      throw classifyResponseError(
+        res.status,
+        errText,
+        `Server did not return a valid .${format} subtitle file.`,
+        res.url
+      );
+    }
+
+    const textContent = await res.text();
+    if (!textContent || !textContent.trim()) {
+      throw new Error(`No captions available to download for .${format.toUpperCase()}. Please generate captions first.`);
+    }
+
+    const mimeMap: Record<'srt' | 'vtt' | 'ass', string> = {
+      srt: 'application/x-subrip;charset=utf-8',
+      vtt: 'text/vtt;charset=utf-8',
+      ass: 'text/plain;charset=utf-8',
+    };
+    const blob = new Blob([textContent], { type: mimeMap[format] });
+
+    const disp = res.headers.get('content-disposition') || '';
+    const match = disp.match(/filename="?([^"]+)"?/i);
+    const filename =
+      match?.[1] ||
+      `${fallbackName.replace(/[^a-zA-Z0-9-_]/g, '_') || 'captions'}.${format}`;
+
+    const objectUrl = URL.createObjectURL(blob);
+    try {
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = filename;
+      link.rel = 'noopener';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 15_000);
+    }
+
+    return { filename, fileSize: blob.size };
+  },
+
   downloadProjectZip: async (projectId: string, fallbackName = 'clipgenius_clips'): Promise<void> => {
     const res = await fetch(`/api/projects/${projectId}/download-zip`, {
       method: 'GET',

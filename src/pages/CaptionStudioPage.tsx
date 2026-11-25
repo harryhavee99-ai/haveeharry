@@ -173,6 +173,7 @@ export function CaptionStudioPage({
   const [downloadingMp4, setDownloadingMp4] = useState(false);
   const [downloadingSoftSub, setDownloadingSoftSub] = useState(false);
   const [downloadingChroma, setDownloadingChroma] = useState(false);
+  const [downloadingSubtitleFormat, setDownloadingSubtitleFormat] = useState<'srt' | 'vtt' | 'ass' | null>(null);
   const [chromaColor, setChromaColor] = useState<'#00FF00' | '#00B140' | '#0047AB' | '#000000'>('#00FF00');
   const [chromaIncludeAudio, setChromaIncludeAudio] = useState(true);
   const [chromaPreviewEnabled, setChromaPreviewEnabled] = useState(false);
@@ -382,19 +383,34 @@ export function CaptionStudioPage({
     setDownloadingChroma(true);
     try {
       await onSaveClip(project.id, previewClip);
-      await api.downloadClipChromaCaptionsMp4(project.id, sourceClip.id, sourceClip.title, {
+      const res = await api.downloadClipChromaCaptionsMp4(project.id, sourceClip.id, sourceClip.title, {
         chromaColor,
         includeAudio: chromaIncludeAudio,
         resolution: isFullOriginal ? 'original' : '1080p',
       });
       setFeedback(
-        `Downloaded Animated Chroma Screen Captions MP4 (${chromaColor}) — import into CapCut, Premiere Pro, After Effects, or DaVinci Resolve and apply Chroma Key!`
+        `Downloaded Only-Captions MP4 (${res.filename}, ${formatBytes(res.fileSize)}) on ${chromaColor} Chroma Screen — import into CapCut, Premiere Pro, After Effects, or DaVinci Resolve!`
       );
       setTimeout(() => setFeedback(null), 4000);
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Chroma Green Screen MP4 export failed.');
+      setErrorMsg(err instanceof Error ? err.message : 'Only-Captions Chroma Green Screen MP4 export failed.');
     } finally {
       setDownloadingChroma(false);
+    }
+  };
+
+  const handleDownloadSubtitleFile = async (format: 'srt' | 'vtt' | 'ass') => {
+    setErrorMsg(null);
+    setDownloadingSubtitleFormat(format);
+    try {
+      await onSaveClip(project.id, previewClip);
+      const res = await api.downloadClipSubtitleFile(project.id, sourceClip.id, format, sourceClip.title);
+      setFeedback(`Downloaded ${res.filename} (${formatBytes(res.fileSize)}) with voiceover-synced timestamps.`);
+      setTimeout(() => setFeedback(null), 3500);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : `Failed to download .${format.toUpperCase()} subtitle file.`);
+    } finally {
+      setDownloadingSubtitleFormat(null);
     }
   };
 
@@ -787,36 +803,49 @@ export function CaptionStudioPage({
                   <Download className="w-3.5 h-3.5 text-[#FEF3C7]" />
                 )}
                 {downloadingChroma
-                  ? 'Rendering Animated Chroma Captions MP4...'
-                  : `Download Chroma ${chromaColor === '#0047AB' ? 'Blue' : chromaColor === '#000000' ? 'Matte' : 'Green'} Screen Captions (.MP4)`}
+                  ? 'Rendering Only-Captions Chroma MP4...'
+                  : `Download Only-Captions MP4 (${chromaColor === '#0047AB' ? 'Chroma Blue' : chromaColor === '#000000' ? 'Black Matte' : 'Chroma Green'})`}
               </button>
             </div>
 
-            <div className="pt-2 border-t border-[#D4AF37]/12 flex items-center justify-between gap-2">
-              <span className="text-[11px] text-zinc-400">Subtitle Files:</span>
+            <div className="pt-2 border-t border-[#D4AF37]/12 flex flex-wrap items-center justify-between gap-2">
+              <span className="text-[11px] text-zinc-400">Download Subtitle Files:</span>
               <div className="flex items-center gap-1.5">
-                <a
-                  href={`/api/projects/${project.id}/clips/${sourceClip.id}/subtitles.srt`}
-                  download
-                  className="inline-flex items-center gap-1 h-7 px-2.5 rounded-md bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/18 text-[11px] text-zinc-200"
+                <button
+                  type="button"
+                  onClick={() => void handleDownloadSubtitleFile('srt')}
+                  disabled={downloadingSubtitleFormat !== null}
+                  className="inline-flex items-center gap-1 h-7 px-2.5 rounded-md bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/25 text-[11px] font-medium text-zinc-100 disabled:opacity-50"
                 >
-                  <FileText className="w-3 h-3 text-[#F5C451]" />
-                  SRT
-                </a>
-                <a
-                  href={`/api/projects/${project.id}/clips/${sourceClip.id}/subtitles.vtt`}
-                  download
-                  className="inline-flex items-center gap-1 h-7 px-2.5 rounded-md bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/18 text-[11px] text-zinc-200"
+                  {downloadingSubtitleFormat === 'srt' ? (
+                    <Loader2 className="w-3 h-3 animate-spin text-[#F5C451]" />
+                  ) : (
+                    <FileText className="w-3 h-3 text-[#F5C451]" />
+                  )}
+                  Download SRT
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleDownloadSubtitleFile('vtt')}
+                  disabled={downloadingSubtitleFormat !== null}
+                  className="inline-flex items-center gap-1 h-7 px-2.5 rounded-md bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/18 text-[11px] text-zinc-200 disabled:opacity-50"
                 >
+                  {downloadingSubtitleFormat === 'vtt' ? (
+                    <Loader2 className="w-3 h-3 animate-spin text-[#F5C451]" />
+                  ) : null}
                   VTT
-                </a>
-                <a
-                  href={`/api/projects/${project.id}/clips/${sourceClip.id}/subtitles.ass`}
-                  download
-                  className="inline-flex items-center gap-1 h-7 px-2.5 rounded-md bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/18 text-[11px] text-zinc-200"
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleDownloadSubtitleFile('ass')}
+                  disabled={downloadingSubtitleFormat !== null}
+                  className="inline-flex items-center gap-1 h-7 px-2.5 rounded-md bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/18 text-[11px] text-zinc-200 disabled:opacity-50"
                 >
+                  {downloadingSubtitleFormat === 'ass' ? (
+                    <Loader2 className="w-3 h-3 animate-spin text-[#F5C451]" />
+                  ) : null}
                   Styled ASS
-                </a>
+                </button>
               </div>
             </div>
           </div>

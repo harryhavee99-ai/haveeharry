@@ -38,6 +38,7 @@ import {
   generateAssSubtitles,
   generateSrtSubtitles,
   generateVttSubtitles,
+  getClipSegments,
   renderChromaCaptionsMp4,
   renderClipWithFFmpeg,
   renderSoftSubtitledMp4,
@@ -1283,11 +1284,22 @@ async function createServer() {
 
   // Download Animated Captions-Only Chroma Green Screen MP4 (for Premiere Pro, CapCut, After Effects, DaVinci Resolve, Filmora)
   app.get('/api/projects/:id/clips/:clipId/download-chroma-captions', async (req, res) => {
-    const project = store.getProject(req.params.id);
-    const clip = project?.clips.find((c) => c.id === req.params.clipId);
+    let project = store.getProject(req.params.id);
+    let clip = project?.clips.find((c) => c.id === req.params.clipId);
     if (!project || !clip) return res.status(404).json({ error: 'Clip not found.' });
 
     try {
+      // Auto-analyze clip audio & generate voiceover-synced captions if no caption segments exist yet
+      if (getClipSegments(project, clip).length === 0 && project.sourcePath && fs.existsSync(project.sourcePath)) {
+        try {
+          const analyzed = await analyzeClipAudioAndGenerateCaptions(project.id, clip.id);
+          project = analyzed.project;
+          clip = analyzed.clip;
+        } catch (autoErr) {
+          console.warn('[ChromaCaptions] Auto audio analysis fallback warning:', autoErr);
+        }
+      }
+
       const rawColor = typeof req.query.color === 'string' ? req.query.color : '#00FF00';
       const includeAudio = req.query.includeAudio !== 'false';
       const rawRes = typeof req.query.resolution === 'string' ? req.query.resolution : undefined;
@@ -1327,7 +1339,7 @@ async function createServer() {
       });
       stream.on('error', (err) => {
         logBackendError({
-          projectId: project.id,
+          projectId: project!.id,
           stage: 'chroma_captions_download',
           httpStatus: 500,
           route: 'GET /api/projects/:id/clips/:clipId/download-chroma-captions',
@@ -1353,44 +1365,125 @@ async function createServer() {
   });
 
   // Download SRT subtitles for a clip
-  app.get('/api/projects/:id/clips/:clipId/subtitles.srt', (req, res) => {
-    const project = store.getProject(req.params.id);
-    const clip = project?.clips.find((c) => c.id === req.params.clipId);
+  app.get('/api/projects/:id/clips/:clipId/subtitles.srt', async (req, res) => {
+    let project = store.getProject(req.params.id);
+    let clip = project?.clips.find((c) => c.id === req.params.clipId);
     if (!project || !clip) return res.status(404).json({ error: 'Clip not found.' });
-    const srt = generateSrtSubtitles(project, clip);
-    const safeName = clip.title.replace(/[^a-zA-Z0-9-_]/g, '_').replace(/_+/g, '_').slice(0, 60) || 'captions';
-    res.setHeader('Content-Type', 'application/x-subrip; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.srt"`);
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.send(srt);
+
+    try {
+      if (getClipSegments(project, clip).length === 0 && project.sourcePath && fs.existsSync(project.sourcePath)) {
+        try {
+          const analyzed = await analyzeClipAudioAndGenerateCaptions(project.id, clip.id);
+          project = analyzed.project;
+          clip = analyzed.clip;
+        } catch (autoErr) {
+          console.warn('[SRTDownload] Auto audio analysis fallback warning:', autoErr);
+        }
+      }
+      const srt = generateSrtSubtitles(project, clip);
+      if (!srt.trim()) {
+        return res.status(400).json({
+          error: 'No captions generated for this clip yet. Click "Analyze Clip Audio & Generate Captions" first.',
+        });
+      }
+      const safeName = clip.title.replace(/[^a-zA-Z0-9-_]/g, '_').replace(/_+/g, '_').slice(0, 60) || 'captions';
+      res.setHeader('Content-Type', 'application/x-subrip; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${safeName}.srt"`);
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(srt);
+    } catch (err) {
+      const safeErr = logBackendError({
+        projectId: project.id,
+        stage: 'srt_download',
+        httpStatus: 500,
+        route: 'GET /api/projects/:id/clips/:clipId/subtitles.srt',
+        error: err,
+      });
+      res.status(500).json({ error: safeErr });
+    }
   });
 
   // Download WebVTT subtitles for a clip
-  app.get('/api/projects/:id/clips/:clipId/subtitles.vtt', (req, res) => {
-    const project = store.getProject(req.params.id);
-    const clip = project?.clips.find((c) => c.id === req.params.clipId);
+  app.get('/api/projects/:id/clips/:clipId/subtitles.vtt', async (req, res) => {
+    let project = store.getProject(req.params.id);
+    let clip = project?.clips.find((c) => c.id === req.params.clipId);
     if (!project || !clip) return res.status(404).json({ error: 'Clip not found.' });
-    const vtt = generateVttSubtitles(project, clip);
-    const safeName = clip.title.replace(/[^a-zA-Z0-9-_]/g, '_').replace(/_+/g, '_').slice(0, 60) || 'captions';
-    res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.vtt"`);
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.send(vtt);
+
+    try {
+      if (getClipSegments(project, clip).length === 0 && project.sourcePath && fs.existsSync(project.sourcePath)) {
+        try {
+          const analyzed = await analyzeClipAudioAndGenerateCaptions(project.id, clip.id);
+          project = analyzed.project;
+          clip = analyzed.clip;
+        } catch (autoErr) {
+          console.warn('[VTTDownload] Auto audio analysis fallback warning:', autoErr);
+        }
+      }
+      const vtt = generateVttSubtitles(project, clip);
+      if (vtt.trim() === 'WEBVTT') {
+        return res.status(400).json({
+          error: 'No captions generated for this clip yet. Click "Analyze Clip Audio & Generate Captions" first.',
+        });
+      }
+      const safeName = clip.title.replace(/[^a-zA-Z0-9-_]/g, '_').replace(/_+/g, '_').slice(0, 60) || 'captions';
+      res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${safeName}.vtt"`);
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(vtt);
+    } catch (err) {
+      const safeErr = logBackendError({
+        projectId: project.id,
+        stage: 'vtt_download',
+        httpStatus: 500,
+        route: 'GET /api/projects/:id/clips/:clipId/subtitles.vtt',
+        error: err,
+      });
+      res.status(500).json({ error: safeErr });
+    }
   });
 
   // Download Styled High-End ASS subtitles for a clip
-  app.get('/api/projects/:id/clips/:clipId/subtitles.ass', (req, res) => {
-    const project = store.getProject(req.params.id);
-    const clip = project?.clips.find((c) => c.id === req.params.clipId);
+  app.get('/api/projects/:id/clips/:clipId/subtitles.ass', async (req, res) => {
+    let project = store.getProject(req.params.id);
+    let clip = project?.clips.find((c) => c.id === req.params.clipId);
     if (!project || !clip) return res.status(404).json({ error: 'Clip not found.' });
-    const outW = project.metadata?.width || 1920;
-    const outH = project.metadata?.height || 1080;
-    const ass = generateAssSubtitles(project, clip, outW, outH);
-    const safeName = clip.title.replace(/[^a-zA-Z0-9-_]/g, '_').replace(/_+/g, '_').slice(0, 60) || 'captions';
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.ass"`);
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.send(ass);
+
+    try {
+      if (getClipSegments(project, clip).length === 0 && project.sourcePath && fs.existsSync(project.sourcePath)) {
+        try {
+          const analyzed = await analyzeClipAudioAndGenerateCaptions(project.id, clip.id);
+          project = analyzed.project;
+          clip = analyzed.clip;
+        } catch (autoErr) {
+          console.warn('[ASSDownload] Auto audio analysis fallback warning:', autoErr);
+        }
+      }
+      if (getClipSegments(project, clip).length === 0) {
+        return res.status(400).json({
+          error: 'No captions generated for this clip yet. Click "Analyze Clip Audio & Generate Captions" first.',
+        });
+      }
+      const outW = project.metadata?.width || 1920;
+      const outH = project.metadata?.height || 1080;
+      const ass = generateAssSubtitles(project, clip, outW, outH);
+      const safeName = clip.title.replace(/[^a-zA-Z0-9-_]/g, '_').replace(/_+/g, '_').slice(0, 60) || 'captions';
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="${safeName}.ass"`);
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(ass);
+    } catch (err) {
+      const safeErr = logBackendError({
+        projectId: project.id,
+        stage: 'ass_download',
+        httpStatus: 500,
+        route: 'GET /api/projects/:id/clips/:clipId/subtitles.ass',
+        error: err,
+      });
+      res.status(500).json({ error: safeErr });
+    }
   });
 
   // Download 0%-re-encode bit-exact MP4 with embedded selectable mov_text captions

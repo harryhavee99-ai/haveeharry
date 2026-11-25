@@ -72,8 +72,11 @@ export function ExportCenterPage({
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [downloadingClipId, setDownloadingClipId] = useState<string | null>(null);
+  const [downloadingChromaClipId, setDownloadingChromaClipId] = useState<string | null>(null);
+  const [downloadingSubKey, setDownloadingSubKey] = useState<string | null>(null);
   const [downloadingZip, setDownloadingZip] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [downloadNotice, setDownloadNotice] = useState<string | null>(null);
 
   const projectJobs = useMemo(
     () => (project ? exportJobs.filter((j) => j.projectId === project.id) : exportJobs),
@@ -124,9 +127,11 @@ export function ExportCenterPage({
 
   const handleDownloadClip = async (clipId: string) => {
     setDownloadError(null);
+    setDownloadNotice(null);
     setDownloadingClipId(clipId);
     try {
-      await api.downloadClipMp4(project.id, clipId);
+      const res = await api.downloadClipMp4(project.id, clipId);
+      setDownloadNotice(`Downloaded ${res.filename} (${formatBytes(res.fileSize)})`);
     } catch (err) {
       setDownloadError(err instanceof Error ? err.message : 'MP4 download failed.');
     } finally {
@@ -134,11 +139,52 @@ export function ExportCenterPage({
     }
   };
 
+  const handleDownloadChromaMp4 = async (clipId: string, clipTitle: string) => {
+    setDownloadError(null);
+    setDownloadNotice(null);
+    setDownloadingChromaClipId(clipId);
+    try {
+      const res = await api.downloadClipChromaCaptionsMp4(project.id, clipId, clipTitle, {
+        chromaColor: '#00FF00',
+        includeAudio: true,
+        resolution: options.resolution,
+      });
+      setDownloadNotice(
+        `Downloaded Only-Captions Chroma Green MP4: ${res.filename} (${formatBytes(res.fileSize)})`
+      );
+    } catch (err) {
+      setDownloadError(err instanceof Error ? err.message : 'Only-Captions MP4 download failed.');
+    } finally {
+      setDownloadingChromaClipId(null);
+    }
+  };
+
+  const handleDownloadSubtitle = async (
+    clipId: string,
+    clipTitle: string,
+    format: 'srt' | 'vtt' | 'ass'
+  ) => {
+    setDownloadError(null);
+    setDownloadNotice(null);
+    const key = `${clipId}_${format}`;
+    setDownloadingSubKey(key);
+    try {
+      const res = await api.downloadClipSubtitleFile(project.id, clipId, format, clipTitle);
+      setDownloadNotice(`Downloaded ${res.filename} (${formatBytes(res.fileSize)})`);
+    } catch (err) {
+      setDownloadError(err instanceof Error ? err.message : `.${format.toUpperCase()} download failed.`);
+    } finally {
+      setDownloadingSubKey(null);
+    }
+  };
+
   const handleDownloadZip = async () => {
     setDownloadError(null);
+    setDownloadNotice(null);
     setDownloadingZip(true);
     try {
       await api.downloadProjectZip(project.id, project.name);
+      setDownloadNotice('Downloaded ZIP bundle containing verified MP4 clips and SRT subtitle files.');
     } catch (err) {
       setDownloadError(err instanceof Error ? err.message : 'ZIP download failed.');
     } finally {
@@ -195,6 +241,18 @@ export function ExportCenterPage({
             <span>{downloadError}</span>
           </div>
           <button onClick={() => setDownloadError(null)} className="p-1 text-red-300 hover:text-white">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {downloadNotice && (
+        <div className="flex items-center justify-between gap-3 px-4 py-3 rounded-xl bg-emerald-500/12 border border-emerald-500/30 text-xs text-emerald-200">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+            <span>{downloadNotice}</span>
+          </div>
+          <button onClick={() => setDownloadNotice(null)} className="p-1 text-emerald-300 hover:text-white">
             <X className="w-4 h-4" />
           </button>
         </div>
@@ -323,6 +381,7 @@ export function ExportCenterPage({
               !isRendering && (clip.renderStatus === 'export_ready' || clip.renderedVideoUrl)
             );
             const isDownloading = downloadingClipId === clip.id;
+            const isDownloadingChroma = downloadingChromaClipId === clip.id;
 
             return (
               <div
@@ -359,7 +418,7 @@ export function ExportCenterPage({
                 </div>
 
                 {/* Progress + Actions */}
-                <div className="flex flex-wrap items-center gap-3 shrink-0">
+                <div className="flex flex-wrap items-center gap-2.5 shrink-0">
                   {isRendering && (
                     <div className="flex items-center gap-2.5 min-w-[180px]">
                       <Loader2 className="w-4 h-4 text-[#F5C451] animate-spin shrink-0" />
@@ -388,40 +447,58 @@ export function ExportCenterPage({
                     </span>
                   )}
 
-                  <a
-                    href={`/api/projects/${project.id}/clips/${clip.id}/subtitles.srt`}
-                    download
-                    className="inline-flex items-center gap-1 h-8 px-2.5 rounded-lg bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/18 text-xs text-zinc-300 whitespace-nowrap"
+                  <button
+                    type="button"
+                    onClick={() => void handleDownloadSubtitle(clip.id, clip.title, 'srt')}
+                    disabled={downloadingSubKey !== null}
+                    className="inline-flex items-center gap-1 h-8 px-2.5 rounded-lg bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/25 text-xs font-medium text-zinc-200 whitespace-nowrap disabled:opacity-50"
                   >
-                    <FileText className="w-3.5 h-3.5 text-[#F5C451]" />
+                    {downloadingSubKey === `${clip.id}_srt` ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[#F5C451]" />
+                    ) : (
+                      <FileText className="w-3.5 h-3.5 text-[#F5C451]" />
+                    )}
                     SRT
-                  </a>
+                  </button>
 
-                  <a
-                    href={`/api/projects/${project.id}/clips/${clip.id}/subtitles.vtt`}
-                    download
-                    className="inline-flex items-center gap-1 h-8 px-2.5 rounded-lg bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/18 text-xs text-zinc-300 whitespace-nowrap"
+                  <button
+                    type="button"
+                    onClick={() => void handleDownloadSubtitle(clip.id, clip.title, 'vtt')}
+                    disabled={downloadingSubKey !== null}
+                    className="inline-flex items-center gap-1 h-8 px-2.5 rounded-lg bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/18 text-xs text-zinc-300 whitespace-nowrap disabled:opacity-50"
                   >
+                    {downloadingSubKey === `${clip.id}_vtt` ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[#F5C451]" />
+                    ) : null}
                     VTT
-                  </a>
+                  </button>
 
-                  <a
-                    href={`/api/projects/${project.id}/clips/${clip.id}/subtitles.ass`}
-                    download
-                    className="inline-flex items-center gap-1 h-8 px-2.5 rounded-lg bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/18 text-xs text-zinc-300 whitespace-nowrap"
+                  <button
+                    type="button"
+                    onClick={() => void handleDownloadSubtitle(clip.id, clip.title, 'ass')}
+                    disabled={downloadingSubKey !== null}
+                    className="inline-flex items-center gap-1 h-8 px-2.5 rounded-lg bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/18 text-xs text-zinc-300 whitespace-nowrap disabled:opacity-50"
                   >
+                    {downloadingSubKey === `${clip.id}_ass` ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[#F5C451]" />
+                    ) : null}
                     ASS
-                  </a>
+                  </button>
 
-                  <a
-                    href={`/api/projects/${project.id}/clips/${clip.id}/download-chroma-captions?color=%2300FF00&includeAudio=true`}
-                    download
-                    title="Download animated captions on a Chroma Green Screen (#00FF00) MP4 for Premiere Pro, CapCut, After Effects, or DaVinci Resolve"
-                    className="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-lg bg-[#071910] hover:bg-[#0D291A] border border-[#22C55E]/40 text-xs font-medium text-[#4ADE80] whitespace-nowrap"
+                  <button
+                    type="button"
+                    onClick={() => void handleDownloadChromaMp4(clip.id, clip.title)}
+                    disabled={isDownloadingChroma}
+                    title="Download ONLY the animated captions on a Chroma Green Screen (#00FF00) MP4 for Premiere Pro, CapCut, After Effects, or DaVinci Resolve"
+                    className="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg bg-[#071910] hover:bg-[#0D291A] border border-[#22C55E]/45 text-xs font-semibold text-[#4ADE80] whitespace-nowrap disabled:opacity-50"
                   >
-                    <span className="w-2 h-2 rounded-full bg-[#00FF00]" />
-                    Chroma Green MP4
-                  </a>
+                    {isDownloadingChroma ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[#4ADE80]" />
+                    ) : (
+                      <span className="w-2 h-2 rounded-full bg-[#00FF00]" />
+                    )}
+                    {isDownloadingChroma ? 'Rendering Captions MP4...' : 'Only Captions MP4'}
+                  </button>
 
                   <button
                     onClick={() => void onExportSingle(project.id, clip.id, options)}

@@ -22,6 +22,7 @@ import {
   Clock,
   Quote,
   Brain,
+  FileText,
 } from 'lucide-react';
 import type {
   ClipRecord,
@@ -119,6 +120,8 @@ export function ClipsPage({
   const [titleDraft, setTitleDraft] = useState('');
   const [busyClipId, setBusyClipId] = useState<string | null>(null);
   const [downloadingClipId, setDownloadingClipId] = useState<string | null>(null);
+  const [downloadingChromaClipId, setDownloadingChromaClipId] = useState<string | null>(null);
+  const [downloadingSrtClipId, setDownloadingSrtClipId] = useState<string | null>(null);
   const [pendingAutoDownloadIds, setPendingAutoDownloadIds] = useState<string[]>([]);
   const [downloadingZip, setDownloadingZip] = useState(false);
   const [renderingAll, setRenderingAll] = useState(false);
@@ -217,6 +220,41 @@ export function ClipsPage({
       setActionError(err instanceof Error ? err.message : 'Failed to download MP4 file.');
     } finally {
       setDownloadingClipId(null);
+    }
+  };
+
+  const handleDownloadOnlyCaptionsMp4 = async (clip: ClipRecord) => {
+    if (!project) return;
+    setActionError(null);
+    setActionNotice(null);
+    setDownloadingChromaClipId(clip.id);
+    try {
+      const result = await api.downloadClipChromaCaptionsMp4(project.id, clip.id, clip.title, {
+        chromaColor: '#00FF00',
+        includeAudio: true,
+      });
+      setActionNotice(
+        `Downloaded Only-Captions Chroma Green MP4: ${result.filename} (${formatBytes(result.fileSize)})`
+      );
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to download Only-Captions MP4.');
+    } finally {
+      setDownloadingChromaClipId(null);
+    }
+  };
+
+  const handleDownloadSrt = async (clip: ClipRecord) => {
+    if (!project) return;
+    setActionError(null);
+    setActionNotice(null);
+    setDownloadingSrtClipId(clip.id);
+    try {
+      const result = await api.downloadClipSubtitleFile(project.id, clip.id, 'srt', clip.title);
+      setActionNotice(`Downloaded ${result.filename} (${formatBytes(result.fileSize)})`);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to download SRT file.');
+    } finally {
+      setDownloadingSrtClipId(null);
     }
   };
 
@@ -750,7 +788,7 @@ export function ClipsPage({
                       )}
                     </div>
 
-                    {/* Action Bar: Preview, Download MP4, Edit, Regenerate, Delete */}
+                    {/* Action Bar: Preview, Download MP4, Only Captions MP4, SRT, Edit, Regenerate, Delete */}
                     <div className="px-4 py-3 border-t border-[#D4AF37]/12 flex flex-wrap items-center justify-between gap-2">
                       <div className="flex flex-wrap items-center gap-2">
                         <button
@@ -780,6 +818,36 @@ export function ClipsPage({
                               : isExportReady
                                 ? 'Download MP4'
                                 : 'Render & Download MP4'}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => void handleDownloadOnlyCaptionsMp4(clip)}
+                          disabled={downloadingChromaClipId === clip.id}
+                          title="Download ONLY the animated captions on a Chroma Green Screen (#00FF00) MP4 video"
+                          className="inline-flex items-center gap-1.5 h-9 px-3 rounded-lg bg-[#071910] hover:bg-[#0D291A] border border-[#22C55E]/45 text-xs font-semibold text-[#4ADE80] transition-colors whitespace-nowrap disabled:opacity-50"
+                        >
+                          {downloadingChromaClipId === clip.id ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin text-[#4ADE80]" />
+                          ) : (
+                            <span className="w-2 h-2 rounded-full bg-[#00FF00]" />
+                          )}
+                          {downloadingChromaClipId === clip.id ? 'Rendering Captions MP4...' : 'Only Captions MP4'}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => void handleDownloadSrt(clip)}
+                          disabled={downloadingSrtClipId === clip.id}
+                          title="Download voiceover-synced .SRT subtitle file"
+                          className="inline-flex items-center gap-1.5 h-9 px-2.5 rounded-lg bg-[#0E1913] hover:bg-[#14241B] border border-[#D4AF37]/25 text-xs font-medium text-zinc-200 transition-colors whitespace-nowrap disabled:opacity-50"
+                        >
+                          {downloadingSrtClipId === clip.id ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin text-[#F5C451]" />
+                          ) : (
+                            <FileText className="w-3.5 h-3.5 text-[#F5C451]" />
+                          )}
+                          SRT
                         </button>
 
                         <button

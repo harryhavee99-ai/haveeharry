@@ -288,7 +288,43 @@ export function getClipSegments(project: ProjectRecord, clip: ClipRecord): Trans
   if (clip.customSegments && clip.customSegments.length > 0) {
     return clip.customSegments;
   }
-  return project.transcript.filter((seg) => seg.end > clip.startTime && seg.start < clip.endTime);
+  const overlapping = (project.transcript || []).filter(
+    (seg) => seg.end > clip.startTime && seg.start < clip.endTime
+  );
+  if (overlapping.length > 0) {
+    return overlapping;
+  }
+  // Fallback: if project has transcript segments (or hook candidate dialogue) whose timestamps were relative or slightly outside
+  if (project.transcript && project.transcript.length > 0) {
+    const clipDur = Math.max(1, clip.endTime - clip.startTime);
+    const firstSeg = project.transcript[0];
+    const lastSeg = project.transcript[project.transcript.length - 1];
+    const totalSpan = Math.max(1, lastSeg.end - firstSeg.start);
+    return project.transcript.map((seg) => {
+      const relStart = clip.startTime + ((seg.start - firstSeg.start) / totalSpan) * clipDur;
+      const relEnd = clip.startTime + ((seg.end - firstSeg.start) / totalSpan) * clipDur;
+      return {
+        ...seg,
+        start: Number(relStart.toFixed(3)),
+        end: Number(Math.max(relStart + 0.25, relEnd).toFixed(3)),
+      };
+    });
+  }
+  if (clip.openingDialogue && clip.openingDialogue.trim()) {
+    const text = clip.openingDialogue.trim();
+    return [
+      {
+        id: `${clip.id}_fallback_seg`,
+        start: clip.startTime,
+        end: clip.endTime,
+        speaker: 'Speaker 1',
+        text,
+        words: [],
+        chunkIndex: 0,
+      },
+    ];
+  }
+  return [];
 }
 
 function formatWordCase(raw: string, style: CaptionStyleConfig): string {
@@ -541,30 +577,95 @@ export function generateAssSubtitles(
 
 export function generateSrtSubtitles(project: ProjectRecord, clip: ClipRecord): string {
   const segments = getClipSegments(project, clip);
-  const offsetSec = (clip.captionStyle.timingOffsetMs || 0) / 1000;
+  const style = clip.captionStyle;
+  const leadInSec = (style.wordLeadInMs ?? 35) / 1000;
+  const offsetSec = (style.timingOffsetMs || 0) / 1000 - leadInSec;
+  const effectiveWordsPerLine = Math.max(1, Math.min(12, style.wordsPerLine || 4));
+  const wordsPerGroup = Math.max(1, Math.min(18, effectiveWordsPerLine * (style.maxLines || 2)));
+  const clipDur = Math.max(1, clip.endTime - clip.startTime);
+
   const blocks: string[] = [];
   let index = 1;
 
   for (const seg of segments) {
-    const start = Math.max(0, seg.start - clip.startTime + offsetSec);
-    const end = Math.min(clip.duration, Math.max(start + 0.2, seg.end - clip.startTime + offsetSec));
-    if (end <= 0 || start >= clip.duration) continue;
-    blocks.push(`${index}\n${formatSrtTime(start)} --> ${formatSrtTime(end)}\n${seg.text.trim()}\n`);
-    index++;
+    if (seg.words && seg.words.length > 0) {
+      for (let i = 0; i < seg.words.length; i += wordsPerGroup) {
+        const group = seg.words.slice(i, i + wordsPerGroup);
+        if (group.length === 0) continue;
+        const start = Math.max(0, group[0].start - clip.startTime + offsetSec);
+        const end = Math.min(
+          clipDur,
+          Math.max(start + 0.18, group[group.length - 1].end - clip.startTime + offsetSec)
+        );
+        if (end <= 0 || start >= clipDur) continue;
+        const lines: string[] = [];
+        for (let k = 0; k < group.length; k += effectiveWordsPerLine) {
+          const lineTokens = group
+            .slice(k, k + effectiveWordsPerLine)
+            .map((w) => formatWordCase(w.word, style));
+          lines.push(lineTokens.join(' '));
+        }
+        blocks.push(`${index}\n${formatSrtTime(start)} --> ${formatSrtTime(end)}\n${lines.join('\n')}\n`);
+        index++;
+      }
+    } else {
+      const start = Math.max(0, seg.start - clip.startTime + offsetSec);
+      const end = Math.min(clipDur, Math.max(start + 0.2, seg.end - clip.startTime + offsetSec));
+      if (end <= 0 || start >= clipDur) continue;
+      const formattedText = seg.text
+        .trim()
+        .split(/\s+/)
+        .map((w) => formatWordCase(w, style))
+        .join(' ');
+      blocks.push(`${index}\n${formatSrtTime(start)} --> ${formatSrtTime(end)}\n${formattedText}\n`);
+      index++;
+    }
   }
   return blocks.join('\n');
 }
 
 export function generateVttSubtitles(project: ProjectRecord, clip: ClipRecord): string {
   const segments = getClipSegments(project, clip);
-  const offsetSec = (clip.captionStyle.timingOffsetMs || 0) / 1000;
+  const style = clip.captionStyle;
+  const leadInSec = (style.wordLeadInMs ?? 35) / 1000;
+  const offsetSec = (style.timingOffsetMs || 0) / 1000 - leadInSec;
+  const effectiveWordsPerLine = Math.max(1, Math.min(12, style.wordsPerLine || 4));
+  const wordsPerGroup = Math.max(1, Math.min(18, effectiveWordsPerLine * (style.maxLines || 2)));
+  const clipDur = Math.max(1, clip.endTime - clip.startTime);
+
   const blocks: string[] = ['WEBVTT\n'];
 
   for (const seg of segments) {
-    const start = Math.max(0, seg.start - clip.startTime + offsetSec);
-    const end = Math.min(clip.duration, Math.max(start + 0.2, seg.end - clip.startTime + offsetSec));
-    if (end <= 0 || start >= clip.duration) continue;
-    blocks.push(`${formatVttTime(start)} --> ${formatVttTime(end)}\n${seg.text.trim()}\n`);
+    if (seg.words && seg.words.length > 0) {
+      for (let i = 0; i < seg.words.length; i += wordsPerGroup) {
+        const group = seg.words.slice(i, i + wordsPerGroup);
+        if (group.length === 0) continue;
+        const start = Math.max(0, group[0].start - clip.startTime + offsetSec);
+        const end = Math.min(
+          clipDur,
+          Math.max(start + 0.18, group[group.length - 1].end - clip.startTime + offsetSec)
+        );
+        if (end <= 0 || start >= clipDur) continue;
+        const lines: string[] = [];
+        for (let k = 0; k < group.length; k += effectiveWordsPerLine) {
+          const lineTokens = group
+            .slice(k, k + effectiveWordsPerLine)
+            .map((w) => formatWordCase(w.word, style));
+          lines.push(lineTokens.join(' '));
+        }
+        blocks.push(`${formatVttTime(start)} --> ${formatVttTime(end)}\n${lines.join('\n')}\n`);
+      }
+    } else {
+      const start = Math.max(0, seg.start - clip.startTime + offsetSec);
+      const end = Math.min(clipDur, Math.max(start + 0.2, seg.end - clip.startTime + offsetSec));
+      if (end <= 0 || start >= clipDur) continue;
+      const formattedText = seg.text
+        .trim()
+        .split(/\s+/)
+        .map((w) => formatWordCase(w, style))
+        .join(' ');
+      blocks.push(`${formatVttTime(start)} --> ${formatVttTime(end)}\n${formattedText}\n`);
+    }
   }
   return blocks.join('\n');
 }
@@ -708,13 +809,10 @@ export async function renderChromaCaptionsMp4(params: {
   chromaHex: string;
 }> {
   const { project, clip } = params;
-  if (!project.metadata) {
-    throw new Error('Video metadata is missing.');
-  }
 
   const segments = getClipSegments(project, clip);
   if (segments.length === 0) {
-    throw new Error('No caption segments available yet. Please generate captions first.');
+    throw new Error('No caption segments available yet. Please click "Analyze Clip Audio & Generate Captions" first.');
   }
 
   const clipDir = path.resolve(store.getProjectDir(project.id), 'clips', clip.id);
@@ -723,8 +821,8 @@ export async function renderChromaCaptionsMp4(params: {
   const rawHex = (params.chromaColor || '#00FF00').trim().replace(/^#/, '');
   const cleanHex = /^[0-9A-Fa-f]{6}$/.test(rawHex) ? rawHex.toUpperCase() : '00FF00';
 
-  const inW = project.metadata.width || 1920;
-  const inH = project.metadata.height || 1080;
+  const inW = project.metadata?.width || 1920;
+  const inH = project.metadata?.height || 1080;
   const preserveOriginal = Boolean(
     clip.preserveOriginalVideo ||
       clip.isFullVideoCaption ||
@@ -740,11 +838,11 @@ export async function renderChromaCaptionsMp4(params: {
     inH
   );
 
-  const outFps = Math.min(60, Math.max(24, Math.round(project.metadata.fps || 30)));
+  const outFps = Math.min(60, Math.max(24, Math.round(project.metadata?.fps || 30)));
   const clipDur = Math.max(1, Number((clip.endTime - clip.startTime).toFixed(3)));
   const isFullVideo =
     Boolean(clip.isFullVideoCaption) ||
-    (clip.startTime <= 0.05 && clip.endTime >= (project.metadata.duration || 0) - 0.15);
+    (clip.startTime <= 0.05 && clip.endTime >= (project.metadata?.duration || clipDur) - 0.15);
 
   // Ensure crisp dark outline stroke around text when rendering over bright Chroma Green (#00FF00)
   // so external Chroma Key / Ultra Key filters cut cleanly without edge spill
@@ -778,8 +876,23 @@ export async function renderChromaCaptionsMp4(params: {
 
   const hasSourceAudio =
     Boolean(project.sourcePath && fs.existsSync(project.sourcePath)) &&
-    (project.metadata.audioCodec || 'none').toLowerCase() !== 'none';
+    (project.metadata?.audioCodec || 'aac').toLowerCase() !== 'none';
   const includeAudio = params.includeAudio !== false && hasSourceAudio;
+
+  // Cap chroma canvas resolution to 1080p max so solid-color captions-only MP4 renders in 1-4 seconds even for long videos
+  const safeResolution: ExportResolution =
+    effectiveResolution === '4k' || (effectiveResolution === 'original' && Math.max(outW, outH) > 1920)
+      ? '1080p'
+      : effectiveResolution;
+  const { width: finalW, height: finalH } = getOutputDimensions(
+    effectiveAspectRatio,
+    safeResolution,
+    inW,
+    inH
+  );
+  if (finalW !== outW || finalH !== outH) {
+    fs.writeFileSync(assPath, generateAssSubtitles(project, chromaClip, finalW, finalH), 'utf-8');
+  }
 
   const args: string[] = [
     '-loglevel',
@@ -788,7 +901,7 @@ export async function renderChromaCaptionsMp4(params: {
     '-f',
     'lavfi',
     '-i',
-    `color=c=0x${cleanHex}:s=${outW}x${outH}:r=${outFps}:d=${clipDur.toFixed(3)}`,
+    `color=c=0x${cleanHex}:s=${finalW}x${finalH}:r=${outFps}:d=${clipDur.toFixed(3)}`,
   ];
 
   if (includeAudio && project.sourcePath) {
@@ -807,9 +920,11 @@ export async function renderChromaCaptionsMp4(params: {
     '-c:v',
     'libx264',
     '-preset',
-    'veryfast',
+    'ultrafast',
+    '-tune',
+    'animation',
     '-crf',
-    '16',
+    '17',
     '-pix_fmt',
     'yuv420p',
     ...(includeAudio ? ['-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-shortest'] : ['-an']),
