@@ -1900,19 +1900,37 @@ async function createServer() {
     next();
   });
 
-  // Mount Vite dev server middleware or serve built dist/
+  // Bind and listen on PORT immediately so health checks and dev server readiness probes succeed in <200ms,
+  // while Vite middleware initializes in the background.
+  let viteMiddleware: express.RequestHandler | null = null;
+  let viteInitPromise: Promise<void> | null = null;
+
   if (process.env.NODE_ENV !== 'production') {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: {
-        middlewareMode: true,
-        allowedHosts: true,
-        hmr: false,
-        watch: null,
-      },
-      appType: 'spa',
+    viteInitPromise = (async () => {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: {
+          middlewareMode: true,
+          allowedHosts: true,
+          hmr: false,
+          watch: null,
+        },
+        appType: 'spa',
+      });
+      viteMiddleware = vite.middlewares;
+    })().catch((err) => {
+      console.error('[SkaDoosh Server] Vite middleware init error:', err);
     });
-    app.use(vite.middlewares);
+
+    app.use(async (req, res, next) => {
+      if (!viteMiddleware && viteInitPromise) {
+        await viteInitPromise;
+      }
+      if (viteMiddleware) {
+        return viteMiddleware(req, res, next);
+      }
+      next();
+    });
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distDir));
@@ -1928,7 +1946,7 @@ async function createServer() {
       : undefined;
   const PORT = Number(cliPort || process.env.PORT || 3000);
   const httpServer = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`ClipGenius AI server running at http://0.0.0.0:${PORT}`);
+    console.log(`SkaDoosh server running at http://0.0.0.0:${PORT}`);
   });
   // Keep Node's keep-alive timeout above Nginx/Cloud Run proxy timeouts to prevent 502 -> warmup HTML 200 races
   httpServer.keepAliveTimeout = 65_000;

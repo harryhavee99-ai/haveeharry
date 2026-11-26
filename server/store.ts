@@ -161,26 +161,17 @@ class Store {
   }
 
   public getStorageUsageBytes(): { totalBytes: number; projectCount: number; clipCount: number } {
-    const walk = (dir: string): number => {
-      if (!fs.existsSync(dir)) return 0;
-      let total = 0;
-      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-        const full = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          total += walk(full);
-        } else {
-          try {
-            total += fs.statSync(full).size;
-          } catch {
-            // ignore transient files
-          }
-        }
+    let totalBytes = 0;
+    let clipCount = 0;
+    for (const p of this.state.projects) {
+      totalBytes += Number(p.fileSize || p.metadata?.fileSize || 0);
+      clipCount += p.clips.length;
+      for (const c of p.clips) {
+        totalBytes += Number(c.renderedFileSize || 0);
       }
-      return total;
-    };
-    const clipCount = this.state.projects.reduce((acc, p) => acc + p.clips.length, 0);
+    }
     return {
-      totalBytes: walk(PROJECTS_DIR),
+      totalBytes,
       projectCount: this.state.projects.length,
       clipCount,
     };

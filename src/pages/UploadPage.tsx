@@ -104,7 +104,7 @@ export function UploadPage({ settings, onStartAnalysis, onCreateTranscriptProjec
         targetClipDuration: settings.defaultClipDuration,
         clipCount: settings.defaultClipCount,
         language: settings.defaultLanguage,
-        aspectRatio: settings.defaultAspectRatio,
+        aspectRatio: 'original',
         framingMode: settings.defaultFramingMode,
         captionPresetId: settings.defaultCaptionPresetId,
         stylePresetId: settings.defaultStylePresetId,
@@ -485,36 +485,92 @@ export function UploadPage({ settings, onStartAnalysis, onCreateTranscriptProjec
             </div>
           )}
 
-          {/* Uploaded Video Preview & Probed Metadata */}
-          {uploadedProject && (
+          {/* Uploaded Video Preview & Probed Metadata — Displays in Original Source Size & Aspect Ratio with Multi-Aspect Review Switcher */}
+          {uploadedProject && (() => {
+            const natW = uploadedProject.metadata?.width && uploadedProject.metadata.width >= 64 ? uploadedProject.metadata.width : 1920;
+            const natH = uploadedProject.metadata?.height && uploadedProject.metadata.height >= 64 ? uploadedProject.metadata.height : 1080;
+            const natRatio = natW / natH;
+            const activeUploadPreviewRatio =
+              config.aspectRatio === 'original'
+                ? natRatio
+                : config.aspectRatio === '9:16'
+                  ? 9 / 16
+                  : config.aspectRatio === '16:9'
+                    ? 16 / 9
+                    : config.aspectRatio === '1:1'
+                      ? 1
+                      : config.aspectRatio === '4:5'
+                        ? 4 / 5
+                        : 4 / 3;
+            const isVerticalView = activeUploadPreviewRatio < 0.9;
+            return (
             <div className="rounded-xl studio-panel overflow-hidden">
-              <div className="aspect-video bg-black relative">
-                {uploadedProject.sourceUrl && !previewError ? (
-                  <video
-                    src={uploadedProject.sourceUrl}
-                    poster={uploadedProject.thumbnailUrl}
-                    controls
-                    playsInline
-                    preload="metadata"
-                    onError={() => setPreviewError(true)}
-                    className="w-full h-full object-contain"
-                  />
-                ) : (
-                  <div className="w-full h-full flex items-center justify-center relative text-center p-4">
-                    {uploadedProject.thumbnailUrl && (
-                      <img
-                        src={uploadedProject.thumbnailUrl}
-                        alt={uploadedProject.originalFilename}
-                        className="absolute inset-0 w-full h-full object-cover opacity-35"
-                      />
-                    )}
-                    <div className="relative z-10 px-4 py-2.5 rounded-lg bg-black/75 border border-[#D4AF37]/25 text-xs text-zinc-200 max-w-md">
-                      {uploadedProject.browserProxyStatus === 'transcoding'
-                        ? 'Preparing H.264 browser preview in background — you can start AI analysis immediately.'
-                        : 'Video uploaded and verified by FFprobe. Rendered MP4 clips will play in universal H.264/AAC.'}
+              <div className="px-4 py-2.5 bg-[#09140E] border-b border-[#D4AF37]/20 flex flex-wrap items-center justify-between gap-2 text-xs">
+                <span className="inline-flex items-center gap-1.5 font-semibold text-emerald-300">
+                  <ShieldCheck className="w-3.5 h-3.5 text-[#F5C451]" />
+                  Original Source View ({natW}×{natH})
+                </span>
+                <div className="flex flex-wrap items-center gap-1">
+                  <span className="text-[11px] text-zinc-400 mr-1">Review Frame:</span>
+                  {(
+                    [
+                      { id: 'original', label: `Original (${natW}×${natH})` },
+                      { id: '9:16', label: '9:16 Vertical' },
+                      { id: '16:9', label: '16:9 Horizontal' },
+                      { id: '1:1', label: '1:1 Square' },
+                      { id: '4:5', label: '4:5 Portrait' },
+                    ] as Array<{ id: AspectRatio; label: string }>
+                  ).map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => setConfig((c) => ({ ...c, aspectRatio: opt.id }))}
+                      className={`px-2 py-0.5 rounded font-mono text-[10px] font-semibold transition-colors ${
+                        config.aspectRatio === opt.id
+                          ? 'bg-[#059669] text-white border border-[#F5C451]/60'
+                          : 'bg-[#0E1913] text-zinc-300 hover:bg-[#15261D] border border-[#D4AF37]/15'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="bg-[#050A07] p-3 flex justify-center">
+                <div
+                  style={{ aspectRatio: String(activeUploadPreviewRatio) }}
+                  className={`relative w-full ${
+                    isVerticalView ? 'max-w-[330px] max-h-[520px]' : 'max-w-full max-h-[480px]'
+                  } bg-black rounded-lg overflow-hidden border border-white/[0.12] shadow-xl`}
+                >
+                  {uploadedProject.sourceUrl && !previewError ? (
+                    <video
+                      src={uploadedProject.sourceUrl}
+                      poster={uploadedProject.thumbnailUrl}
+                      controls
+                      playsInline
+                      preload="metadata"
+                      onError={() => setPreviewError(true)}
+                      className="w-full h-full object-contain"
+                    />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center relative text-center p-4">
+                      {uploadedProject.thumbnailUrl && (
+                        <img
+                          src={uploadedProject.thumbnailUrl}
+                          alt={uploadedProject.originalFilename}
+                          className="absolute inset-0 w-full h-full object-contain opacity-45"
+                        />
+                      )}
+                      <div className="relative z-10 px-4 py-2.5 rounded-lg bg-black/75 border border-[#D4AF37]/25 text-xs text-zinc-200 max-w-md">
+                        {uploadedProject.browserProxyStatus === 'transcoding'
+                          ? 'Preparing H.264 browser preview in background — you can start AI analysis immediately.'
+                          : 'Video uploaded and verified by FFprobe. Rendered MP4 clips will play in universal H.264/AAC.'}
+                      </div>
                     </div>
-                  </div>
-                )}
+                  )}
+                </div>
               </div>
               <div className="p-5 space-y-4">
                 <div className="flex items-start justify-between gap-4">
@@ -568,7 +624,8 @@ export function UploadPage({ settings, onStartAnalysis, onCreateTranscriptProjec
                 )}
               </div>
             </div>
-          )}
+            );
+          })()}
         </div>
 
         {/* Right: Workflow Mode & AI Configuration */}

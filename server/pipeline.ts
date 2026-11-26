@@ -1996,7 +1996,16 @@ export async function runAnalysisPipeline(projectId: string): Promise<void> {
         return clip;
       });
 
-      project.clips = generatedClips;
+      // Always prepend a Full Original Video Captions track (aspectRatio: 'original', preserveOriginalVideo: true)
+      // so whenever a user uploads a video, it is immediately viewable and captionable in its exact original style & size!
+      const existingFullTrack = project.clips.find((c) => c.isFullVideoCaption);
+      const fullOriginalTrack = buildFullVideoCaptionClip(
+        project,
+        project.analysisConfig.captionPresetId,
+        existingFullTrack?.id
+      );
+
+      project.clips = [fullOriginalTrack, ...generatedClips];
       fs.mkdirSync(clipsDir, { recursive: true });
       for (let i = 0; i < project.clips.length; i++) {
         const clip = project.clips[i];

@@ -942,12 +942,12 @@ export function CaptionStudioPage({
               </span>
             </div>
 
-            <div className={isLandscapePreview ? 'w-full' : 'w-full max-w-[300px]'}>
+            <div className="w-full">
               <ClipPreviewPlayer
                 project={project}
                 clip={previewClip}
                 currentTime={seekTime}
-                maxHeightClass={isLandscapePreview ? 'max-h-[340px]' : 'max-h-[430px]'}
+                maxHeightClass="max-h-[430px]"
                 chromaPreviewColor={chromaPreviewEnabled ? chromaColor : null}
               />
             </div>
