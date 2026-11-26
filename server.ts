@@ -25,7 +25,9 @@ import {
   buildFullVideoCaptionClip,
   createInitialPipelineStages,
   createRealSampleVideoProject,
+  createStandaloneTranscriptCaptionProject,
   extractThumbnail,
+  importTranscriptIntoProjectClip,
   isPipelineRunning,
   probeVideoFile,
   refreshHookCandidateTranscriptFields,
@@ -91,7 +93,7 @@ const ALLOWED_EXTENSIONS = new Set([
   '.ogv',
   '.vob',
 ]);
-const CHUNK_SIZE_BYTES = 2 * 1024 * 1024; // 2 MB proxy-safe chunks (supports unlimited file sizes & durations)
+const CHUNK_SIZE_BYTES = 4 * 1024 * 1024; // 4 MB high-speed proxy-safe chunks (supports parallel worker streaming & unlimited file sizes)
 
 let cachedCaps: Omit<SystemCapabilities, 'geminiConfigured'> | null = null;
 
@@ -1279,6 +1281,79 @@ async function createServer() {
         error: err,
       });
       res.status(500).json({ error: safeErr });
+    }
+  });
+
+  // Standalone Transcript-to-Animated-Captions Studio Project Creator (.SRT, .VTT, .TXT, .ASS, .JSON -> Animated Captions MP4)
+  app.post('/api/projects/from-transcript', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as {
+        name?: string;
+        content?: string;
+        filename?: string;
+        language?: string;
+        aspectRatio?: '9:16' | '16:9' | '1:1' | '4:5';
+        captionPresetId?: string;
+        animation?: ClipRecord['captionStyle']['animation'];
+        targetDurationSeconds?: number;
+      };
+      if (!body.content || typeof body.content !== 'string' || !body.content.trim()) {
+        return res.status(400).json({
+          error: 'Please upload a transcript file (.SRT, .VTT, .TXT, .ASS, .JSON) or paste transcript text.',
+        });
+      }
+      const result = await createStandaloneTranscriptCaptionProject({
+        name: body.name,
+        content: body.content,
+        filename: body.filename,
+        language: body.language,
+        aspectRatio: body.aspectRatio,
+        captionPresetId: body.captionPresetId,
+        animation: body.animation,
+        targetDurationSeconds: body.targetDurationSeconds,
+      });
+      res.json(result);
+    } catch (err) {
+      const safeErr = logBackendError({
+        stage: 'create_transcript_caption_project',
+        httpStatus: 400,
+        route: 'POST /api/projects/from-transcript',
+        error: err,
+      });
+      res.status(400).json({ error: safeErr });
+    }
+  });
+
+  // Import Transcript File (.SRT, .VTT, .TXT, .ASS, .JSON) or Pasted Transcript into an existing Clip
+  app.post('/api/projects/:id/clips/:clipId/import-transcript', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as {
+        content?: string;
+        filename?: string;
+        syncWithAudio?: boolean;
+      };
+      if (!body.content || typeof body.content !== 'string' || !body.content.trim()) {
+        return res.status(400).json({
+          error: 'Transcript content is empty. Upload a valid .SRT, .VTT, .TXT, .ASS, or .JSON file.',
+        });
+      }
+      const result = await importTranscriptIntoProjectClip({
+        projectId: req.params.id,
+        clipId: req.params.clipId,
+        content: body.content,
+        filename: body.filename,
+        syncWithAudio: body.syncWithAudio,
+      });
+      res.json(result);
+    } catch (err) {
+      const safeErr = logBackendError({
+        projectId: req.params.id,
+        stage: 'import_clip_transcript',
+        httpStatus: 400,
+        route: 'POST /api/projects/:id/clips/:clipId/import-transcript',
+        error: err,
+      });
+      res.status(400).json({ error: safeErr });
     }
   });
 

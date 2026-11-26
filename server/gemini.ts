@@ -224,7 +224,153 @@ export interface ChunkTranscriptionResult {
   segments: TranscriptSegment[];
 }
 
-function parseTimestampedTranscriptLines(
+function buildLanguageDirective(language: string): string {
+  switch (language) {
+    case 'hinglish':
+      return [
+        'LANGUAGE & SCRIPT RULE (HIGH-END HINGLISH):',
+        'Transcribe the spoken Hindi/Urdu/English speech verbatim in clean, natural HINGLISH (Latin/Roman alphabet mixing conversational Hindi and English exactly as spoken by modern Indian/South Asian creators).',
+        'Use natural, readable Roman spelling for Hindi words (e.g., "Aaj hum baat karenge kaise aap apne video captions ko high-end bana sakte hain") and standard English spelling for English words.',
+        'NEVER use Devanagari (हिन्दी) or Urdu Arabic script (اردو). Add crisp punctuation (?, !, ., ,) and natural capitalization.',
+      ].join(' ');
+    case 'roman_ur':
+      return [
+        'LANGUAGE & SCRIPT RULE (HIGH-END ROMAN URDU):',
+        'Transcribe the spoken Urdu/Hindi/English speech verbatim in authentic, studio-grade ROMAN URDU (Latin alphabet used for Urdu).',
+        'Use natural Pakistani/South Asian Roman Urdu orthography (e.g., "Agar aap ko yeh video pasand aayi toh zaroor dekhein ke captions kaise kaam karte hain", using clear spellings like "hain", "mein", "aur", "kyunke", "lekin", "zaroor", "bohat", "aap").',
+        'Keep spoken English technical terms in clean English spelling. NEVER use Urdu Nastaliq/Arabic script (اردو) or Devanagari. Add accurate punctuation and capitalization.',
+      ].join(' ');
+    case 'ur':
+      return [
+        'LANGUAGE & SCRIPT RULE (HIGH-END URDU NASTALIQ / اردو):',
+        'Transcribe the spoken audio in authentic, grammatically accurate Urdu script (اردو / Nastaliq Arabic script).',
+        'Use proper Urdu spelling, spacing, and punctuation (۔ ، ؟ !). If the speaker uses English words, either transliterate them cleanly into Urdu script or keep short acronyms clear.',
+      ].join(' ');
+    case 'hi':
+      return [
+        'LANGUAGE & SCRIPT RULE (HINDI / हिन्दी):',
+        'Transcribe the spoken audio in clean, accurate Hindi Devanagari script (हिन्दी) with proper punctuation.',
+      ].join(' ');
+    case 'en':
+      return [
+        'LANGUAGE & SCRIPT RULE (ENGLISH):',
+        'Transcribe the spoken audio in clean English. If the speaker speaks Urdu or Hindi, translate/transcribe accurately into natural spoken English matching the exact phrase timing.',
+      ].join(' ');
+    case 'auto':
+    default:
+      if (language && language !== 'auto') {
+        return `Transcribe the spoken audio verbatim in language code "${language}" with accurate punctuation and capitalization.`;
+      }
+      return 'Detect the spoken language automatically and transcribe verbatim in the original spoken language (for Urdu/Hindi mixed with English, you may use clean Roman Urdu / Hinglish or original script matching the speaker).';
+  }
+}
+
+/**
+ * Splits plain untimestamped verbatim ASR text into natural 4-7 word breath-group segments
+ * distributed across [0, chunkDurationSeconds] according to syllable & punctuation weights.
+ * Downstream `alignTranscriptWithVoiceActivity` in pipeline.ts then snaps these phrases directly
+ * onto the actual FFmpeg voiceover waveform islands.
+ */
+function segmentPlainTextIntoPhrases(
+  rawText: string,
+  chunkIndex: number,
+  chunkOffsetSeconds: number,
+  chunkDurationSeconds: number
+): TranscriptSegment[] {
+  const cleaned = rawText
+    .replace(/\[NO_SPEECH\]/gi, '')
+    .replace(/^```[a-z]*\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+  if (!cleaned) return [];
+
+  // Strip any leading speaker prefix if present on paragraphs
+  const words = cleaned
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter(Boolean);
+  if (words.length === 0) return [];
+
+  const phrases: string[] = [];
+  let current: string[] = [];
+
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    current.push(w);
+    const endsSentence = /[.!?؟۔]+["')\]}]*$/.test(w);
+    const endsClause = /[,;:—–\-]+["')\]}]*$/.test(w);
+    if (
+      (endsSentence && current.length >= 2) ||
+      (endsClause && current.length >= 4) ||
+      current.length >= 6
+    ) {
+      phrases.push(current.join(' '));
+      current = [];
+    }
+  }
+  if (current.length > 0) {
+    if (phrases.length > 0 && current.length <= 2) {
+      phrases[phrases.length - 1] += ' ' + current.join(' ');
+    } else {
+      phrases.push(current.join(' '));
+    }
+  }
+
+  if (phrases.length === 0) return [];
+
+  // Calculate relative speaking duration weight per phrase
+  const phraseWeights = phrases.map((p) => {
+    const wordCount = p.split(/\s+/).length;
+    const charBonus = p.length * 0.08;
+    const pauseBonus = /[.!?؟۔]$/.test(p) ? 0.9 : /[,;:]$/.test(p) ? 0.45 : 0.2;
+    return Math.max(1, wordCount * 0.85 + charBonus + pauseBonus);
+  });
+
+  const totalWeight = phraseWeights.reduce((acc, w) => acc + w, 0);
+  // Estimate natural speech span (avoid stretching a 3-word sentence across 60 seconds)
+  const estimatedSpeechSpan = Math.min(
+    chunkDurationSeconds,
+    Math.max(Math.min(chunkDurationSeconds, 1.5), words.length * 0.44 + phrases.length * 0.35)
+  );
+  // If estimated speech is much shorter than chunkDurationSeconds, still cover up to 92% of chunk so voice activity aligner can map it across islands
+  const usableDuration = Math.max(
+    estimatedSpeechSpan,
+    Math.min(chunkDurationSeconds, chunkDurationSeconds * 0.92)
+  );
+
+  let cursor = 0;
+  const segments: TranscriptSegment[] = [];
+
+  for (let i = 0; i < phrases.length; i++) {
+    const slot = (phraseWeights[i] / totalWeight) * usableDuration;
+    const gap = i < phrases.length - 1 ? Math.min(0.14, slot * 0.08) : 0;
+    const localStart = Math.max(0, Math.min(chunkDurationSeconds - 0.15, cursor));
+    const localEnd = Math.max(
+      localStart + 0.25,
+      Math.min(chunkDurationSeconds, cursor + Math.max(0.25, slot - gap))
+    );
+    cursor += slot;
+
+    const absStart = Number((chunkOffsetSeconds + localStart).toFixed(3));
+    const absEnd = Number((chunkOffsetSeconds + localEnd).toFixed(3));
+    const text = phrases[i].replace(/^(?:Speaker\s*\d+|Host|Guest)\s*:\s*/i, '').trim();
+    if (!text) continue;
+
+    segments.push({
+      id: uuidv4(),
+      start: absStart,
+      end: absEnd,
+      speaker: 'Speaker 1',
+      text,
+      words: buildWordTimings(text, absStart, absEnd),
+      chunkIndex,
+    });
+  }
+
+  return segments;
+}
+
+export function parseTimestampedTranscriptLines(
   rawText: string,
   chunkIndex: number,
   chunkOffsetSeconds: number,
@@ -237,7 +383,7 @@ function parseTimestampedTranscriptLines(
     .filter(Boolean);
 
   const parseSec = (val: string): number => {
-    const clean = val.trim().replace(/s$/i, '');
+    const clean = val.trim().replace(/,/g, '.').replace(/s$/i, '');
     if (clean.includes(':')) {
       const parts = clean.split(':').map(Number);
       if (parts.length === 2 && parts.every(Number.isFinite)) return parts[0] * 60 + parts[1];
@@ -247,36 +393,89 @@ function parseTimestampedTranscriptLines(
     return Number.isFinite(n) ? n : NaN;
   };
 
-  // Matches formats like: [0.0 - 5.2] Speaker 1: Hello world  OR  [00:00 - 00:05] Hello world
-  const lineRe = /^\[?\s*([0-9:.]+s?)\s*[-–—to]+\s*([0-9:.]+s?)\s*\]?\s*(?:([^:]{1,28}):\s*)?(.+)$/i;
+  // 1. Matches range formats like: [0.0 - 5.2] Speaker 1: Hello world OR 00:00.400 --> 00:03.200 Hello
+  const rangeLineRe =
+    /^\[?\s*([0-9:.,]+s?)\s*(?:[-–—]+|-->|to)\s*([0-9:.,]+s?)\s*\]?\s*(?:[-|]\s*)?(?:([^:]{1,28}):\s*)?(.+)$/i;
+
+  // 2. Matches single start timestamp formats like: [00:02.4] Hello world OR (1.5s) Hello world
+  const singleTsEntries: Array<{ start: number; speaker: string; text: string }> = [];
+  const singleLineRe = /^[\[({]?\s*([0-9]+:[0-9:.,]+|[0-9]+\.[0-9]+s?|[0-9]+s)\s*[\])}]?\s*(?:[-|]\s*)?(?:([^:]{1,24}):\s*)?(.+)$/i;
+
   for (const line of lines) {
-    const m = line.match(lineRe);
-    if (!m) continue;
-    const rawStart = parseSec(m[1]);
-    const rawEnd = parseSec(m[2]);
-    const speaker = (m[3] || 'Speaker 1').trim();
-    const text = m[4].trim();
-    if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd) || !text || text === '[NO_SPEECH]') continue;
-    const localStart = Math.max(0, Math.min(chunkDurationSeconds - 0.1, rawStart));
-    const localEnd = Math.max(localStart + 0.25, Math.min(chunkDurationSeconds, rawEnd));
-    const absStart = Number((chunkOffsetSeconds + localStart).toFixed(3));
-    const absEnd = Number((chunkOffsetSeconds + localEnd).toFixed(3));
-    segments.push({
-      id: uuidv4(),
-      start: absStart,
-      end: absEnd,
-      speaker,
-      text,
-      words: buildWordTimings(text, absStart, absEnd),
-      chunkIndex,
-    });
+    if (/^\d+$/.test(line) || /^WEBVTT/i.test(line)) continue;
+    const m = line.match(rangeLineRe);
+    if (m) {
+      const rawStart = parseSec(m[1]);
+      const rawEnd = parseSec(m[2]);
+      const speaker = (m[3] || 'Speaker 1').trim();
+      const text = m[4].trim();
+      if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd) || !text || text === '[NO_SPEECH]') continue;
+      const localStart = Math.max(0, Math.min(chunkDurationSeconds - 0.1, rawStart));
+      const localEnd = Math.max(localStart + 0.25, Math.min(chunkDurationSeconds, rawEnd));
+      const absStart = Number((chunkOffsetSeconds + localStart).toFixed(3));
+      const absEnd = Number((chunkOffsetSeconds + localEnd).toFixed(3));
+      segments.push({
+        id: uuidv4(),
+        start: absStart,
+        end: absEnd,
+        speaker,
+        text,
+        words: buildWordTimings(text, absStart, absEnd),
+        chunkIndex,
+      });
+      continue;
+    }
+
+    const sMatch = line.match(singleLineRe);
+    if (sMatch) {
+      const rawStart = parseSec(sMatch[1]);
+      const speaker = (sMatch[2] || 'Speaker 1').trim();
+      const text = sMatch[3].trim();
+      if (Number.isFinite(rawStart) && text && text !== '[NO_SPEECH]') {
+        singleTsEntries.push({ start: rawStart, speaker, text });
+      }
+    }
   }
-  return segments;
+
+  if (segments.length > 0) {
+    return segments;
+  }
+
+  if (singleTsEntries.length > 0) {
+    for (let i = 0; i < singleTsEntries.length; i++) {
+      const curr = singleTsEntries[i];
+      const nextStart = i + 1 < singleTsEntries.length ? singleTsEntries[i + 1].start : chunkDurationSeconds;
+      const localStart = Math.max(0, Math.min(chunkDurationSeconds - 0.1, curr.start));
+      const estDur = Math.max(0.4, Math.min(4.5, curr.text.split(/\s+/).length * 0.45));
+      const localEnd = Math.max(
+        localStart + 0.25,
+        Math.min(chunkDurationSeconds, Math.min(nextStart - 0.04, localStart + estDur))
+      );
+      const absStart = Number((chunkOffsetSeconds + localStart).toFixed(3));
+      const absEnd = Number((chunkOffsetSeconds + localEnd).toFixed(3));
+      segments.push({
+        id: uuidv4(),
+        start: absStart,
+        end: absEnd,
+        speaker: curr.speaker,
+        text: curr.text,
+        words: buildWordTimings(curr.text, absStart, absEnd),
+        chunkIndex,
+      });
+    }
+    return segments;
+  }
+
+  // 3. Fallback: If the ASR model returned clean spoken text without timestamp brackets,
+  // segment it directly into natural breath phrases so we NEVER discard valid transcription
+  // or re-upload the heavy audio binary a second time!
+  return segmentPlainTextIntoPhrases(rawText, chunkIndex, chunkOffsetSeconds, chunkDurationSeconds);
 }
 
 /**
- * Transcribes a single audio chunk using Gemini 3.5 Transcribe (verbatim spoken speech)
- * with fast single-pass timestamp parsing and Gemini 4 Hydrogen structured fallback alignment.
+ * Transcribes a single audio chunk using a resilient 3-tier Gemini audio pipeline
+ * (gemini-3.5-transcribe -> gemini-4-hydrogen -> gemini-3.1-flash-lite)
+ * with single-pass timestamp/phrase parsing so we never double-send audio tokens.
  */
 export async function transcribeAudioChunk(params: {
   audioPath: string;
@@ -289,19 +488,13 @@ export async function transcribeAudioChunk(params: {
   const audioBuffer = fs.readFileSync(params.audioPath);
   const base64Audio = audioBuffer.toString('base64');
 
-  const languageDirective =
-    params.language === 'auto'
-      ? 'Detect the spoken language automatically and transcribe verbatim in the original spoken language.'
-      : params.language === 'roman_ur'
-        ? 'Transcribe the spoken Urdu/Hindi verbatim using Roman Urdu (Latin script) with natural punctuation and capitalization.'
-        : `Transcribe the spoken audio verbatim in language code "${params.language}" with accurate punctuation and capitalization.`;
+  const languageDirective = buildLanguageDirective(params.language);
 
-  // Step 1: Fast single-pass timestamped speech-to-text via gemini-3.5-transcribe
-  // Guard against Free Tier 10,000 input tokens/min limit (~32 audio tokens/sec -> max ~240s per chunk)
-  // and skip immediately during active rate-limit cooldowns to route cleanly to gemini-4-hydrogen.
+  // Step 1: Fast single-pass speech-to-text via gemini-3.5-transcribe
+  // Guard against Free Tier 10,000 input tokens/min limit (~32 audio tokens/sec)
   let verbatimReference = '';
   const canUseFastTranscribe =
-    params.chunkDurationSeconds <= 240 && Date.now() >= transcribeCooldownUntil;
+    params.chunkDurationSeconds <= 180 && Date.now() >= transcribeCooldownUntil;
 
   if (canUseFastTranscribe) {
     try {
@@ -321,7 +514,7 @@ export async function transcribeAudioChunk(params: {
                   },
                   {
                     text: [
-                      `${languageDirective}`,
+                      languageDirective,
                       `Audio duration is ${params.chunkDurationSeconds.toFixed(2)} seconds (0.00 to ${params.chunkDurationSeconds.toFixed(2)}).`,
                       `CRITICAL SYNC RULE: Split speech into short, tight phrase segments (1.2 to 3.8 seconds each, max 7 words per line).`,
                       `Set the start timestamp to the EXACT tenth-of-a-second when the speaker's voice begins the first syllable (do NOT include leading silence).`,
@@ -346,7 +539,7 @@ export async function transcribeAudioChunk(params: {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
-        const cooldownMs = extractRetryDelayMs(msg, 65_000);
+        const cooldownMs = extractRetryDelayMs(msg, 62_000);
         transcribeCooldownUntil = Date.now() + cooldownMs;
         console.log(
           `[Gemini] gemini-3.5-transcribe rate-limited (cooldown ${Math.round(cooldownMs / 1000)}s); routing chunk ${params.chunkIndex} to gemini-4-hydrogen.`
@@ -363,11 +556,13 @@ export async function transcribeAudioChunk(params: {
     );
   }
 
-  if (verbatimReference === '[NO_SPEECH]') {
+  if (verbatimReference === '[NO_SPEECH]' || /^\[?NO[_\s]SPEECH\]?$/i.test(verbatimReference)) {
     return { detectedLanguage: params.language === 'auto' ? 'en' : params.language, segments: [] };
   }
 
-  // Fast path: if gemini-3.5-transcribe already returned clean timestamped segments, skip second heavy audio pass!
+  // Fast path: if gemini-3.5-transcribe returned text (with OR without timestamp brackets),
+  // parseTimestampedTranscriptLines now handles both timestamped lines and plain text phrase segmentation,
+  // avoiding a duplicate base64 audio call!
   if (verbatimReference) {
     const directSegments = parseTimestampedTranscriptLines(
       verbatimReference,
@@ -376,6 +571,40 @@ export async function transcribeAudioChunk(params: {
       params.chunkDurationSeconds
     );
     if (directSegments.length > 0) {
+      // If user explicitly requested Hinglish or Roman Urdu and the ASR model returned Devanagari or Urdu Arabic script,
+      // run a lightweight text-only transliteration pass (costs almost zero tokens compared to audio)
+      if (
+        (params.language === 'hinglish' || params.language === 'roman_ur') &&
+        directSegments.some((s) => /[\u0600-\u06FF\u0900-\u097F]/.test(s.text))
+      ) {
+        try {
+          const translitRes = await withTimeout(
+            ai.models.generateContent({
+              model: 'gemini-3.1-flash-lite',
+              contents: [
+                languageDirective,
+                'Convert each numbered line below into clean Latin/Roman script (preserving the exact line numbers and meaning, one line per number):',
+                directSegments.map((s, i) => `${i + 1}. ${s.text}`).join('\n'),
+              ].join('\n\n'),
+            }),
+            15_000,
+            'transliterate-script'
+          );
+          const tLines = (translitRes.text ?? '')
+            .split('\n')
+            .map((l) => l.replace(/^\d+[.)]\s*/, '').trim())
+            .filter(Boolean);
+          if (tLines.length === directSegments.length) {
+            for (let i = 0; i < directSegments.length; i++) {
+              directSegments[i].text = tLines[i];
+              directSegments[i].words = buildWordTimings(tLines[i], directSegments[i].start, directSegments[i].end);
+            }
+          }
+        } catch {
+          // Keep original directSegments if transliteration helper fails
+        }
+      }
+
       return {
         detectedLanguage: params.language === 'auto' ? 'en' : params.language,
         segments: directSegments,
@@ -383,14 +612,12 @@ export async function transcribeAudioChunk(params: {
     }
   }
 
-  // Step 2: Structured timestamped diarized alignment via gemini-4-hydrogen (fallback when Step 1 had no timestamps)
+  // Step 2: Structured timestamped alignment via gemini-4-hydrogen (with fallback to gemini-3.1-flash-lite)
   const prompt = [
     `You are a frame-accurate speech-to-text forced timestamp aligner.`,
     `This audio chunk is ${params.chunkDurationSeconds.toFixed(2)} seconds long (local timestamps from 0.00 to ${params.chunkDurationSeconds.toFixed(2)} seconds).`,
     languageDirective,
-    verbatimReference
-      ? `Verbatim ASR reference transcript (use this as ground truth so you never invent dialogue):\n"""\n${verbatimReference}\n"""`
-      : 'Transcribe only words genuinely spoken in the audio. NEVER invent or hallucinate speech.',
+    'Transcribe only words genuinely spoken in the audio. NEVER invent or hallucinate speech.',
     `CRITICAL VOICEOVER SYNC RULES:`,
     `1. Break speech into short, natural breath-group phrases of 1.2 to 4.0 seconds each (4 to 8 words per segment). Whenever the speaker pauses for breath (>0.2s), end the current segment and start a new segment after the pause.`,
     `2. Set "start" to the exact moment the first syllable of the phrase becomes audible (NEVER start at 0.0 if there is leading music/silence before the voiceover starts).`,
@@ -398,58 +625,94 @@ export async function transcribeAudioChunk(params: {
     `If there is no spoken dialogue in this audio chunk, return an empty segments array.`,
   ].join('\n\n');
 
-  const t1 = Date.now();
-  const parsed = await withRetry(async () => {
-    const alignedRes = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: {
-        parts: [
-          {
-            inlineData: {
-              mimeType: 'audio/mp3',
-              data: base64Audio,
-            },
-          },
-          { text: prompt },
-        ],
+  const responseSchema = {
+    type: Type.OBJECT,
+    properties: {
+      detectedLanguage: {
+        type: Type.STRING,
+        description: 'ISO language code or name of the spoken audio.',
       },
-      config: {
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        responseMimeType: 'application/json',
-        responseSchema: {
+      segments: {
+        type: Type.ARRAY,
+        items: {
           type: Type.OBJECT,
           properties: {
-            detectedLanguage: {
-              type: Type.STRING,
-              description: 'ISO language code or name of the spoken audio.',
-            },
-            segments: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  start: { type: Type.NUMBER, description: 'Start time in seconds relative to chunk start' },
-                  end: { type: Type.NUMBER, description: 'End time in seconds relative to chunk start' },
-                  speaker: { type: Type.STRING, description: 'Speaker label such as Speaker 1' },
-                  text: { type: Type.STRING, description: 'Exact spoken words with punctuation' },
-                },
-                required: ['start', 'end', 'speaker', 'text'],
-              },
-            },
+            start: { type: Type.NUMBER, description: 'Start time in seconds relative to chunk start' },
+            end: { type: Type.NUMBER, description: 'End time in seconds relative to chunk start' },
+            speaker: { type: Type.STRING, description: 'Speaker label such as Speaker 1' },
+            text: { type: Type.STRING, description: 'Exact spoken words with punctuation' },
           },
-          required: ['detectedLanguage', 'segments'],
+          required: ['start', 'end', 'speaker', 'text'],
         },
       },
-    });
+    },
+    required: ['detectedLanguage', 'segments'],
+  };
 
-    return parseJsonSafely<{
-      detectedLanguage?: string;
-      segments?: Array<{ start: number; end: number; speaker: string; text: string }>;
-    }>(alignedRes.text, { detectedLanguage: params.language === 'auto' ? 'en' : params.language, segments: [] });
-  }, 3);
-  console.log(
-    `[Gemini] gemini-4-hydrogen alignment chunk ${params.chunkIndex} finished in ${Date.now() - t1}ms (${parsed.segments?.length ?? 0} segs)`
-  );
+  let parsed: {
+    detectedLanguage?: string;
+    segments?: Array<{ start: number; end: number; speaker: string; text: string }>;
+  } | null = null;
+
+  const fallbackModels = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'] as const;
+  let lastModelErr: unknown = null;
+
+  for (const modelName of fallbackModels) {
+    try {
+      const t1 = Date.now();
+      parsed = await withTimeout(
+        withRetry(async () => {
+          const alignedRes = await ai.models.generateContent({
+            model: modelName,
+            contents: {
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: 'audio/mp3',
+                    data: base64Audio,
+                  },
+                },
+                { text: prompt },
+              ],
+            },
+            config: {
+              ...(modelName === 'gemini-4-hydrogen'
+                ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                : {}),
+              responseMimeType: 'application/json',
+              responseSchema,
+            },
+          });
+
+          return parseJsonSafely<{
+            detectedLanguage?: string;
+            segments?: Array<{ start: number; end: number; speaker: string; text: string }>;
+          }>(alignedRes.text, {
+            detectedLanguage: params.language === 'auto' ? 'en' : params.language,
+            segments: [],
+          });
+        }, 2),
+        45_000,
+        `${modelName}-transcribe`
+      );
+      console.log(
+        `[Gemini] ${modelName} alignment chunk ${params.chunkIndex} finished in ${Date.now() - t1}ms (${parsed?.segments?.length ?? 0} segs)`
+      );
+      break;
+    } catch (err) {
+      lastModelErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[Gemini] ${modelName} failed on chunk ${params.chunkIndex} (${msg.slice(0, 140)}). Trying next fallback...`
+      );
+    }
+  }
+
+  if (!parsed) {
+    throw lastModelErr instanceof Error
+      ? lastModelErr
+      : new Error('All transcription models were temporarily busy or rate-limited.');
+  }
 
   const segments: TranscriptSegment[] = (parsed.segments ?? [])
     .filter((s) => s.text && s.text.trim().length > 0 && s.text.trim() !== '[NO_SPEECH]')

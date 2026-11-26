@@ -54,8 +54,31 @@ interface CaptionStudioPageProps {
   onResyncAudioCaptions?: (projectId: string, clipId?: string) => Promise<number>;
   onAnalyzeClipAudioCaptions?: (
     projectId: string,
-    clipId: string
+    clipId: string,
+    language?: string
   ) => Promise<{ alignedSegments: number; wordCount: number }>;
+  onCreateTranscriptProject?: (payload: {
+    name?: string;
+    content: string;
+    filename?: string;
+    language?: string;
+    aspectRatio?: '9:16' | '16:9' | '1:1' | '4:5';
+    captionPresetId?: string;
+    animation?: CaptionAnimation;
+    targetDurationSeconds?: number;
+  }) => Promise<{
+    project: ProjectRecord;
+    clip: ClipRecord;
+  }>;
+  onImportClipTranscript?: (
+    projectId: string,
+    clipId: string,
+    payload: {
+      content: string;
+      filename?: string;
+      syncWithAudio?: boolean;
+    }
+  ) => Promise<{ segmentsCount: number; wordCount: number }>;
   onExportClip: (
     projectId: string,
     clipId: string,
@@ -141,6 +164,8 @@ export function CaptionStudioPage({
   onCreateFullVideoCaptions,
   onResyncAudioCaptions,
   onAnalyzeClipAudioCaptions,
+  onCreateTranscriptProject,
+  onImportClipTranscript,
   onExportClip,
   onNavigate,
 }: CaptionStudioPageProps) {
@@ -169,6 +194,13 @@ export function CaptionStudioPage({
   const [creatingFull, setCreatingFull] = useState(false);
   const [resyncingAudio, setResyncingAudio] = useState(false);
   const [analyzingClipAudio, setAnalyzingClipAudio] = useState(false);
+  const [analysisLanguage, setAnalysisLanguage] = useState<string>(
+    project?.analysisConfig?.language || 'auto'
+  );
+  const [showImportTranscriptDrawer, setShowImportTranscriptDrawer] = useState(false);
+  const [importTranscriptText, setImportTranscriptText] = useState('');
+  const [importTranscriptFilename, setImportTranscriptFilename] = useState<string | null>(null);
+  const [importingTranscript, setImportingTranscript] = useState(false);
   const [renderingMp4, setRenderingMp4] = useState(false);
   const [downloadingMp4, setDownloadingMp4] = useState(false);
   const [downloadingSoftSub, setDownloadingSoftSub] = useState(false);
@@ -187,6 +219,12 @@ export function CaptionStudioPage({
     }
   }, [sourceClip?.id]);
 
+  useEffect(() => {
+    if (project?.analysisConfig?.language) {
+      setAnalysisLanguage(project.analysisConfig.language);
+    }
+  }, [project?.id, project?.analysisConfig?.language]);
+
   const baseSegments = useMemo(() => {
     if (!project || !sourceClip) return [];
     if (editedSegments && editedSegments.length > 0) return editedSegments;
@@ -203,19 +241,140 @@ export function CaptionStudioPage({
     return exportJobs.find((j) => j.projectId === project.id && j.clipId === sourceClip.id) ?? null;
   }, [exportJobs, project, sourceClip]);
 
+  const handleTranscriptFileRead = async (file: File) => {
+    try {
+      const content = await file.text();
+      setImportTranscriptText(content);
+      setImportTranscriptFilename(file.name);
+      setErrorMsg(null);
+    } catch {
+      setErrorMsg('Could not read transcript file. Please upload a valid .srt, .vtt, .txt, .ass, or .json file.');
+    }
+  };
+
   if (!project) {
     return (
-      <div className="p-12 rounded-2xl studio-panel text-center">
-        <h2 className="font-display text-lg font-semibold text-white">Caption Studio</h2>
-        <p className="mt-1.5 text-sm text-zinc-400">
-          Upload a video to generate high-end synchronized captions on your full original video (zero video changes) or on individual clips.
-        </p>
-        <button
-          onClick={() => onNavigate('upload')}
-          className="mt-5 studio-btn-primary inline-flex items-center gap-2 h-10 px-5 rounded-lg text-sm font-medium text-white"
-        >
-          <UploadCloud className="w-4 h-4" /> Upload Video
-        </button>
+      <div className="space-y-6 max-w-4xl mx-auto">
+        <div className="p-8 sm:p-10 rounded-2xl studio-panel text-center">
+          <h2 className="font-display text-xl font-semibold text-white">Caption Studio</h2>
+          <p className="mt-1.5 text-sm text-zinc-400">
+            Upload a video to generate synchronized captions, or upload a transcript file below (.SRT / .VTT / .TXT) in Hinglish, Roman Urdu, Urdu, or English to generate &amp; download animated Chroma Green Screen MP4 captions right away.
+          </p>
+          <button
+            onClick={() => onNavigate('upload')}
+            className="mt-5 studio-btn-primary inline-flex items-center gap-2 h-10 px-5 rounded-lg text-sm font-medium text-white"
+          >
+            <UploadCloud className="w-4 h-4" /> Upload Video or Transcript File
+          </button>
+        </div>
+
+        {/* Standalone Transcript-to-Animated-Captions Generator directly inside Caption Studio */}
+        {onCreateTranscriptProject && (
+          <div className="p-6 sm:p-7 rounded-2xl studio-panel border border-[#10B981]/35 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-[#059669]/20 border border-[#10B981]/40 text-[11px] font-semibold text-emerald-300">
+                  <Sparkles className="w-3.5 h-3.5 text-[#F5C451]" />
+                  No Video Needed · Direct Transcript → Animated Captions MP4
+                </span>
+                <h3 className="mt-1.5 font-display text-lg font-bold text-white">
+                  Generate Animated Captions from Transcript File (.SRT / .VTT / .TXT)
+                </h3>
+                <p className="text-xs text-zinc-400">
+                  Upload or paste your transcript in <strong className="text-emerald-300">Hinglish</strong>, <strong className="text-emerald-300">Roman Urdu</strong>, <strong className="text-emerald-300">Urdu (اردو)</strong>, or English to preview 60fps animations and download Chroma Green Screen MP4.
+                </p>
+              </div>
+              <label className="cursor-pointer inline-flex items-center gap-2 h-9 px-3.5 rounded-lg bg-[#0E1913] hover:bg-[#14241B] border border-[#D4AF37]/30 text-xs font-semibold text-[#F5C451]">
+                <FileText className="w-3.5 h-3.5" />
+                {importTranscriptFilename ? `Loaded: ${importTranscriptFilename}` : 'Choose .SRT / .VTT / .TXT'}
+                <input
+                  type="file"
+                  accept=".srt,.vtt,.txt,.ass,.ssa,.json,text/plain"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) void handleTranscriptFileRead(f);
+                  }}
+                />
+              </label>
+            </div>
+
+            {errorMsg && (
+              <div className="flex items-center gap-2 px-3.5 py-2 rounded-lg bg-red-500/12 border border-red-500/30 text-xs text-red-200">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                {errorMsg}
+              </div>
+            )}
+
+            <textarea
+              rows={5}
+              value={importTranscriptText}
+              onChange={(e) => setImportTranscriptText(e.target.value)}
+              placeholder={`Paste .SRT timestamps or plain text in Hinglish, Roman Urdu, Urdu (اردو), or English...\nExample:\n1\n00:00:00,000 --> 00:00:02,600\nBhai ye captions animation bilkul high end sync ke sath kaam karti hai!\n\n2\n00:00:02,600 --> 00:00:05,400\nAap isko Chroma Green Screen MP4 mein download kar ke kisi bhi editor mein use karein.`}
+              className="w-full rounded-xl bg-[#07110C] border border-[#10B981]/25 focus:border-[#F5C451]/60 p-3.5 text-xs text-zinc-100 font-mono leading-relaxed focus:outline-none"
+            />
+
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <select
+                  value={analysisLanguage}
+                  onChange={(e) => setAnalysisLanguage(e.target.value)}
+                  className="h-9 px-3 rounded-lg bg-[#0C1510] border border-[#D4AF37]/25 text-xs text-white"
+                >
+                  {SUPPORTED_LANGUAGES.map((lang) => (
+                    <option key={lang.code} value={lang.code} className="bg-[#0C1510]">
+                      {lang.label}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={style.animation}
+                  onChange={(e) => setStyle((s) => ({ ...s, animation: e.target.value as CaptionAnimation }))}
+                  className="h-9 px-3 rounded-lg bg-[#0C1510] border border-[#D4AF37]/25 text-xs text-white"
+                >
+                  {ANIMATION_OPTIONS.map((anim) => (
+                    <option key={anim.id} value={anim.id} className="bg-[#0C1510]">
+                      Animation: {anim.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <button
+                disabled={importingTranscript || !importTranscriptText.trim()}
+                onClick={async () => {
+                  setErrorMsg(null);
+                  setImportingTranscript(true);
+                  try {
+                    await onCreateTranscriptProject({
+                      name: importTranscriptFilename
+                        ? importTranscriptFilename.replace(/\.[^.]+$/, '')
+                        : 'Transcript Animated Captions',
+                      content: importTranscriptText,
+                      filename: importTranscriptFilename || 'transcript.srt',
+                      language: analysisLanguage,
+                      captionPresetId: style.presetId || 'loki-emerald-gold',
+                      animation: style.animation,
+                      aspectRatio: '9:16',
+                    });
+                  } catch (err) {
+                    setErrorMsg(err instanceof Error ? err.message : 'Failed to create animated captions from transcript.');
+                  } finally {
+                    setImportingTranscript(false);
+                  }
+                }}
+                className="studio-btn-primary inline-flex items-center gap-2 h-10 px-5 rounded-xl text-xs font-semibold text-white disabled:opacity-50"
+              >
+                {importingTranscript ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Sparkles className="w-4 h-4 text-[#FEF3C7]" />
+                )}
+                {importingTranscript ? 'Generating Animated Captions...' : 'Generate Animated Captions & Open Studio'}
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     );
   }
@@ -358,23 +517,65 @@ export function CaptionStudioPage({
       let alignedSegments = 0;
       let wordCount = 0;
       if (onAnalyzeClipAudioCaptions) {
-        const res = await onAnalyzeClipAudioCaptions(project.id, sourceClip.id);
+        const res = await onAnalyzeClipAudioCaptions(project.id, sourceClip.id, analysisLanguage);
         alignedSegments = res.alignedSegments;
         wordCount = res.wordCount;
       } else {
-        const res = await api.analyzeClipAudioCaptions(project.id, sourceClip.id);
+        const res = await api.analyzeClipAudioCaptions(project.id, sourceClip.id, analysisLanguage);
         alignedSegments = res.alignedSegments;
         wordCount = res.wordCount;
       }
       setEditedSegments(null);
+      const langLabel =
+        SUPPORTED_LANGUAGES.find((l) => l.code === analysisLanguage)?.label || analysisLanguage;
       setFeedback(
-        `High-End Clip Audio Analysis complete: generated ${alignedSegments} voiceover-locked caption lines (${wordCount} words).`
+        `High-End Clip Audio Analysis (${langLabel}) complete: generated ${alignedSegments} voiceover-locked caption lines (${wordCount} words).`
       );
       setTimeout(() => setFeedback(null), 3800);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Clip audio caption analysis failed.');
     } finally {
       setAnalyzingClipAudio(false);
+    }
+  };
+
+  const handleImportTranscriptOntoClip = async () => {
+    if (!importTranscriptText.trim()) {
+      setErrorMsg('Please upload a transcript file (.srt, .vtt, .txt) or paste your transcript text first.');
+      return;
+    }
+    setErrorMsg(null);
+    setImportingTranscript(true);
+    try {
+      let segmentsCount = 0;
+      let wordCount = 0;
+      if (onImportClipTranscript) {
+        const res = await onImportClipTranscript(project.id, sourceClip.id, {
+          content: importTranscriptText,
+          filename: importTranscriptFilename || 'transcript.srt',
+          syncWithAudio: true,
+        });
+        segmentsCount = res.segmentsCount;
+        wordCount = res.wordCount;
+      } else {
+        const res = await api.importClipTranscript(project.id, sourceClip.id, {
+          content: importTranscriptText,
+          filename: importTranscriptFilename || 'transcript.srt',
+          syncWithAudio: true,
+        });
+        segmentsCount = res.segmentsCount;
+        wordCount = res.wordCount;
+      }
+      setEditedSegments(null);
+      setShowImportTranscriptDrawer(false);
+      setFeedback(
+        `Imported transcript & synced ${segmentsCount} animated caption segments (${wordCount} words) to clip timeline!`
+      );
+      setTimeout(() => setFeedback(null), 4000);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to import transcript onto clip.');
+    } finally {
+      setImportingTranscript(false);
     }
   };
 
@@ -493,15 +694,28 @@ export function CaptionStudioPage({
         <div>
           <h1 className="font-display text-2xl font-bold text-white">Caption Studio</h1>
           <p className="mt-0.5 text-xs text-zinc-400">
-            60fps voiceover-locked captions · 12 animations (Waving Flow, Bounce, Karaoke, Typewriter, Neon Pulse) · Pinned video preview while scrolling settings.
+            60fps voiceover-locked captions · Hinglish, Roman Urdu &amp; Urdu (اردو) support · 12 animations · Transcript-to-Chroma MP4 export.
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          <select
+            value={analysisLanguage}
+            onChange={(e) => setAnalysisLanguage(e.target.value)}
+            title="Select caption language & script (Hinglish, Roman Urdu, Urdu Nastaliq, Hindi, English, Auto)"
+            className="h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#10B981]/40 text-xs font-medium text-emerald-200 max-w-[205px] truncate"
+          >
+            {SUPPORTED_LANGUAGES.map((lang) => (
+              <option key={lang.code} value={lang.code} className="bg-[#0C1510] text-white">
+                {lang.label}
+              </option>
+            ))}
+          </select>
+
           <button
             onClick={() => void handleAnalyzeClipAudioAndGenerateCaptions()}
             disabled={analyzingClipAudio}
-            title="Extract this clip's audio track, run high-end AI speech analysis & generate frame-locked captions"
+            title="Extract this clip's audio track, run high-end AI speech analysis in the selected language (Hinglish / Roman Urdu / Urdu / English) & generate frame-locked captions"
             className="studio-btn-primary inline-flex items-center gap-1.5 h-9 px-3.5 rounded-lg text-xs font-semibold text-white whitespace-nowrap"
           >
             {analyzingClipAudio ? (
@@ -510,6 +724,19 @@ export function CaptionStudioPage({
               <Sparkles className="w-3.5 h-3.5 text-[#FEF3C7]" />
             )}
             {analyzingClipAudio ? 'Analyzing Clip Audio...' : 'Analyze Clip Audio & Generate Captions'}
+          </button>
+
+          <button
+            onClick={() => setShowImportTranscriptDrawer((v) => !v)}
+            title="Upload or paste a transcript file (.SRT, .VTT, .TXT, .ASS) to generate animated captions"
+            className={`inline-flex items-center gap-1.5 h-9 px-3.5 rounded-lg border text-xs font-semibold whitespace-nowrap transition-colors ${
+              showImportTranscriptDrawer
+                ? 'bg-[#D4AF37]/20 border-[#F5C451]/60 text-[#FEF3C7]'
+                : 'bg-[#0E1913] hover:bg-[#14241B] border-[#D4AF37]/30 text-[#F5C451]'
+            }`}
+          >
+            <FileText className="w-3.5 h-3.5" />
+            Import Transcript (.SRT/.TXT)
           </button>
 
           <button
@@ -578,6 +805,109 @@ export function CaptionStudioPage({
           )}
         </div>
       </div>
+
+      {/* Collapsible Transcript Import & Standalone Animated Captions Drawer */}
+      {showImportTranscriptDrawer && (
+        <div className="p-4 sm:p-5 rounded-xl studio-panel border border-[#F5C451]/35 space-y-3.5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <FileText className="w-4 h-4 text-[#F5C451]" />
+                Transcript File → Animated Captions Generator (.SRT / .VTT / .TXT / .ASS)
+              </h3>
+              <p className="text-[11px] text-zinc-400">
+                Upload a transcript file or paste Hinglish, Roman Urdu, Urdu (اردو), or English lines. Apply to this clip or generate a standalone Only-Captions Chroma Green Screen MP4.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="cursor-pointer inline-flex items-center gap-1.5 h-8 px-3 rounded-lg bg-[#0E1913] hover:bg-[#14241B] border border-[#D4AF37]/35 text-xs font-semibold text-[#F5C451]">
+                <UploadCloud className="w-3.5 h-3.5" />
+                {importTranscriptFilename ? importTranscriptFilename : 'Upload .SRT / .VTT / .TXT'}
+                <input
+                  type="file"
+                  accept=".srt,.vtt,.txt,.ass,.ssa,.json,text/plain"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) void handleTranscriptFileRead(f);
+                  }}
+                />
+              </label>
+              <button
+                type="button"
+                onClick={() => setShowImportTranscriptDrawer(false)}
+                className="h-8 px-2.5 rounded-lg bg-zinc-900/80 hover:bg-zinc-800 text-xs text-zinc-400"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+
+          <textarea
+            rows={4}
+            value={importTranscriptText}
+            onChange={(e) => setImportTranscriptText(e.target.value)}
+            placeholder="Paste .SRT / .VTT timestamps or plain text lines in Hinglish, Roman Urdu, Urdu (اردو), or English..."
+            className="w-full rounded-lg bg-[#07110C] border border-[#10B981]/25 focus:border-[#F5C451]/60 p-3 text-xs text-zinc-100 font-mono leading-relaxed focus:outline-none"
+          />
+
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-[11px] text-zinc-400">
+              Supports timestamped <code className="text-emerald-300">.srt / .vtt</code> or plain text (auto-timed &amp; snapped to voiceover waveform).
+            </span>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={importingTranscript || !importTranscriptText.trim()}
+                onClick={() => void handleImportTranscriptOntoClip()}
+                className="studio-btn-primary inline-flex items-center gap-1.5 h-9 px-4 rounded-lg text-xs font-semibold text-white disabled:opacity-50"
+              >
+                {importingTranscript ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Sparkles className="w-3.5 h-3.5 text-[#FEF3C7]" />
+                )}
+                {importingTranscript ? 'Syncing Transcript...' : 'Apply Transcript to Current Clip'}
+              </button>
+
+              {onCreateTranscriptProject && (
+                <button
+                  type="button"
+                  disabled={importingTranscript || !importTranscriptText.trim()}
+                  onClick={async () => {
+                    setErrorMsg(null);
+                    setImportingTranscript(true);
+                    try {
+                      await onCreateTranscriptProject({
+                        name: importTranscriptFilename
+                          ? importTranscriptFilename.replace(/\.[^.]+$/, '')
+                          : 'Transcript Animated Captions',
+                        content: importTranscriptText,
+                        filename: importTranscriptFilename || 'transcript.srt',
+                        language: analysisLanguage,
+                        captionPresetId: style.presetId || 'loki-emerald-gold',
+                        animation: style.animation,
+                        aspectRatio: '9:16',
+                      });
+                      setShowImportTranscriptDrawer(false);
+                      setFeedback('Created standalone Transcript-to-Animated-Captions project ready for Chroma Green Screen MP4 export!');
+                      setTimeout(() => setFeedback(null), 4000);
+                    } catch (err) {
+                      setErrorMsg(err instanceof Error ? err.message : 'Could not create standalone transcript project.');
+                    } finally {
+                      setImportingTranscript(false);
+                    }
+                  }}
+                  className="inline-flex items-center gap-1.5 h-9 px-3.5 rounded-lg bg-[#00FF00]/15 hover:bg-[#00FF00]/25 border border-[#00FF00]/45 text-xs font-semibold text-[#4ADE80] disabled:opacity-50"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Create Standalone Captions-Only Project
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {feedback && (
         <div className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-xs text-emerald-300">

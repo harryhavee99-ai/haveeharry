@@ -13,14 +13,22 @@ import {
   Captions,
   Scissors,
   ShieldCheck,
+  FileText,
+  Download,
+  Zap,
+  Globe,
+  Waves,
 } from 'lucide-react';
 import type {
   AnalysisConfig,
   AppSettings,
   AspectRatio,
+  CaptionAnimation,
+  ClipRecord,
   FramingMode,
   MotionIntensity,
   ProcessingMode,
+  ProjectRecord,
 } from '../../shared/types.ts';
 import { CAPTION_PRESETS, SUPPORTED_LANGUAGES, VISUAL_STYLE_PRESETS } from '../../shared/presets.ts';
 import { api } from '../lib/api.ts';
@@ -30,6 +38,16 @@ import { formatBytes, formatDurationHuman } from '../lib/format.ts';
 interface UploadPageProps {
   settings: AppSettings;
   onStartAnalysis: (projectId: string, config: AnalysisConfig) => Promise<void>;
+  onCreateTranscriptProject?: (payload: {
+    name?: string;
+    content: string;
+    filename?: string;
+    language?: string;
+    aspectRatio?: '9:16' | '16:9' | '1:1' | '4:5';
+    captionPresetId?: string;
+    animation?: CaptionAnimation;
+    targetDurationSeconds?: number;
+  }) => Promise<{ project: ProjectRecord; clip: ClipRecord }>;
 }
 
 const VALID_EXTS = [
@@ -51,8 +69,9 @@ const VALID_EXTS = [
   '.vob',
 ];
 
-export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
+export function UploadPage({ settings, onStartAnalysis, onCreateTranscriptProject }: UploadPageProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const transcriptFileInputRef = useRef<HTMLInputElement | null>(null);
   const uploadState = useUploadManager();
 
   const [dragActive, setDragActive] = useState(false);
@@ -60,6 +79,17 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
   const [startingAnalysis, setStartingAnalysis] = useState(false);
   const [generatingSample, setGeneratingSample] = useState(false);
   const [previewError, setPreviewError] = useState(false);
+
+  // Transcript-to-Animated-Captions Studio state
+  const [transcriptTitle, setTranscriptTitle] = useState('SkaDoosh Animated Captions');
+  const [transcriptFilename, setTranscriptFilename] = useState<string | undefined>(undefined);
+  const [transcriptContent, setTranscriptContent] = useState('');
+  const [transcriptLanguage, setTranscriptLanguage] = useState<string>('hinglish');
+  const [transcriptAspectRatio, setTranscriptAspectRatio] = useState<'9:16' | '16:9' | '1:1' | '4:5'>('9:16');
+  const [transcriptPresetId, setTranscriptPresetId] = useState<string>('ocean-wave-flow');
+  const [transcriptAnimation, setTranscriptAnimation] = useState<CaptionAnimation>('wave');
+  const [creatingTranscriptStudio, setCreatingTranscriptStudio] = useState(false);
+  const [downloadingDirectChroma, setDownloadingDirectChroma] = useState(false);
 
   const [durationPreset, setDurationPreset] = useState<string>(
     () => uploadState.savedDurationPreset ?? String(settings.defaultClipDuration)
@@ -174,6 +204,64 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
     }
   };
 
+  const handleLoadTranscriptFile = async (file: File) => {
+    setLocalError(null);
+    try {
+      const text = await file.text();
+      if (!text.trim()) {
+        setLocalError('Selected transcript file is empty.');
+        return;
+      }
+      setTranscriptFilename(file.name);
+      setTranscriptTitle(file.name.replace(/\.(srt|vtt|txt|ass|ssa|json)$/i, '') || 'Transcript Captions');
+      setTranscriptContent(text);
+    } catch {
+      setLocalError('Could not read transcript file.');
+    }
+  };
+
+  const handleOpenTranscriptInCaptionStudio = async (andDownloadChroma = false) => {
+    if (!transcriptContent.trim()) {
+      setLocalError('Please upload a transcript file (.SRT, .VTT, .TXT, .ASS, .JSON) or paste transcript text first.');
+      return;
+    }
+    setLocalError(null);
+    if (andDownloadChroma) {
+      setDownloadingDirectChroma(true);
+    } else {
+      setCreatingTranscriptStudio(true);
+    }
+    try {
+      const payload = {
+        name: transcriptTitle.trim() || 'Animated Captions',
+        content: transcriptContent,
+        filename: transcriptFilename,
+        language: transcriptLanguage,
+        aspectRatio: transcriptAspectRatio,
+        captionPresetId: transcriptPresetId,
+        animation: transcriptAnimation,
+      };
+      const res = onCreateTranscriptProject
+        ? await onCreateTranscriptProject(payload)
+        : await api.createProjectFromTranscript(payload);
+
+      if (andDownloadChroma) {
+        await api.downloadClipChromaCaptionsMp4(res.project.id, res.clip.id, res.clip.title, {
+          chromaColor: '#00FF00',
+          includeAudio: false,
+          resolution: '1080p',
+        });
+      }
+    } catch (err) {
+      setLocalError(
+        err instanceof Error ? err.message : 'Failed to generate animated captions from transcript.'
+      );
+    } finally {
+      setCreatingTranscriptStudio(false);
+      setDownloadingDirectChroma(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
@@ -253,8 +341,16 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
                   Drag and drop your video file here
                 </h2>
                 <p className="mt-2 text-sm text-zinc-400 max-w-md mx-auto">
-                  Or click to browse local files · Any length &amp; any file size · Uninterrupted background 2 MB chunked streaming
+                  Or click to browse local files · Any length &amp; any file size · High-Speed 3x Parallel 4 MB Multi-Stream Engine
                 </p>
+                <div className="mt-4 flex flex-wrap items-center justify-center gap-1.5">
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-[#059669]/20 border border-[#10B981]/35 text-[11px] font-medium text-emerald-300">
+                    <Zap className="w-3 h-3 text-[#F5C451]" /> 3× Parallel Streams (4 MB Chunks)
+                  </span>
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-[#0E1913] border border-[#D4AF37]/25 text-[11px] font-medium text-zinc-200">
+                    <Globe className="w-3 h-3 text-[#F5C451]" /> Hinglish · Roman Urdu · اردو · English
+                  </span>
+                </div>
                 <div className="mt-5 pt-4 border-t border-[#D4AF37]/15 flex flex-wrap items-center justify-center gap-x-4 gap-y-1 text-xs font-mono text-[#F5C451]">
                   <span>MP4</span>
                   <span className="text-zinc-600" aria-hidden="true">·</span>
@@ -275,25 +371,31 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
             </div>
           )}
 
-          {/* Active Chunked Upload Progress Card */}
+          {/* Active High-Speed Multi-Stream Upload Telemetry Card */}
           {hasActiveUploadCard && uploadInfo && (
-            <div className="p-6 rounded-xl studio-panel space-y-4">
+            <div className="p-6 rounded-xl studio-panel space-y-4 border border-[#10B981]/35">
               <div className="flex items-start justify-between gap-4">
                 <div className="flex items-center gap-3 min-w-0">
-                  <div className="w-10 h-10 rounded-lg bg-[#0E1913] border border-[#D4AF37]/20 flex items-center justify-center text-[#F5C451] shrink-0">
+                  <div className="w-10 h-10 rounded-lg bg-[#0E1913] border border-[#D4AF37]/25 flex items-center justify-center text-[#F5C451] shrink-0">
                     <Film className="w-5 h-5" />
                   </div>
                   <div className="min-w-0">
-                    <div className="text-sm font-semibold text-white truncate">
-                      {uploadState.fileName}
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-semibold text-white truncate">
+                        {uploadState.fileName}
+                      </span>
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-[#059669]/25 border border-[#10B981]/40 font-mono text-[10px] font-semibold text-emerald-300 shrink-0">
+                        <Zap className="w-2.5 h-2.5 text-[#F5C451]" />
+                        {uploadInfo.parallelStreams ?? 3}× TURBO
+                      </span>
                     </div>
                     <div className="text-xs text-zinc-400 tabular-nums mt-0.5">
-                      {formatBytes(uploadInfo.uploadedBytes)} / {formatBytes(uploadInfo.totalBytes)} · Chunk{' '}
-                      {Math.min(uploadInfo.chunkIndex + 1, uploadInfo.totalChunks)} of {uploadInfo.totalChunks}
+                      {formatBytes(uploadInfo.uploadedBytes)} / {formatBytes(uploadInfo.totalBytes)} ·{' '}
+                      {uploadInfo.completedChunks ?? uploadInfo.chunkIndex} of {uploadInfo.totalChunks} chunks verified (4 MB/chunk)
                     </div>
                   </div>
                 </div>
-                <span className="font-mono text-lg font-bold text-[#F5C451] tabular-nums">
+                <span className="font-mono text-xl font-bold text-[#F5C451] tabular-nums">
                   {uploadInfo.percentage}%
                 </span>
               </div>
@@ -301,8 +403,40 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
               <div className="h-2.5 rounded-full bg-[#132219] overflow-hidden">
                 <div
                   style={{ width: `${uploadInfo.percentage}%` }}
-                  className="h-full bg-gradient-to-r from-[#059669] via-[#10B981] to-[#D4AF37] transition-[width] duration-150"
+                  className="h-full bg-gradient-to-r from-[#059669] via-[#10B981] to-[#D4AF37] transition-[width] duration-100"
                 />
+              </div>
+
+              {/* High-End Live Upload Telemetry Grid */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 pt-1">
+                <div className="p-2.5 rounded-lg bg-[#09130E] border border-[#D4AF37]/15">
+                  <div className="text-[10px] uppercase tracking-wider text-zinc-500">Live Speed</div>
+                  <div className="mt-0.5 font-mono text-xs font-semibold text-emerald-300 tabular-nums">
+                    {formatBytes(uploadInfo.speedBytesPerSec)}/s
+                  </div>
+                </div>
+                <div className="p-2.5 rounded-lg bg-[#09130E] border border-[#D4AF37]/15">
+                  <div className="text-[10px] uppercase tracking-wider text-zinc-500">Peak Speed</div>
+                  <div className="mt-0.5 font-mono text-xs font-semibold text-[#F5C451] tabular-nums">
+                    {formatBytes(uploadInfo.peakSpeedBytesPerSec || uploadInfo.speedBytesPerSec)}/s
+                  </div>
+                </div>
+                <div className="p-2.5 rounded-lg bg-[#09130E] border border-[#D4AF37]/15">
+                  <div className="text-[10px] uppercase tracking-wider text-zinc-500">Est. Remaining</div>
+                  <div className="mt-0.5 font-mono text-xs font-semibold text-white tabular-nums">
+                    {uploadInfo.etaSeconds !== undefined && uploadInfo.etaSeconds > 0
+                      ? formatDurationHuman(uploadInfo.etaSeconds)
+                      : uploadInfo.state === 'assembling' || uploadInfo.state === 'verifying'
+                        ? 'Finalizing...'
+                        : 'Calculating...'}
+                  </div>
+                </div>
+                <div className="p-2.5 rounded-lg bg-[#09130E] border border-[#D4AF37]/15">
+                  <div className="text-[10px] uppercase tracking-wider text-zinc-500">Parallel Streams</div>
+                  <div className="mt-0.5 font-mono text-xs font-semibold text-zinc-200 tabular-nums">
+                    {uploadInfo.activeWorkers ?? 1} active / {uploadInfo.parallelStreams ?? 3} max
+                  </div>
+                </div>
               </div>
 
               <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-zinc-400">
@@ -310,14 +444,14 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
                   {uploadInfo.retryNotice
                     ? uploadInfo.retryNotice
                     : uploadInfo.state === 'verifying'
-                      ? 'Verifying uploaded chunks on server...'
+                      ? 'Verifying all uploaded chunks on server disk...'
                       : uploadInfo.state === 'assembling'
-                        ? 'Finalizing video and probing media streams with FFprobe...'
+                        ? 'Stream-assembling video & probing media streams with FFprobe...'
                         : uploadInfo.state === 'paused'
                           ? 'Upload paused — click Resume Upload to continue from last verified chunk'
                           : uploadInfo.state === 'error'
                             ? `Upload interrupted: ${uploadInfo.error}`
-                            : `Uploading video at ${formatBytes(uploadInfo.speedBytesPerSec)}/s`}
+                            : `Streaming via ${uploadInfo.parallelStreams ?? 3} concurrent workers · Elapsed ${uploadInfo.elapsedSeconds ?? 0}s`}
                 </span>
                 <div className="flex items-center gap-2">
                   {uploadInfo.state !== 'assembling' && uploadInfo.state !== 'verifying' && (
@@ -807,6 +941,217 @@ export function UploadPage({ settings, onStartAnalysis }: UploadPageProps) {
                     ? 'Generate High-End Captions (Original Quality)'
                     : 'Analyze Video & Generate Clips'}
             </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Direct Transcript File (.SRT / .VTT / .TXT) -> Animated Chroma Green Screen Captions Generator */}
+      <div className="p-6 rounded-2xl studio-panel border border-[#22C55E]/35 space-y-5">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="space-y-1">
+            <div className="inline-flex items-center gap-2 px-2.5 py-0.5 rounded-md bg-[#22C55E]/15 border border-[#22C55E]/40 text-[11px] font-semibold text-[#4ADE80]">
+              <Waves className="w-3.5 h-3.5 text-[#F5C451]" />
+              NO VIDEO UPLOAD REQUIRED · TRANSCRIPT TO ANIMATED CAPTIONS MP4
+            </div>
+            <h2 className="font-display text-lg font-bold text-white">
+              Transcript File to Animated Captions Generator (.SRT / .VTT / .TXT → Chroma Green Screen MP4)
+            </h2>
+            <p className="text-xs text-zinc-400">
+              Upload any transcript file (<span className="text-zinc-200 font-mono">.srt, .vtt, .txt, .ass, .json</span>) or paste your script in{' '}
+              <span className="text-[#F5C451] font-medium">Hinglish, Roman Urdu, Urdu (اردو), or English</span> to generate animated captions (Waving Flow, Bounce, Karaoke, Pop) and download as a Chroma Green Screen MP4.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            <input
+              ref={transcriptFileInputRef}
+              type="file"
+              accept=".srt,.vtt,.txt,.ass,.ssa,.json,text/plain,text/vtt,application/json"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) void handleLoadTranscriptFile(file);
+                e.target.value = '';
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => transcriptFileInputRef.current?.click()}
+              className="inline-flex items-center gap-2 h-9 px-3.5 rounded-lg bg-[#0E1913] hover:bg-[#14241B] border border-[#D4AF37]/30 text-xs font-semibold text-white"
+            >
+              <FileText className="w-3.5 h-3.5 text-[#F5C451]" />
+              {transcriptFilename ? `Loaded: ${transcriptFilename}` : 'Upload Transcript File (.SRT / .VTT / .TXT)'}
+            </button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+          <div className="lg:col-span-7 space-y-2">
+            <div className="flex items-center justify-between text-xs text-zinc-300">
+              <span className="font-medium">
+                Transcript Text (Supports SRT timestamps, <code className="text-[#F5C451]">[00:01 - 00:04]</code>, or plain lines in Hinglish / Roman Urdu / اردو)
+              </span>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTranscriptLanguage('hinglish');
+                    setTranscriptTitle('Hinglish Creator Captions');
+                    setTranscriptContent(
+                      [
+                        '[0.0 - 2.6] Aaj hum baat karenge kaise aap apne videos ke liye',
+                        '[2.6 - 5.4] high-end animated captions generate kar sakte hain!',
+                        '[5.4 - 8.2] Sirf transcript file upload karo aur green screen MP4 download karo.',
+                      ].join('\n')
+                    );
+                  }}
+                  className="px-2 py-0.5 rounded bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/20 text-[10px] text-emerald-300"
+                >
+                  Sample Hinglish
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTranscriptLanguage('roman_ur');
+                    setTranscriptTitle('Roman Urdu Studio Captions');
+                    setTranscriptContent(
+                      [
+                        '[0.0 - 2.8] Agar aap ne sirf transcript se animated captions banani hain,',
+                        '[2.8 - 5.6] toh SkaDoosh mein apni file upload karein ya text paste karein',
+                        '[5.6 - 8.5] aur chroma green screen MP4 kisi bhi editor mein use karein!',
+                      ].join('\n')
+                    );
+                  }}
+                  className="px-2 py-0.5 rounded bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/20 text-[10px] text-[#F5C451]"
+                >
+                  Sample Roman Urdu
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTranscriptLanguage('ur');
+                    setTranscriptTitle('Urdu Nastaliq Captions');
+                    setTranscriptContent(
+                      [
+                        '[0.0 - 3.0] اب آپ صرف ٹرانسکرپٹ فائل دے کر شاندار اینیمیٹڈ کیپشنز بنا سکتے ہیں',
+                        '[3.0 - 6.2] اور کروما گرین اسکرین ایم پی فور ڈاؤن لوڈ کر کے کسی بھی سافٹ ویئر میں استعمال کریں۔',
+                      ].join('\n')
+                    );
+                  }}
+                  className="px-2 py-0.5 rounded bg-[#0C1510] hover:bg-[#132219] border border-[#D4AF37]/20 text-[10px] text-zinc-200"
+                >
+                  Sample اردو
+                </button>
+              </div>
+            </div>
+            <textarea
+              rows={5}
+              value={transcriptContent}
+              onChange={(e) => setTranscriptContent(e.target.value)}
+              placeholder={`Paste your .SRT, .VTT, timestamped lines, or plain script here...\nExample (Roman Urdu / Hinglish):\n[0.0 - 2.8] Aaj ki video mein hum dekhenge high-end waving captions\n[2.8 - 5.6] jo aap ke voiceover ke saath bilkul sync kaam karti hain!`}
+              className="w-full p-3 rounded-xl bg-[#08100C] border border-[#D4AF37]/20 text-xs text-white font-mono leading-relaxed focus:outline-none focus:border-[#10B981]"
+            />
+          </div>
+
+          <div className="lg:col-span-5 space-y-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs text-zinc-300 mb-1">Language / Script</label>
+                <select
+                  value={transcriptLanguage}
+                  onChange={(e) => setTranscriptLanguage(e.target.value)}
+                  className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/20 text-xs text-white"
+                >
+                  {SUPPORTED_LANGUAGES.map((l) => (
+                    <option key={l.code} value={l.code} className="bg-[#0C1510]">
+                      {l.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs text-zinc-300 mb-1">Caption Animation</label>
+                <select
+                  value={transcriptAnimation}
+                  onChange={(e) => setTranscriptAnimation(e.target.value as CaptionAnimation)}
+                  className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/20 text-xs text-white"
+                >
+                  <option value="wave" className="bg-[#0C1510]">Waving Flow (Sinusoidal Wave)</option>
+                  <option value="bounce" className="bg-[#0C1510]">Elastic Bounce</option>
+                  <option value="pop" className="bg-[#0C1510]">Creator Pop Spring</option>
+                  <option value="karaoke" className="bg-[#0C1510]">Karaoke Word Sweep</option>
+                  <option value="typewriter" className="bg-[#0C1510]">Typewriter Reveal</option>
+                  <option value="neon_pulse" className="bg-[#0C1510]">Neon Pulse Halo</option>
+                  <option value="glow" className="bg-[#0C1510]">Radiant Glow</option>
+                  <option value="shake" className="bg-[#0C1510]">Hype Shake</option>
+                  <option value="flip" className="bg-[#0C1510]">3D Flip In</option>
+                  <option value="slide" className="bg-[#0C1510]">Slide Up</option>
+                  <option value="fade" className="bg-[#0C1510]">Smooth Fade</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs text-zinc-300 mb-1">Studio Style Preset</label>
+                <select
+                  value={transcriptPresetId}
+                  onChange={(e) => setTranscriptPresetId(e.target.value)}
+                  className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/20 text-xs text-white"
+                >
+                  {CAPTION_PRESETS.map((p) => (
+                    <option key={p.id} value={p.id} className="bg-[#0C1510]">
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs text-zinc-300 mb-1">Canvas Aspect Ratio</label>
+                <select
+                  value={transcriptAspectRatio}
+                  onChange={(e) =>
+                    setTranscriptAspectRatio(e.target.value as '9:16' | '16:9' | '1:1' | '4:5')
+                  }
+                  className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/20 text-xs text-white"
+                >
+                  <option value="9:16" className="bg-[#0C1510]">9:16 Vertical (1080×1920)</option>
+                  <option value="16:9" className="bg-[#0C1510]">16:9 Landscape (1920×1080)</option>
+                  <option value="1:1" className="bg-[#0C1510]">1:1 Square (1080×1080)</option>
+                  <option value="4:5" className="bg-[#0C1510]">4:5 Portrait (1080×1350)</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="pt-1 flex flex-col sm:flex-row gap-2.5">
+              <button
+                type="button"
+                disabled={creatingTranscriptStudio || downloadingDirectChroma}
+                onClick={() => void handleOpenTranscriptInCaptionStudio(false)}
+                className="flex-1 studio-btn-primary h-10 px-4 rounded-xl text-xs font-semibold text-white inline-flex items-center justify-center gap-2 disabled:opacity-50"
+              >
+                {creatingTranscriptStudio ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Sparkles className="w-4 h-4 text-[#FEF3C7]" />
+                )}
+                {creatingTranscriptStudio ? 'Building Animated Captions...' : 'Preview & Customize in Caption Studio'}
+              </button>
+
+              <button
+                type="button"
+                disabled={creatingTranscriptStudio || downloadingDirectChroma}
+                onClick={() => void handleOpenTranscriptInCaptionStudio(true)}
+                className="flex-1 h-10 px-4 rounded-xl bg-gradient-to-r from-[#15803D] via-[#16A34A] to-[#059669] hover:brightness-110 border border-[#4ADE80]/50 text-xs font-semibold text-white inline-flex items-center justify-center gap-2 shadow-md disabled:opacity-50"
+              >
+                {downloadingDirectChroma ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Download className="w-4 h-4 text-[#FEF3C7]" />
+                )}
+                {downloadingDirectChroma ? 'Rendering Chroma MP4...' : 'Generate & Download Chroma MP4'}
+              </button>
+            </div>
           </div>
         </div>
       </div>

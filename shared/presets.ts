@@ -23,9 +23,10 @@ export interface VisualStylePreset {
 
 export const SUPPORTED_LANGUAGES = [
   { code: 'auto', label: 'Auto-Detect Spoken Language' },
+  { code: 'hinglish', label: 'Hinglish (Hindi + English · Latin Script)' },
+  { code: 'roman_ur', label: 'Roman Urdu (اردو · Latin Script)' },
+  { code: 'ur', label: 'Urdu (اردو · Nastaliq Script)' },
   { code: 'en', label: 'English' },
-  { code: 'ur', label: 'Urdu (اردو)' },
-  { code: 'roman_ur', label: 'Roman Urdu' },
   { code: 'hi', label: 'Hindi (हिन्दी)' },
   { code: 'ar', label: 'Arabic (العربية)' },
   { code: 'es', label: 'Spanish' },

@@ -479,14 +479,47 @@ export default function App() {
 
   const handleAnalyzeClipAudioCaptions = async (
     projectId: string,
-    clipId: string
+    clipId: string,
+    language?: string
   ): Promise<{ alignedSegments: number; wordCount: number }> => {
-    const res = await api.analyzeClipAudioCaptions(projectId, clipId);
+    const res = await api.analyzeClipAudioCaptions(projectId, clipId, language);
     if (res.project) {
       const normalized = normalizeProject(res.project);
       setProjects((prev) => prev.map((p) => (p.id === projectId ? normalized : p)));
     }
     return { alignedSegments: res.alignedSegments, wordCount: res.wordCount };
+  };
+
+  const handleCreateTranscriptProject = async (payload: {
+    name?: string;
+    content: string;
+    filename?: string;
+    language?: string;
+    aspectRatio?: '9:16' | '16:9' | '1:1' | '4:5';
+    captionPresetId?: string;
+    animation?: ClipRecord['captionStyle']['animation'];
+    targetDurationSeconds?: number;
+  }): Promise<{ project: ProjectRecord; clip: ClipRecord }> => {
+    const res = await api.createProjectFromTranscript(payload);
+    const normalized = normalizeProject(res.project);
+    setProjects((prev) => [normalized, ...prev.filter((p) => p.id !== normalized.id)]);
+    setActiveProjectId(normalized.id);
+    setActiveClipId(res.clip.id);
+    setActivePage('captions');
+    return { project: normalized, clip: res.clip };
+  };
+
+  const handleImportClipTranscript = async (
+    projectId: string,
+    clipId: string,
+    payload: { content: string; filename?: string; syncWithAudio?: boolean }
+  ): Promise<{ segmentsCount: number; wordCount: number }> => {
+    const res = await api.importClipTranscript(projectId, clipId, payload);
+    if (res.project) {
+      const normalized = normalizeProject(res.project);
+      setProjects((prev) => prev.map((p) => (p.id === projectId ? normalized : p)));
+    }
+    return { segmentsCount: res.segmentsCount, wordCount: res.wordCount };
   };
 
   const handleSaveSettings = async (patch: Partial<AppSettings>) => {
@@ -737,6 +770,7 @@ export default function App() {
             <UploadPage
               settings={settings}
               onStartAnalysis={(projectId, cfg) => handleStartAnalysis(projectId, cfg, false)}
+              onCreateTranscriptProject={handleCreateTranscriptProject}
             />
           )}
 
@@ -789,6 +823,8 @@ export default function App() {
               onCreateFullVideoCaptions={handleCreateFullVideoCaptions}
               onResyncAudioCaptions={handleResyncAudioCaptions}
               onAnalyzeClipAudioCaptions={handleAnalyzeClipAudioCaptions}
+              onCreateTranscriptProject={handleCreateTranscriptProject}
+              onImportClipTranscript={handleImportClipTranscript}
               onExportClip={handleExportSingle}
               onNavigate={setActivePage}
             />
