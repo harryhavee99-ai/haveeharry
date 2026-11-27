@@ -7,11 +7,14 @@ import {
   RotateCcw,
   Move,
   Maximize2,
+  Maximize,
   Eye,
   Film,
   Sparkles,
   Loader2,
   RefreshCw,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react';
 import type {
   AspectRatio,
@@ -75,10 +78,15 @@ export function ClipPreviewPlayer({
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
+  const [playbackRate, setPlaybackRate] = useState<number>(1);
   const [relTime, setRelTime] = useState(0);
   const [isDraggingCrop, setIsDraggingCrop] = useState(false);
   const [mediaError, setMediaError] = useState(false);
   const [localProxyUrl, setLocalProxyUrl] = useState<string | undefined>(undefined);
+  const [localRenderedUrl, setLocalRenderedUrl] = useState<string | undefined>(undefined);
+  const [localRenderStatus, setLocalRenderStatus] = useState<ClipRecord['renderStatus']>(undefined);
+  const [localRenderProgress, setLocalRenderProgress] = useState<number | undefined>(undefined);
+  const [localRenderDetail, setLocalRenderDetail] = useState<string | undefined>(undefined);
   const [proxyRepairing, setProxyRepairing] = useState(false);
   const [quickRenderingMp4, setQuickRenderingMp4] = useState(false);
 
@@ -122,6 +130,12 @@ export function ClipPreviewPlayer({
     setLocalProxyUrl(undefined);
   }, [project.id, project.sourceUrl]);
 
+  useEffect(() => {
+    setLocalRenderedUrl(clip.renderedVideoUrl);
+    setLocalRenderStatus(clip.renderStatus);
+    setLocalRenderDetail(clip.renderStageDetail);
+  }, [clip.id, clip.renderedVideoUrl, clip.renderStatus, clip.renderStageDetail]);
+
   // Measure actual preview DOM canvas dimensions via ResizeObserver so caption font size, stroke, padding,
   // and vertical MarginV match the FFmpeg ASS renderer (server/renderer.ts -> generateAssSubtitles) 1:1!
   useEffect(() => {
@@ -154,13 +168,28 @@ export function ClipPreviewPlayer({
   const srcHeight = project.metadata?.height && project.metadata.height >= 64 ? project.metadata.height : 1080;
 
   const ratio = getAspectRatioNumeric(reviewAspectRatio, srcWidth, srcHeight);
-  const showingRendered = Boolean((previewRendered || verifyRenderedMp4) && clip.renderedVideoUrl);
+  const effectiveRenderedUrl = localRenderedUrl || clip.renderedVideoUrl;
+  const effectiveRenderStatus = localRenderStatus || clip.renderStatus;
+  const isCurrentlyRenderingMp4 =
+    quickRenderingMp4 ||
+    effectiveRenderStatus === 'queued' ||
+    effectiveRenderStatus === 'rendering' ||
+    effectiveRenderStatus === 'validating' ||
+    effectiveRenderStatus === 'saving';
+
+  const showingRendered = Boolean((previewRendered || verifyRenderedMp4) && effectiveRenderedUrl);
   const effectiveSourceUrl = localProxyUrl || project.sourceUrl;
-  const videoSrc = showingRendered ? clip.renderedVideoUrl : effectiveSourceUrl;
+  const videoSrc = showingRendered ? effectiveRenderedUrl : effectiveSourceUrl;
 
   useEffect(() => {
     setMediaError(false);
   }, [videoSrc]);
+
+  // Keep playbackRate synced to <video> and background <video>
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.playbackRate = playbackRate;
+    if (bgVideoRef.current) bgVideoRef.current.playbackRate = playbackRate;
+  }, [playbackRate, videoSrc]);
 
   // Automatically trigger or poll universal H.264 browser preview transcoding if sourceUrl is missing or failed to decode
   const triggerH264BrowserPreviewRepair = async (force = true) => {
@@ -191,14 +220,62 @@ export function ClipPreviewPlayer({
         } catch {
           // ignore
         }
-      }, 2500);
+      }, 2000);
       return () => clearInterval(timer);
     }
   }, [project.id, effectiveSourceUrl, project.browserProxyStatus, showingRendered]);
 
+  // Poll project & export job status whenever an H.264 MP4 preview render is running so the player switches immediately when ready
+  useEffect(() => {
+    if (!isCurrentlyRenderingMp4 && !(verifyRenderedMp4 && !effectiveRenderedUrl)) return;
+    let active = true;
+    const poll = async () => {
+      try {
+        const [freshProj, exportsList] = await Promise.all([
+          api.getProject(project.id),
+          api.getExports(project.id),
+        ]);
+        if (!active) return;
+        const freshClip = freshProj.clips.find((c) => c.id === clip.id);
+        const clipJobs = exportsList.filter((j) => j.clipId === clip.id);
+        const latestJob = clipJobs[0];
+        if (latestJob) {
+          setLocalRenderProgress(latestJob.progress);
+          setLocalRenderDetail(latestJob.stageDetail);
+        }
+        if (freshClip) {
+          setLocalRenderStatus(freshClip.renderStatus);
+          if (freshClip.renderStageDetail) setLocalRenderDetail(freshClip.renderStageDetail);
+          if (freshClip.renderedVideoUrl && freshClip.renderStatus === 'export_ready') {
+            const bustUrl = freshClip.renderedVideoUrl.includes('?')
+              ? `${freshClip.renderedVideoUrl}&r=${Date.now()}`
+              : `${freshClip.renderedVideoUrl}?r=${Date.now()}`;
+            setLocalRenderedUrl(bustUrl);
+            setQuickRenderingMp4(false);
+            setMediaError(false);
+          } else if (freshClip.renderStatus === 'failed') {
+            setQuickRenderingMp4(false);
+          }
+        }
+      } catch {
+        // ignore transient poll errors
+      }
+    };
+    const interval = setInterval(() => void poll(), 1400);
+    void poll();
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [isCurrentlyRenderingMp4, verifyRenderedMp4, effectiveRenderedUrl, project.id, clip.id]);
+
   const handleQuickRenderH264Mp4 = async () => {
-    if (quickRenderingMp4) return;
+    if (isCurrentlyRenderingMp4) return;
     setQuickRenderingMp4(true);
+    setLocalRenderStatus('rendering');
+    setLocalRenderProgress(4);
+    setLocalRenderDetail('Rendering H.264 MP4 preview with burned-in captions...');
+    setVerifyRenderedMp4(true);
     try {
       if (onQuickRenderH264Preview) {
         await onQuickRenderH264Preview();
@@ -212,10 +289,7 @@ export function ClipPreviewPlayer({
           includeMusic: !clip.preserveOriginalVideo && !clip.isFullVideoCaption,
         });
       }
-      setVerifyRenderedMp4(true);
     } catch {
-      // ignore
-    } finally {
       setQuickRenderingMp4(false);
     }
   };
@@ -682,56 +756,69 @@ export function ClipPreviewPlayer({
               </div>
             )}
 
-            {/* H.264 MP4 Preview Rendered Switcher & Quick Render Action */}
+            {/* H.264 MP4 Preview Rendered Switcher & Quick Render / Re-Render Action */}
             {!previewRendered && (
-              <div className="inline-flex items-center gap-1">
-                {clip.renderedVideoUrl ? (
-                  <div className="inline-flex rounded-md overflow-hidden border border-[#D4AF37]/30 bg-[#0C1510]">
+              <div className="inline-flex flex-wrap items-center gap-1">
+                {effectiveRenderedUrl ? (
+                  <>
+                    <div className="inline-flex rounded-md overflow-hidden border border-[#D4AF37]/30 bg-[#0C1510]">
+                      <button
+                        type="button"
+                        onClick={() => setVerifyRenderedMp4(false)}
+                        title="Live 60fps interactive caption & motion preview"
+                        className={`inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold transition-colors ${
+                          !verifyRenderedMp4
+                            ? 'bg-[#059669] text-white'
+                            : 'text-zinc-400 hover:text-zinc-200'
+                        }`}
+                      >
+                        <Eye className="w-3 h-3" /> Live 1:1
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setVerifyRenderedMp4(true)}
+                        title="Watch the actual FFmpeg-rendered H.264 MP4 output"
+                        className={`inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold transition-colors ${
+                          verifyRenderedMp4
+                            ? 'bg-[#D4AF37]/30 text-[#FEF3C7]'
+                            : 'text-zinc-400 hover:text-zinc-200'
+                        }`}
+                      >
+                        <Film className="w-3 h-3 text-[#F5C451]" /> H.264 MP4 Rendered
+                      </button>
+                    </div>
                     <button
                       type="button"
-                      onClick={() => setVerifyRenderedMp4(false)}
-                      title="Live 60fps interactive caption & motion preview"
-                      className={`inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold transition-colors ${
-                        !verifyRenderedMp4
-                          ? 'bg-[#059669] text-white'
-                          : 'text-zinc-400 hover:text-zinc-200'
-                      }`}
+                      disabled={isCurrentlyRenderingMp4}
+                      onClick={() => void handleQuickRenderH264Mp4()}
+                      title="Re-render H.264 MP4 preview with your latest caption style, font & opacity changes"
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold border border-[#D4AF37]/35 bg-[#0E1913] hover:bg-[#15261D] text-emerald-300 transition-colors disabled:opacity-50"
                     >
-                      <Eye className="w-3 h-3" /> Live 1:1
+                      {isCurrentlyRenderingMp4 ? (
+                        <>
+                          <Loader2 className="w-3 h-3 animate-spin text-[#F5C451]" />
+                          {localRenderProgress ? `${localRenderProgress}%` : 'Rendering...'}
+                        </>
+                      ) : (
+                        <>
+                          <RefreshCw className="w-2.5 h-2.5 text-[#F5C451]" />
+                          Re-Render MP4
+                        </>
+                      )}
                     </button>
-                    <button
-                      type="button"
-                      onClick={() => setVerifyRenderedMp4(true)}
-                      title="Watch the actual FFmpeg-rendered H.264 MP4 output"
-                      className={`inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold transition-colors ${
-                        verifyRenderedMp4
-                          ? 'bg-[#D4AF37]/30 text-[#FEF3C7]'
-                          : 'text-zinc-400 hover:text-zinc-200'
-                      }`}
-                    >
-                      <Film className="w-3 h-3 text-[#F5C451]" /> H.264 MP4 Rendered
-                    </button>
-                  </div>
+                  </>
                 ) : (
                   <button
                     type="button"
-                    disabled={
-                      quickRenderingMp4 ||
-                      clip.renderStatus === 'queued' ||
-                      clip.renderStatus === 'rendering' ||
-                      clip.renderStatus === 'validating'
-                    }
+                    disabled={isCurrentlyRenderingMp4}
                     onClick={() => void handleQuickRenderH264Mp4()}
                     title="Render an H.264 MP4 preview with burned-in captions so you can inspect the exact exported MP4"
                     className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold border border-[#D4AF37]/35 bg-[#0E1913] hover:bg-[#15261D] text-[#FEF3C7] transition-colors disabled:opacity-50"
                   >
-                    {quickRenderingMp4 ||
-                    clip.renderStatus === 'queued' ||
-                    clip.renderStatus === 'rendering' ||
-                    clip.renderStatus === 'validating' ? (
+                    {isCurrentlyRenderingMp4 ? (
                       <>
                         <Loader2 className="w-3 h-3 animate-spin text-[#F5C451]" />
-                        Rendering H.264 MP4...
+                        Rendering H.264 MP4 {localRenderProgress ? `(${localRenderProgress}%)` : '...'}
                       </>
                     ) : (
                       <>
@@ -789,8 +876,11 @@ export function ClipPreviewPlayer({
             preload="metadata"
             onLoadedMetadata={() => {
               setMediaError(false);
-              if (videoRef.current && !showingRendered) {
-                videoRef.current.currentTime = clip.startTime;
+              if (videoRef.current) {
+                videoRef.current.playbackRate = playbackRate;
+                if (!showingRendered) {
+                  videoRef.current.currentTime = clip.startTime;
+                }
               }
             }}
             onTimeUpdate={handleVideoTimeUpdate}
@@ -833,6 +923,11 @@ export function ClipPreviewPlayer({
                       <Loader2 className="w-3.5 h-3.5 animate-spin text-[#F5C451]" />
                       <span>Rendering Universal H.264 MP4 Preview...</span>
                     </>
+                  ) : showingRendered ? (
+                    <>
+                      <Film className="w-3.5 h-3.5 text-[#F5C451]" />
+                      <span>H.264 MP4 Preview Stream</span>
+                    </>
                   ) : (
                     <>
                       <Film className="w-3.5 h-3.5 text-[#F5C451]" />
@@ -845,20 +940,47 @@ export function ClipPreviewPlayer({
                 <p className="text-[11px] text-zinc-300 leading-relaxed">
                   {project.browserProxyStatus === 'transcoding' || proxyRepairing
                     ? 'Converting this video format into a universal browser-playable H.264/AAC MP4 stream automatically...'
-                    : 'Click below to generate a universal H.264 MP4 browser preview for this format.'}
+                    : showingRendered
+                      ? 'Click below to re-render the burned-in H.264 MP4 preview stream.'
+                      : 'Click below to generate a universal H.264 MP4 browser preview for this format.'}
                 </p>
                 {!proxyRepairing && project.browserProxyStatus !== 'transcoding' && (
                   <button
                     type="button"
-                    onClick={() => void triggerH264BrowserPreviewRepair(true)}
+                    onClick={() =>
+                      showingRendered
+                        ? void handleQuickRenderH264Mp4()
+                        : void triggerH264BrowserPreviewRepair(true)
+                    }
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-[#059669] hover:bg-[#10B981] text-white font-semibold text-[11px] transition-colors"
                   >
                     <RefreshCw className="w-3 h-3" />
-                    Render Universal H.264 Preview Now
+                    {showingRendered ? 'Re-Render H.264 MP4 Preview' : 'Render Universal H.264 Preview Now'}
                   </button>
                 )}
               </div>
             )}
+          </div>
+        )}
+
+        {/* Live H.264 MP4 Rendering Progress Banner Overlay inside Canvas */}
+        {isCurrentlyRenderingMp4 && (
+          <div className="absolute bottom-3 left-3 right-3 z-40 p-2.5 rounded-lg bg-[#050A07]/90 backdrop-blur-md border border-[#D4AF37]/45 shadow-xl space-y-1.5">
+            <div className="flex items-center justify-between text-[11px]">
+              <span className="inline-flex items-center gap-1.5 font-semibold text-[#F5C451] truncate">
+                <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                {localRenderDetail || 'Rendering H.264 MP4 Preview (avc1 / yuv420p / AAC)...'}
+              </span>
+              <span className="font-mono font-bold text-white tabular-nums">
+                {localRenderProgress ?? 10}%
+              </span>
+            </div>
+            <div className="h-1.5 rounded-full bg-[#132219] overflow-hidden">
+              <div
+                style={{ width: `${Math.max(8, localRenderProgress ?? 10)}%` }}
+                className="h-full bg-gradient-to-r from-[#059669] via-[#10B981] to-[#D4AF37] transition-[width] duration-200"
+              />
+            </div>
           </div>
         )}
 
@@ -879,7 +1001,7 @@ export function ClipPreviewPlayer({
           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-black/70 backdrop-blur-sm border border-[#10B981]/35 font-mono text-[10px] text-emerald-300">
             <Sparkles className="w-2.5 h-2.5 text-[#F5C451]" />
             {showingRendered
-              ? `H.264 MP4 Preview Rendered (${clip.renderedResolution || `${srcWidth}×${srcHeight}`})`
+              ? `H.264 MP4 Preview Rendered · ${clip.renderedResolution || `${srcWidth}×${srcHeight}`} · avc1/AAC`
               : `1:1 Export-Matched Preview · ${
                   reviewAspectRatio === 'original' ? `${srcWidth}×${srcHeight}` : reviewAspectRatio
                 }`}
@@ -1195,9 +1317,9 @@ export function ClipPreviewPlayer({
         })()}
       </div>
 
-      {/* Transport Controls */}
+      {/* High-End Transport Controls (Play/Pause, Frame-Step, Scrubber, Speed, Audio & Fullscreen) */}
       {showControls && (
-        <div className="w-full mt-3 flex items-center gap-3 px-1">
+        <div className="w-full mt-3 flex flex-wrap items-center gap-2 px-1">
           <button
             onClick={() => void togglePlay()}
             aria-label={isPlaying ? 'Pause preview' : 'Play preview'}
@@ -1209,16 +1331,55 @@ export function ClipPreviewPlayer({
           <button
             onClick={handleRestart}
             aria-label="Restart clip"
-            className="flex items-center justify-center h-9 w-9 rounded-lg bg-[#0E1913] hover:bg-[#14241B] border border-[#D4AF37]/20 text-zinc-300 shrink-0 transition-colors"
+            title="Restart clip from 0:00"
+            className="flex items-center justify-center h-9 w-8 rounded-lg bg-[#0E1913] hover:bg-[#14241B] border border-[#D4AF37]/20 text-zinc-300 shrink-0 transition-colors"
           >
-            <RotateCcw className="w-4 h-4" />
+            <RotateCcw className="w-3.5 h-3.5" />
           </button>
+
+          {/* Frame-by-Frame Precision Step (-40ms / +40ms) for exact word-onset & H.264 frame inspection */}
+          <div className="inline-flex rounded-lg overflow-hidden border border-[#D4AF37]/20 bg-[#0E1913] shrink-0">
+            <button
+              type="button"
+              onClick={() => {
+                const next = Math.max(0, Number((relTime - 0.04).toFixed(3)));
+                setRelTime(next);
+                onTimeUpdate?.(next);
+                if (videoRef.current) {
+                  videoRef.current.pause();
+                  setIsPlaying(false);
+                  videoRef.current.currentTime = showingRendered ? next : clip.startTime + next;
+                }
+              }}
+              title="Step back 1 frame (-40ms)"
+              className="h-9 w-7 flex items-center justify-center text-zinc-300 hover:bg-[#14241B] hover:text-white transition-colors"
+            >
+              <ChevronLeft className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                const next = Math.min(clipDuration, Number((relTime + 0.04).toFixed(3)));
+                setRelTime(next);
+                onTimeUpdate?.(next);
+                if (videoRef.current) {
+                  videoRef.current.pause();
+                  setIsPlaying(false);
+                  videoRef.current.currentTime = showingRendered ? next : clip.startTime + next;
+                }
+              }}
+              title="Step forward 1 frame (+40ms)"
+              className="h-9 w-7 flex items-center justify-center text-zinc-300 hover:bg-[#14241B] hover:text-white border-l border-[#D4AF37]/15 transition-colors"
+            >
+              <ChevronRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
 
           <input
             type="range"
             min={0}
             max={clipDuration}
-            step={0.05}
+            step={0.02}
             value={Math.min(clipDuration, relTime)}
             onChange={(e) => {
               const val = Number(e.target.value);
@@ -1231,19 +1392,51 @@ export function ClipPreviewPlayer({
                 bgVideoRef.current.currentTime = clip.startTime + val;
               }
             }}
-            className="flex-1 accent-[#10B981] h-1.5 bg-[#132219] rounded-lg cursor-pointer"
+            className="flex-1 min-w-[90px] accent-[#10B981] h-1.5 bg-[#132219] rounded-lg cursor-pointer"
           />
 
           <span className="font-mono text-xs text-zinc-300 tabular-nums whitespace-nowrap shrink-0">
             {formatTimecode(relTime, true)} / {formatTimecode(clipDuration, true)}
           </span>
 
+          {/* Playback Speed Selector */}
+          <select
+            value={playbackRate}
+            onChange={(e) => setPlaybackRate(Number(e.target.value))}
+            title="Preview playback speed"
+            className="h-9 px-1.5 rounded-lg bg-[#0E1913] border border-[#D4AF37]/20 font-mono text-[11px] text-[#F5C451] shrink-0"
+          >
+            <option value={0.5} className="bg-[#0C1510]">0.5×</option>
+            <option value={0.75} className="bg-[#0C1510]">0.75×</option>
+            <option value={1} className="bg-[#0C1510]">1.0×</option>
+            <option value={1.25} className="bg-[#0C1510]">1.25×</option>
+            <option value={1.5} className="bg-[#0C1510]">1.5×</option>
+          </select>
+
           <button
             onClick={() => setIsMuted((m) => !m)}
             aria-label={isMuted ? 'Unmute audio' : 'Mute audio'}
-            className="flex items-center justify-center h-9 w-9 rounded-lg bg-[#0E1913] hover:bg-[#14241B] border border-[#D4AF37]/20 text-zinc-300 shrink-0 transition-colors"
+            className="flex items-center justify-center h-9 w-8 rounded-lg bg-[#0E1913] hover:bg-[#14241B] border border-[#D4AF37]/20 text-zinc-300 shrink-0 transition-colors"
           >
             {isMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              const target = containerRef.current || videoRef.current;
+              if (!target) return;
+              if (document.fullscreenElement) {
+                void document.exitFullscreen().catch(() => {});
+              } else if (target.requestFullscreen) {
+                void target.requestFullscreen().catch(() => {});
+              }
+            }}
+            title="Toggle Fullscreen Preview"
+            aria-label="Toggle Fullscreen Preview"
+            className="flex items-center justify-center h-9 w-8 rounded-lg bg-[#0E1913] hover:bg-[#14241B] border border-[#D4AF37]/20 text-zinc-300 shrink-0 transition-colors"
+          >
+            <Maximize className="w-3.5 h-3.5" />
           </button>
         </div>
       )}

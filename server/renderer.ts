@@ -1372,8 +1372,8 @@ export async function renderClipWithFFmpeg(params: {
     options.codec === 'h265'
       ? ['-tag:v', 'hvc1']
       : outW > 1920 || outH > 1920
-        ? ['-profile:v', 'high', '-level:v', '5.1']
-        : ['-profile:v', 'high', '-level:v', '4.2'];
+        ? ['-profile:v', 'high', '-level:v', '5.1', '-tag:v', 'avc1']
+        : ['-profile:v', 'high', '-level:v', '4.2', '-tag:v', 'avc1'];
 
   const keepOriginalFps = options.fps === 'original' || (preserveOriginal && !options.fps);
   const fpsFlags: string[] = keepOriginalFps ? [] : ['-r', String(options.fps || 30)];
@@ -1382,7 +1382,7 @@ export async function renderClipWithFFmpeg(params: {
     ? []
     : copyOriginalAudio
       ? ['-c:a', 'copy']
-      : ['-c:a', 'aac', '-b:a', preserveOriginal ? '256k' : '192k', '-ar', '48000'];
+      : ['-c:a', 'aac', '-b:a', preserveOriginal ? '256k' : '192k', '-ar', '48000', '-ac', '2'];
 
   const ffmpegArgs: string[] = [
     '-y',
@@ -1490,7 +1490,7 @@ export async function renderClipWithFFmpeg(params: {
     }
 
     const storageObjectPath = `projects/${project.id}/clips/${clip.id}/${outFilename}`;
-    const publicUrl = `/media/${storageObjectPath}`;
+    const publicUrl = `/media/${storageObjectPath}?t=${Date.now()}`;
     const completedAt = new Date().toISOString();
     const resolutionLabel = `${validationMeta.width}x${validationMeta.height}`;
 

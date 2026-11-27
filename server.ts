@@ -216,7 +216,7 @@ async function ensureBrowserH264Preview(
     }
   }
 
-  // Transcode to universal H.264 (libx264, yuv420p, baseline/main compatible) + AAC stereo MP4 with +faststart
+  // Transcode to universal H.264 (libx264, yuv420p, avc1 High@4.1) + AAC stereo MP4 with +faststart
   project.browserProxyStatus = 'transcoding';
   store.upsertProject(project);
 
@@ -237,7 +237,13 @@ async function ensureBrowserH264Preview(
     '-preset',
     'ultrafast',
     '-crf',
-    '23',
+    '22',
+    '-profile:v',
+    'high',
+    '-level:v',
+    '4.1',
+    '-tag:v',
+    'avc1',
     '-pix_fmt',
     'yuv420p',
     ...(meta.audioCodec !== 'none' ? ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-ac', '2'] : ['-an']),
@@ -389,7 +395,113 @@ async function createServer() {
     next();
   });
 
-  // Serve project videos, thumbnails, renders, and on-demand synthesized royalty-free music
+  // Serve project videos, thumbnails, and rendered H.264 MP4s with explicit HTTP 206 Partial Content Byte-Range streaming
+  // so HTML5 <video> elements scrub, seek, and play smoothly across Chrome, Safari, Edge, and Firefox.
+  app.use('/media/projects', (req, res, next) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+    const relPath = decodeURIComponent(req.path || '').replace(/^\/+/, '');
+    if (!relPath || relPath.includes('..')) return next();
+
+    const resolvedBase = path.resolve(PROJECTS_DIR);
+    const fullPath = path.resolve(resolvedBase, relPath);
+    if (!fullPath.startsWith(resolvedBase + path.sep)) return next();
+    if (!fs.existsSync(fullPath)) return next();
+
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(fullPath);
+    } catch {
+      return next();
+    }
+    if (!stat.isFile() || stat.size <= 0) return next();
+
+    const ext = path.extname(fullPath).toLowerCase();
+    const isVideo =
+      ext === '.mp4' ||
+      ext === '.webm' ||
+      ext === '.mov' ||
+      ext === '.m4v' ||
+      ext === '.mkv' ||
+      ext === '.avi' ||
+      ext === '.ts' ||
+      ext === '.3gp' ||
+      ext === '.flv' ||
+      ext === '.wmv' ||
+      ext === '.mpeg' ||
+      ext === '.mpg' ||
+      ext === '.ogv';
+
+    if (!isVideo) return next();
+
+    const mimeMap: Record<string, string> = {
+      '.mp4': 'video/mp4',
+      '.m4v': 'video/mp4',
+      '.mov': 'video/quicktime',
+      '.webm': 'video/webm',
+      '.ogv': 'video/ogg',
+      '.mkv': 'video/x-matroska',
+      '.avi': 'video/x-msvideo',
+      '.ts': 'video/mp2t',
+      '.3gp': 'video/3gpp',
+      '.flv': 'video/x-flv',
+      '.wmv': 'video/x-ms-wmv',
+      '.mpeg': 'video/mpeg',
+      '.mpg': 'video/mpeg',
+    };
+
+    const contentType = mimeMap[ext] || 'video/mp4';
+    const fileSize = stat.size;
+    const range = req.headers.range;
+
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+
+    if (range) {
+      const parts = range.replace(/bytes=/, '').split('-');
+      const start = parseInt(parts[0], 10);
+      const requestedEnd = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      if (Number.isNaN(start) || start < 0 || start >= fileSize) {
+        res.status(416);
+        res.setHeader('Content-Range', `bytes */${fileSize}`);
+        return res.end();
+      }
+      const end = Math.min(fileSize - 1, Number.isNaN(requestedEnd) ? fileSize - 1 : requestedEnd);
+      const chunkLength = end - start + 1;
+
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+      res.setHeader('Content-Length', String(chunkLength));
+
+      if (req.method === 'HEAD') return res.end();
+
+      const stream = fs.createReadStream(fullPath, { start, end });
+      res.on('close', () => {
+        if (!stream.destroyed) stream.destroy();
+      });
+      stream.on('error', () => {
+        if (!res.headersSent) res.status(500).end();
+        else res.end();
+      });
+      return stream.pipe(res);
+    }
+
+    res.status(200);
+    res.setHeader('Content-Length', String(fileSize));
+    if (req.method === 'HEAD') return res.end();
+
+    const stream = fs.createReadStream(fullPath);
+    res.on('close', () => {
+      if (!stream.destroyed) stream.destroy();
+    });
+    stream.on('error', () => {
+      if (!res.headersSent) res.status(500).end();
+      else res.end();
+    });
+    return stream.pipe(res);
+  });
+
   app.use('/media/projects', express.static(PROJECTS_DIR));
   app.get('/media/music/:filename', async (req, res, next) => {
     const filePath = await ensureMusicFileByName(req.params.filename);
