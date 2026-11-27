@@ -1445,11 +1445,24 @@ export function CaptionStudioPage({
                 </div>
 
                 <div>
-                  <div className="flex justify-between text-xs text-zinc-300 mb-1">
+                  <div className="flex justify-between items-center text-xs text-zinc-300 mb-1">
                     <span>Neon / Radiant Glow Halo Intensity</span>
-                    <span className="font-mono tabular-nums text-zinc-200">
-                      {style.glowIntensity ?? 14}px
-                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        type="number"
+                        min={0}
+                        max={28}
+                        step={1}
+                        value={style.glowIntensity ?? 14}
+                        onChange={(e) => {
+                          const raw = Number(e.target.value);
+                          const clamped = Number.isNaN(raw) ? 0 : Math.max(0, Math.min(28, raw));
+                          setStyle((s) => ({ ...s, glowIntensity: clamped }));
+                        }}
+                        className="w-14 h-6 px-1.5 rounded bg-[#070E0A] border border-[#D4AF37]/25 font-mono text-[11px] text-[#F5C451] text-right"
+                      />
+                      <span className="font-mono text-[11px] text-zinc-400">px</span>
+                    </div>
                   </div>
                   <input
                     type="range"
@@ -1459,6 +1472,39 @@ export function CaptionStudioPage({
                     value={style.glowIntensity ?? 14}
                     onChange={(e) =>
                       setStyle((s) => ({ ...s, glowIntensity: Number(e.target.value) }))
+                    }
+                    className="w-full accent-[#10B981]"
+                  />
+                </div>
+
+                <div className="sm:col-span-2">
+                  <div className="flex justify-between items-center text-xs text-zinc-300 mb-1">
+                    <span>Neon / Radiant Glow Halo Opacity (Manual % or Slider)</span>
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        type="number"
+                        min={0}
+                        max={100}
+                        step={1}
+                        value={Math.round((style.glowOpacity ?? 0.9) * 100)}
+                        onChange={(e) => {
+                          const raw = Number(e.target.value);
+                          const pct = Number.isNaN(raw) ? 0 : Math.max(0, Math.min(100, raw));
+                          setStyle((s) => ({ ...s, glowOpacity: pct / 100 }));
+                        }}
+                        className="w-16 h-6 px-1.5 rounded bg-[#070E0A] border border-[#D4AF37]/25 font-mono text-[11px] text-[#F5C451] text-right"
+                      />
+                      <span className="font-mono text-[11px] text-zinc-400">%</span>
+                    </div>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={Math.round((style.glowOpacity ?? 0.9) * 100)}
+                    onChange={(e) =>
+                      setStyle((s) => ({ ...s, glowOpacity: Number(e.target.value) / 100 }))
                     }
                     className="w-full accent-[#10B981]"
                   />
@@ -1543,20 +1589,28 @@ export function CaptionStudioPage({
               <div className="flex items-center gap-2">
                 <TypeIcon className="w-4 h-4 text-[#F5C451]" />
                 <h2 className="font-display text-sm font-semibold text-white">
-                  Typography, Colors, Stroke &amp; Shadow Studio
+                  Typography, Updated Fonts, Per-Effect Opacity &amp; Shadow Studio
                 </h2>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div>
-                  <label className="block text-xs text-zinc-400 mb-1">Font Family</label>
+                  <label className="block text-xs text-zinc-400 mb-1">
+                    Font Family ({CAPTION_FONTS.length} Studio Fonts)
+                  </label>
                   <select
                     value={style.fontFamily}
                     onChange={(e) => setStyle((s) => ({ ...s, fontFamily: e.target.value }))}
+                    style={{ fontFamily: `"${style.fontFamily}", sans-serif` }}
                     className="w-full h-9 px-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/18 text-xs text-white"
                   >
                     {CAPTION_FONTS.map((f) => (
-                      <option key={f} value={f} className="bg-[#0C1510]">
+                      <option
+                        key={f}
+                        value={f}
+                        style={{ fontFamily: `"${f}", sans-serif` }}
+                        className="bg-[#0C1510]"
+                      >
                         {f}
                       </option>
                     ))}
@@ -1604,6 +1658,38 @@ export function CaptionStudioPage({
                 </div>
               </div>
 
+              {/* Quick-Pick Updated Creator Fonts Bar */}
+              <div className="p-3 rounded-lg bg-[#0A130E] border border-[#D4AF37]/15">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[11px] font-semibold text-zinc-200">
+                    Quick-Pick Updated Creator &amp; Display Fonts
+                  </span>
+                  <span className="text-[10px] text-[#F5C451] font-mono">
+                    Active: {style.fontFamily}
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {CAPTION_FONTS.map((fontName) => {
+                    const isSelected = style.fontFamily === fontName;
+                    return (
+                      <button
+                        key={fontName}
+                        type="button"
+                        onClick={() => setStyle((s) => ({ ...s, fontFamily: fontName }))}
+                        style={{ fontFamily: `"${fontName}", sans-serif` }}
+                        className={`px-2.5 py-1 rounded-md text-xs border transition-colors ${
+                          isSelected
+                            ? 'bg-[#059669]/25 border-[#D4AF37]/75 text-white font-semibold'
+                            : 'bg-[#0C1510] border-[#D4AF37]/15 text-zinc-300 hover:border-[#D4AF37]/40 hover:text-white'
+                        }`}
+                      >
+                        {fontName}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
               {/* Color Pickers */}
               <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
                 {(
@@ -1635,12 +1721,160 @@ export function CaptionStudioPage({
                 })}
               </div>
 
-              {/* Typography & Stroke Sliders */}
+              {/* Per-Effect Opacity Studio (Manual Type-In % + Slider) */}
+              <div className="p-3.5 rounded-lg bg-[#0A130E] border border-[#D4AF37]/20 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <span className="text-xs font-semibold text-white">
+                      Per-Effect Opacity Controls (Manual Type-In % + Slider)
+                    </span>
+                    <p className="text-[11px] text-zinc-400">
+                      Type an exact percentage (0–100%) or drag the slider to fine-tune each caption effect&apos;s transparency.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setStyle((s) => ({
+                        ...s,
+                        textOpacity: 1,
+                        highlightOpacity: 1,
+                        strokeOpacity: 1,
+                        shadowOpacity: 0.85,
+                        glowOpacity: 0.9,
+                      }))
+                    }
+                    className="px-2.5 py-1 rounded-md bg-[#0C1510] border border-[#D4AF37]/25 hover:border-[#D4AF37]/50 text-[11px] text-zinc-300"
+                  >
+                    Reset Effect Opacities
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+                  {(
+                    [
+                      {
+                        key: 'textOpacity',
+                        label: 'Base Caption Text Opacity',
+                        fallback: 1,
+                      },
+                      {
+                        key: 'highlightOpacity',
+                        label: 'Active Spoken Word Highlight Opacity',
+                        fallback: 1,
+                      },
+                      {
+                        key: 'strokeOpacity',
+                        label: 'Outline Stroke Opacity',
+                        fallback: 1,
+                      },
+                      {
+                        key: 'shadowOpacity',
+                        label: 'Drop Shadow Opacity',
+                        fallback: 0.85,
+                      },
+                      {
+                        key: 'glowOpacity',
+                        label: 'Neon / Radiant Glow Halo Opacity',
+                        fallback: 0.9,
+                      },
+                      {
+                        key: 'activeWordBgOpacity',
+                        label: 'Active Spoken Word Pill Box Opacity',
+                        fallback: 0,
+                      },
+                      {
+                        key: 'backgroundOpacity',
+                        label: 'Caption Backdrop Box Opacity',
+                        fallback: 0,
+                      },
+                    ] as const
+                  ).map(({ key, label, fallback }) => {
+                    const currentOpacity =
+                      typeof style[key] === 'number' ? (style[key] as number) : fallback;
+                    const pctValue = Math.round(currentOpacity * 100);
+                    return (
+                      <div
+                        key={key}
+                        className="p-2.5 rounded-lg bg-[#0C1510] border border-[#D4AF37]/14"
+                      >
+                        <div className="flex items-center justify-between gap-2 mb-1.5">
+                          <span className="text-xs text-zinc-200 font-medium">{label}</span>
+                          <div className="flex items-center gap-1">
+                            <input
+                              type="number"
+                              min={0}
+                              max={100}
+                              step={1}
+                              value={pctValue}
+                              onChange={(e) => {
+                                const raw = Number(e.target.value);
+                                const clamped = Number.isNaN(raw)
+                                  ? 0
+                                  : Math.max(0, Math.min(100, raw));
+                                setStyle((s) => ({
+                                  ...s,
+                                  [key]: clamped / 100,
+                                  ...(key === 'activeWordBgOpacity'
+                                    ? { activeWordBgColor: s.activeWordBgColor || '#10B981' }
+                                    : {}),
+                                  ...(key === 'shadowOpacity' && clamped > 0
+                                    ? { shadow: true }
+                                    : {}),
+                                }));
+                              }}
+                              aria-label={`${label} percentage`}
+                              className="w-16 h-7 px-2 rounded bg-[#070E0A] border border-[#D4AF37]/30 font-mono text-xs text-[#F5C451] text-right focus:outline-none focus:border-[#10B981]"
+                            />
+                            <span className="font-mono text-xs text-zinc-400">%</span>
+                          </div>
+                        </div>
+                        <input
+                          type="range"
+                          min={0}
+                          max={100}
+                          step={1}
+                          value={pctValue}
+                          onChange={(e) => {
+                            const clamped = Math.max(0, Math.min(100, Number(e.target.value)));
+                            setStyle((s) => ({
+                              ...s,
+                              [key]: clamped / 100,
+                              ...(key === 'activeWordBgOpacity'
+                                ? { activeWordBgColor: s.activeWordBgColor || '#10B981' }
+                                : {}),
+                              ...(key === 'shadowOpacity' && clamped > 0 ? { shadow: true } : {}),
+                            }));
+                          }}
+                          className="w-full accent-[#10B981]"
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Typography & Stroke Sliders (with Manual Type-In Inputs) */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
-                  <div className="flex justify-between text-xs text-zinc-400 mb-1">
+                  <div className="flex justify-between items-center text-xs text-zinc-400 mb-1">
                     <span>Font Size</span>
-                    <span className="font-mono tabular-nums text-zinc-200">{style.fontSize}px</span>
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="number"
+                        min={14}
+                        max={96}
+                        step={1}
+                        value={style.fontSize}
+                        onChange={(e) => {
+                          const raw = Number(e.target.value);
+                          const clamped = Number.isNaN(raw) ? 18 : Math.max(14, Math.min(96, raw));
+                          setStyle((s) => ({ ...s, fontSize: clamped }));
+                        }}
+                        className="w-14 h-6 px-1.5 rounded bg-[#070E0A] border border-[#D4AF37]/25 font-mono text-[11px] text-zinc-200 text-right"
+                      />
+                      <span className="font-mono text-[11px] text-zinc-400">px</span>
+                    </div>
                   </div>
                   <input
                     type="range"
@@ -1653,9 +1887,24 @@ export function CaptionStudioPage({
                 </div>
 
                 <div>
-                  <div className="flex justify-between text-xs text-zinc-400 mb-1">
+                  <div className="flex justify-between items-center text-xs text-zinc-400 mb-1">
                     <span>Outline Stroke Width</span>
-                    <span className="font-mono tabular-nums text-zinc-200">{style.strokeWidth}px</span>
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="number"
+                        min={0}
+                        max={12}
+                        step={0.5}
+                        value={style.strokeWidth}
+                        onChange={(e) => {
+                          const raw = Number(e.target.value);
+                          const clamped = Number.isNaN(raw) ? 0 : Math.max(0, Math.min(12, raw));
+                          setStyle((s) => ({ ...s, strokeWidth: clamped }));
+                        }}
+                        className="w-14 h-6 px-1.5 rounded bg-[#070E0A] border border-[#D4AF37]/25 font-mono text-[11px] text-zinc-200 text-right"
+                      />
+                      <span className="font-mono text-[11px] text-zinc-400">px</span>
+                    </div>
                   </div>
                   <input
                     type="range"
@@ -1727,11 +1976,28 @@ export function CaptionStudioPage({
                 </div>
 
                 <div>
-                  <div className="flex justify-between text-xs text-zinc-400 mb-1">
+                  <div className="flex justify-between items-center text-xs text-zinc-400 mb-1">
                     <span>Drop Shadow Blur Depth</span>
-                    <span className="font-mono tabular-nums text-zinc-200">
-                      {style.shadowBlur ?? 10}px
-                    </span>
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="number"
+                        min={0}
+                        max={36}
+                        step={1}
+                        value={style.shadowBlur ?? 10}
+                        onChange={(e) => {
+                          const raw = Number(e.target.value);
+                          const clamped = Number.isNaN(raw) ? 0 : Math.max(0, Math.min(36, raw));
+                          setStyle((s) => ({
+                            ...s,
+                            shadowBlur: clamped,
+                            shadow: clamped > 0,
+                          }));
+                        }}
+                        className="w-14 h-6 px-1.5 rounded bg-[#070E0A] border border-[#D4AF37]/25 font-mono text-[11px] text-zinc-200 text-right"
+                      />
+                      <span className="font-mono text-[11px] text-zinc-400">px</span>
+                    </div>
                   </div>
                   <input
                     type="range"
@@ -1829,22 +2095,39 @@ export function CaptionStudioPage({
                 </label>
 
                 <div>
-                  <div className="flex justify-between text-xs text-zinc-400 mb-1">
+                  <div className="flex justify-between items-center text-xs text-zinc-400 mb-1">
                     <span>Pill Opacity</span>
-                    <span className="font-mono tabular-nums text-zinc-200">
-                      {Math.round((style.activeWordBgOpacity ?? 0) * 100)}%
-                    </span>
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="number"
+                        min={0}
+                        max={100}
+                        step={1}
+                        value={Math.round((style.activeWordBgOpacity ?? 0) * 100)}
+                        onChange={(e) => {
+                          const raw = Number(e.target.value);
+                          const pct = Number.isNaN(raw) ? 0 : Math.max(0, Math.min(100, raw));
+                          setStyle((s) => ({
+                            ...s,
+                            activeWordBgOpacity: pct / 100,
+                            activeWordBgColor: s.activeWordBgColor || '#10B981',
+                          }));
+                        }}
+                        className="w-15 h-6 px-1.5 rounded bg-[#070E0A] border border-[#D4AF37]/25 font-mono text-[11px] text-[#F5C451] text-right"
+                      />
+                      <span className="font-mono text-[11px] text-zinc-400">%</span>
+                    </div>
                   </div>
                   <input
                     type="range"
                     min={0}
-                    max={1}
-                    step={0.05}
-                    value={style.activeWordBgOpacity ?? 0}
+                    max={100}
+                    step={1}
+                    value={Math.round((style.activeWordBgOpacity ?? 0) * 100)}
                     onChange={(e) =>
                       setStyle((s) => ({
                         ...s,
-                        activeWordBgOpacity: Number(e.target.value),
+                        activeWordBgOpacity: Number(e.target.value) / 100,
                         activeWordBgColor: s.activeWordBgColor || '#10B981',
                       }))
                     }
@@ -1856,20 +2139,33 @@ export function CaptionStudioPage({
               {/* Backdrop Box & Line Layout Sliders */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
-                  <div className="flex justify-between text-xs text-zinc-400 mb-1">
+                  <div className="flex justify-between items-center text-xs text-zinc-400 mb-1">
                     <span>Caption Backdrop Opacity</span>
-                    <span className="font-mono tabular-nums text-zinc-200">
-                      {Math.round(style.backgroundOpacity * 100)}%
-                    </span>
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="number"
+                        min={0}
+                        max={100}
+                        step={1}
+                        value={Math.round(style.backgroundOpacity * 100)}
+                        onChange={(e) => {
+                          const raw = Number(e.target.value);
+                          const pct = Number.isNaN(raw) ? 0 : Math.max(0, Math.min(100, raw));
+                          setStyle((s) => ({ ...s, backgroundOpacity: pct / 100 }));
+                        }}
+                        className="w-15 h-6 px-1.5 rounded bg-[#070E0A] border border-[#D4AF37]/25 font-mono text-[11px] text-[#F5C451] text-right"
+                      />
+                      <span className="font-mono text-[11px] text-zinc-400">%</span>
+                    </div>
                   </div>
                   <input
                     type="range"
                     min={0}
-                    max={1}
-                    step={0.05}
-                    value={style.backgroundOpacity}
+                    max={100}
+                    step={1}
+                    value={Math.round(style.backgroundOpacity * 100)}
                     onChange={(e) =>
-                      setStyle((s) => ({ ...s, backgroundOpacity: Number(e.target.value) }))
+                      setStyle((s) => ({ ...s, backgroundOpacity: Number(e.target.value) / 100 }))
                     }
                     className="w-full accent-[#10B981]"
                   />

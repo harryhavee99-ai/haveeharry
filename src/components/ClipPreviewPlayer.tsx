@@ -829,7 +829,29 @@ export function ClipPreviewPlayer({
             ))}
 
         {/* Synchronized Word-Level Captions Overlay — 1:1 WYSIWYG match with FFmpeg ASS Subtitle Burn-In */}
-        {!showingRendered && cs.enabled && activeCaptionGroup && (
+        {!showingRendered && cs.enabled && activeCaptionGroup && (() => {
+          const hexToRgba = (hex: string, alpha = 1) => {
+            const clean = (hex || '#FFFFFF').replace('#', '').trim();
+            const full =
+              clean.length === 3
+                ? clean
+                    .split('')
+                    .map((c) => c + c)
+                    .join('')
+                : clean.padEnd(6, 'F').slice(0, 6);
+            const r = parseInt(full.slice(0, 2), 16) || 0;
+            const g = parseInt(full.slice(2, 4), 16) || 0;
+            const b = parseInt(full.slice(4, 6), 16) || 0;
+            return `rgba(${r}, ${g}, ${b}, ${Math.max(0, Math.min(1, alpha)).toFixed(3)})`;
+          };
+
+          const textAlpha = Math.max(0, Math.min(1, cs.textOpacity ?? 1));
+          const highlightAlpha = Math.max(0, Math.min(1, cs.highlightOpacity ?? 1));
+          const strokeAlpha = Math.max(0, Math.min(1, cs.strokeOpacity ?? 1));
+          const shadowAlpha = Math.max(0, Math.min(1, cs.shadowOpacity ?? 0.85));
+          const glowAlpha = Math.max(0, Math.min(1, cs.glowOpacity ?? 0.9));
+
+          return (
           <div
             style={{
               // Match libass Alignment (1-3 bottom anchor, 4-6 middle anchor, 7-9 top anchor) & MarginV exactly:
@@ -873,21 +895,23 @@ export function ClipPreviewPlayer({
                 borderRadius: `${wysiwygMetrics.radiusPx}px`,
                 padding: `${wysiwygMetrics.padY}px ${wysiwygMetrics.padX}px`,
                 backgroundColor:
-                  cs.backgroundOpacity > 0.05
-                    ? `${cs.backgroundColor}${Math.round(cs.backgroundOpacity * 255)
-                        .toString(16)
-                        .padStart(2, '0')}`
+                  cs.backgroundOpacity > 0.02
+                    ? hexToRgba(cs.backgroundColor, cs.backgroundOpacity)
                     : 'transparent',
                 paintOrder: 'stroke fill',
-                textShadow: cs.shadow
-                  ? `0 ${Math.max(1, Math.round(2 * wysiwygMetrics.domScale))}px ${Math.max(
-                      2,
-                      Math.round((cs.shadowBlur ?? 10) * wysiwygMetrics.domScale)
-                    )}px ${cs.shadowColor || 'rgba(0,0,0,0.92)'}, 0 1px 2px rgba(0,0,0,0.95)`
-                  : 'none',
+                textShadow:
+                  cs.shadow && shadowAlpha > 0.01
+                    ? `0 ${Math.max(1, Math.round(2 * wysiwygMetrics.domScale))}px ${Math.max(
+                        2,
+                        Math.round((cs.shadowBlur ?? 10) * wysiwygMetrics.domScale)
+                      )}px ${hexToRgba(cs.shadowColor || '#000000', shadowAlpha)}, 0 1px 2px ${hexToRgba(
+                        cs.shadowColor || '#000000',
+                        Math.min(1, shadowAlpha * 1.1)
+                      )}`
+                    : 'none',
                 WebkitTextStroke:
-                  wysiwygMetrics.strokePx > 0 && cs.backgroundOpacity <= 0.05
-                    ? `${wysiwygMetrics.strokePx}px ${cs.strokeColor}`
+                  wysiwygMetrics.strokePx > 0 && strokeAlpha > 0.01 && cs.backgroundOpacity <= 0.05
+                    ? `${wysiwygMetrics.strokePx}px ${hexToRgba(cs.strokeColor, strokeAlpha)}`
                     : undefined,
               }}
               className={`inline-block max-w-full ${
@@ -926,7 +950,7 @@ export function ClipPreviewPlayer({
                 const waveAmp = (cs.waveAmplitude ?? 7) * Math.max(0.55, wysiwygMetrics.domScale);
                 const activeScale = cs.activeWordScale ?? 1.1;
                 const glowRadius = Math.max(
-                  4,
+                  2,
                   Math.round((cs.glowIntensity ?? 14) * Math.max(0.55, wysiwygMetrics.domScale))
                 );
 
@@ -960,12 +984,24 @@ export function ClipPreviewPlayer({
                 }
 
                 const hasActivePill =
-                  isActive && (cs.activeWordBgOpacity ?? 0) > 0.05 && Boolean(cs.activeWordBgColor);
+                  isActive && (cs.activeWordBgOpacity ?? 0) > 0.02 && Boolean(cs.activeWordBgColor);
                 const pillBg = hasActivePill
-                  ? `${cs.activeWordBgColor}${Math.round((cs.activeWordBgOpacity ?? 0.9) * 255)
-                      .toString(16)
-                      .padStart(2, '0')}`
+                  ? hexToRgba(cs.activeWordBgColor || '#10B981', cs.activeWordBgOpacity ?? 0.9)
                   : undefined;
+
+                const wordColor =
+                  isActive || isKaraokeLit
+                    ? hexToRgba(cs.highlightColor, highlightAlpha)
+                    : hexToRgba(cs.textColor, textAlpha);
+
+                const showWordGlow =
+                  isActive &&
+                  glowAlpha > 0.02 &&
+                  (cs.glowIntensity ?? 14) > 0 &&
+                  (cs.animation === 'glow' ||
+                    cs.animation === 'neon_pulse' ||
+                    cs.animation === 'wave' ||
+                    cs.glowOpacity !== undefined);
 
                 return (
                   <React.Fragment key={w.id}>
@@ -973,7 +1009,7 @@ export function ClipPreviewPlayer({
                     <span
                       key={isActive ? `${w.id}_active` : w.id}
                       style={{
-                        color: isActive || isKaraokeLit ? cs.highlightColor : cs.textColor,
+                        color: wordColor,
                         opacity: isTypewriterHidden ? 0 : 1,
                         marginRight: `${wysiwygMetrics.wordGapPx}px`,
                         backgroundColor: pillBg,
@@ -987,15 +1023,14 @@ export function ClipPreviewPlayer({
                           ? `${Math.max(3, Math.round(6 * wysiwygMetrics.domScale))}px`
                           : undefined,
                         transform: wordTransform,
-                        textShadow:
-                          isActive &&
-                          (cs.animation === 'glow' ||
-                            cs.animation === 'neon_pulse' ||
-                            cs.animation === 'wave')
-                            ? `0 0 ${glowRadius}px ${cs.highlightColor}, 0 0 ${Math.round(
-                                glowRadius * 0.45
-                              )}px ${cs.highlightColor}, 0 2px 6px rgba(0,0,0,0.92)`
-                            : undefined,
+                        textShadow: showWordGlow
+                          ? `0 0 ${glowRadius}px ${hexToRgba(cs.highlightColor, glowAlpha)}, 0 0 ${Math.round(
+                              glowRadius * 0.45
+                            )}px ${hexToRgba(cs.highlightColor, glowAlpha)}, 0 2px 6px ${hexToRgba(
+                              cs.shadowColor || '#000000',
+                              shadowAlpha
+                            )}`
+                          : undefined,
                       }}
                       className={`inline-block ${
                         cs.animation === 'wave'
@@ -1016,7 +1051,8 @@ export function ClipPreviewPlayer({
               })}
             </div>
           </div>
-        )}
+          );
+        })()}
       </div>
 
       {/* Transport Controls */}

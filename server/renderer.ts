@@ -253,6 +253,20 @@ function mapFontForLinuxAss(fontFamily: string, sampleText: string): string {
   }
   const map: Record<string, string> = {
     'Plus Jakarta Sans': 'DejaVu Sans',
+    'Montserrat': 'DejaVu Sans',
+    'Poppins': 'DejaVu Sans',
+    'Bebas Neue': 'Liberation Sans Narrow',
+    'Anton': 'Liberation Sans Narrow',
+    'Oswald': 'Liberation Sans Narrow',
+    'Outfit': 'DejaVu Sans',
+    'Syne': 'DejaVu Sans',
+    'Space Grotesk': 'Liberation Sans',
+    'Sora': 'DejaVu Sans',
+    'Rubik': 'DejaVu Sans',
+    'Bangers': 'Liberation Sans Narrow',
+    'Righteous': 'DejaVu Sans',
+    'Playfair Display': 'Liberation Serif',
+    'Cinzel': 'Liberation Serif',
     'DM Sans': 'Liberation Sans',
     'Liberation Serif': 'Liberation Serif',
     'JetBrains Mono': 'JetBrains Mono',
@@ -364,16 +378,23 @@ export function generateAssSubtitles(
   const colOffset = style.alignment === 'left' ? 0 : style.alignment === 'right' ? 2 : 1;
   const alignment = rowBase + colOffset;
 
-  const primaryCol = hexToAssColor(style.textColor, 1);
-  const highlightCol = hexToAssColor(style.highlightColor, 1);
+  const textAlpha = Math.max(0, Math.min(1, style.textOpacity ?? 1));
+  const highlightAlpha = Math.max(0, Math.min(1, style.highlightOpacity ?? 1));
+  const strokeAlpha = Math.max(0, Math.min(1, style.strokeOpacity ?? 1));
+  const shadowAlpha = Math.max(0, Math.min(1, style.shadowOpacity ?? 0.85));
+  const glowAlpha = Math.max(0, Math.min(1, style.glowOpacity ?? 0.9));
+
+  const primaryCol = hexToAssColor(style.textColor, textAlpha);
+  const highlightCol = hexToAssColor(style.highlightColor, highlightAlpha);
+  const glowCol = hexToAssColor(style.highlightColor, glowAlpha);
   const hasBox = style.backgroundOpacity > 0.05;
   const outlineCol = hasBox
     ? hexToAssColor(style.backgroundColor, style.backgroundOpacity)
-    : hexToAssColor(style.strokeColor, 1);
+    : hexToAssColor(style.strokeColor, strokeAlpha);
   const shadowHex = style.shadowColor || '#000000';
   const backCol = hasBox
     ? hexToAssColor(style.backgroundColor, style.backgroundOpacity)
-    : hexToAssColor(shadowHex, style.shadow ? 0.7 : 0);
+    : hexToAssColor(shadowHex, style.shadow ? shadowAlpha : 0);
 
   const borderStyle = hasBox ? 3 : 1;
   const padExtra = style.backgroundPadding ? Math.max(2, style.backgroundPadding * 0.5) : 6;
@@ -422,7 +443,9 @@ export function generateAssSubtitles(
   const speed = Math.max(0.4, Math.min(2.5, style.animationSpeed ?? 1.0));
   const waveAmp = Math.max(2, Math.min(20, style.waveAmplitude ?? 7));
   const activeScalePct = Math.round(Math.max(100, Math.min(140, (style.activeWordScale ?? 1.1) * 100)));
-  const glowBlur = Number(Math.max(1.2, Math.min(7.5, ((style.glowIntensity ?? 14) / 6) * scaleFactor)).toFixed(1));
+  const glowBlur = Number(
+    Math.max(1.2, Math.min(7.5, ((style.glowIntensity ?? 14) / 6) * scaleFactor * Math.max(0.2, glowAlpha))).toFixed(1)
+  );
   const hasActivePill = (style.activeWordBgOpacity ?? 0) > 0.08 && Boolean(style.activeWordBgColor);
   const activePillCol = hasActivePill
     ? hexToAssColor(style.activeWordBgColor || '#10B981', style.activeWordBgOpacity ?? 0.9)
@@ -512,7 +535,7 @@ export function generateAssSubtitles(
                 return `${lineBreak}{\\c${highlightCol}${pillApply}\\fscx${activeScalePct}\\fscy${activeScalePct}\\frz${shakeDeg}\\t(0,${s1},\\frz-${shakeDeg})\\t(${s1},${s2},\\frz${Math.round(shakeDeg * 0.6)})\\t(${s2},${s3},\\frz0)}${safeWord}{\\c${primaryCol}${pillReset}\\fscx100\\fscy100\\frz0}`;
               }
               if (style.animation === 'neon_pulse' || style.animation === 'glow') {
-                const haloTag = hasBox ? pillApply : `\\3c${highlightCol}\\blur${glowBlur}`;
+                const haloTag = hasBox ? pillApply : `\\3c${glowCol}\\blur${glowBlur}`;
                 const resetHalo = hasBox ? pillReset : `\\3c${outlineCol}\\blur0.4`;
                 const pulseScale = style.animation === 'neon_pulse' ? Math.max(108, activeScalePct) : activeScalePct;
                 return `${lineBreak}{\\c${highlightCol}${haloTag}\\fscx${pulseScale}\\fscy${pulseScale}\\t(0,${animDur1},\\fscx104\\fscy104)}${safeWord}{\\c${primaryCol}${resetHalo}\\fscx100\\fscy100}`;

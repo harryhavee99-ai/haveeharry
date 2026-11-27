@@ -199,6 +199,12 @@ export interface CaptionStyleConfig {
   shadowColor?: string; // default '#000000'
   shadowBlur?: number; // 0..24 px (default 10)
   wordLeadInMs?: number; // -150..150 ms (default 35ms perceptual vocal onset lead-in)
+  // Per-Effect Independent Opacity Controls (0..1, default 1.0)
+  textOpacity?: number; // 0..1 (default 1)
+  highlightOpacity?: number; // 0..1 (default 1)
+  strokeOpacity?: number; // 0..1 (default 1)
+  shadowOpacity?: number; // 0..1 (default 0.85)
+  glowOpacity?: number; // 0..1 (default 0.9)
 }
 
 export interface ColorGradingConfig {
