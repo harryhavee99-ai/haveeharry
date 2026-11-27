@@ -231,6 +231,17 @@ export const api = {
       body: JSON.stringify(patch),
     }),
 
+  ensureBrowserPreview: (projectId: string, force = true) =>
+    requestJson<{
+      sourceUrl?: string;
+      browserProxyStatus: 'ready' | 'transcoding' | 'failed';
+      project: ProjectRecord;
+    }>(`/api/projects/${projectId}/ensure-preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force }),
+    }),
+
   createFullVideoCaptions: (
     projectId: string,
     payload?: { captionPresetId?: string; autoRender?: boolean; language?: string }

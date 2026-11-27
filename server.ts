@@ -85,15 +85,226 @@ const ALLOWED_EXTENSIONS = new Set([
   '.flv',
   '.ts',
   '.3gp',
+  '.3g2',
   '.wmv',
+  '.asf',
   '.mpeg',
   '.mpg',
   '.mts',
   '.m2ts',
   '.ogv',
+  '.ogg',
   '.vob',
+  '.f4v',
+  '.divx',
+  '.mxf',
+  '.rm',
+  '.rmvb',
 ]);
 const CHUNK_SIZE_BYTES = 4 * 1024 * 1024; // 4 MB high-speed proxy-safe chunks (supports parallel worker streaming & unlimited file sizes)
+
+const activePreviewTranscodes = new Map<string, Promise<string | undefined>>();
+
+/**
+ * Ensures any uploaded video format (MP4, MOV, MKV, WebM, AVI, FLV, WMV, 3GP, TS, MTS, M2TS, MPEG, VOB,
+ * OGV, MXF, HEVC/H.265, ProRes, 10-bit H.264, AC3/EAC3/PCM audio, etc.) has a universal browser-playable
+ * H.264 (yuv420p) + AAC MP4 preview (`preview_browser.mp4`).
+ */
+async function ensureBrowserH264Preview(
+  project: ProjectRecord,
+  options: { forceTranscode?: boolean; waitIfFast?: boolean } = {}
+): Promise<{ sourceUrl?: string; status: 'ready' | 'transcoding' | 'failed' }> {
+  const { forceTranscode = false, waitIfFast = true } = options;
+  if (!project.sourcePath || !fs.existsSync(project.sourcePath)) {
+    return { sourceUrl: project.sourceUrl, status: 'failed' };
+  }
+
+  const projectDir = store.getProjectDir(project.id);
+  const previewPath = path.join(projectDir, 'preview_browser.mp4');
+  const previewTmpPath = path.join(projectDir, 'preview_browser.tmp.mp4');
+  const previewUrl = `/media/projects/${project.id}/preview_browser.mp4`;
+
+  if (!forceTranscode && fs.existsSync(previewPath) && fs.statSync(previewPath).size > 0) {
+    project.sourceUrl = `${previewUrl}?t=${fs.statSync(previewPath).mtimeMs}`;
+    project.browserProxyStatus = 'ready';
+    store.upsertProject(project);
+    return { sourceUrl: project.sourceUrl, status: 'ready' };
+  }
+
+  const meta = project.metadata ?? (await probeVideoFile(project.sourcePath));
+  const ext = path.extname(project.sourcePath).toLowerCase() || '.mp4';
+  const targetFilename = path.basename(project.sourcePath);
+
+  const isH264 = meta.codec === 'h264' || meta.codec === 'avc1';
+  const is8BitYuv420 =
+    !meta.pixFmt || meta.pixFmt === 'yuv420p' || meta.pixFmt === 'yuvj420p' || meta.pixFmt === 'nv12';
+  const isBrowserAudio =
+    meta.audioCodec === 'aac' ||
+    meta.audioCodec === 'mp3' ||
+    meta.audioCodec === 'opus' ||
+    meta.audioCodec === 'none';
+
+  // Only treat native .mp4 with 8-bit yuv420p H.264 + AAC/MP3 as directly playable without a proxy
+  // (unless forceTranscode was explicitly requested after a browser <video> error or user clicked "Render H.264 Preview").
+  const isDirectlyBrowserPlayable =
+    !forceTranscode && ext === '.mp4' && isH264 && is8BitYuv420 && isBrowserAudio;
+
+  if (isDirectlyBrowserPlayable) {
+    const directUrl = `/media/projects/${project.id}/${targetFilename}`;
+    project.sourceUrl = directUrl;
+    project.browserProxyStatus = 'ready';
+    store.upsertProject(project);
+    return { sourceUrl: directUrl, status: 'ready' };
+  }
+
+  // If a background transcode is already running for this project, attach to it
+  if (activePreviewTranscodes.has(project.id)) {
+    if (waitIfFast) {
+      const doneUrl = await Promise.race([
+        activePreviewTranscodes.get(project.id)!,
+        new Promise<undefined>((r) => setTimeout(() => r(undefined), 12000)),
+      ]);
+      if (doneUrl) {
+        return { sourceUrl: doneUrl, status: 'ready' };
+      }
+    }
+    return { sourceUrl: project.sourceUrl, status: 'transcoding' };
+  }
+
+  // Can we fast-remux video stream without re-encoding video? (Only when video is already 8-bit H.264 yuv420p and forceTranscode is false)
+  const canRemuxVideo = !forceTranscode && isH264 && is8BitYuv420;
+
+  if (canRemuxVideo && waitIfFast && meta.fileSize <= 500 * 1024 * 1024) {
+    try {
+      await execFileAsync(
+        'ffmpeg',
+        [
+          '-loglevel',
+          'error',
+          '-y',
+          '-i',
+          project.sourcePath,
+          '-map',
+          '0:v:0',
+          '-map',
+          '0:a:0?',
+          '-c:v',
+          'copy',
+          ...(meta.audioCodec !== 'none' ? ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-ac', '2'] : ['-an']),
+          '-f',
+          'mp4',
+          '-movflags',
+          '+faststart',
+          previewTmpPath,
+        ],
+        { maxBuffer: 16 * 1024 * 1024, timeout: 18000 }
+      );
+      if (fs.existsSync(previewTmpPath) && fs.statSync(previewTmpPath).size > 0) {
+        fs.renameSync(previewTmpPath, previewPath);
+        const finalUrl = `${previewUrl}?t=${Date.now()}`;
+        project.sourceUrl = finalUrl;
+        project.browserProxyStatus = 'ready';
+        store.upsertProject(project);
+        return { sourceUrl: finalUrl, status: 'ready' };
+      }
+    } catch {
+      try {
+        if (fs.existsSync(previewTmpPath)) fs.unlinkSync(previewTmpPath);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  // Transcode to universal H.264 (libx264, yuv420p, baseline/main compatible) + AAC stereo MP4 with +faststart
+  project.browserProxyStatus = 'transcoding';
+  store.upsertProject(project);
+
+  const transcodeArgs = [
+    '-loglevel',
+    'error',
+    '-y',
+    '-i',
+    project.sourcePath,
+    '-map',
+    '0:v:0',
+    '-map',
+    '0:a:0?',
+    '-vf',
+    'scale=trunc(min(1280\\,iw)/2)*2:trunc(ow/a/2)*2',
+    '-c:v',
+    'libx264',
+    '-preset',
+    'ultrafast',
+    '-crf',
+    '23',
+    '-pix_fmt',
+    'yuv420p',
+    ...(meta.audioCodec !== 'none' ? ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-ac', '2'] : ['-an']),
+    '-f',
+    'mp4',
+    '-movflags',
+    '+faststart',
+    previewTmpPath,
+  ];
+
+  const transcodePromise = new Promise<string | undefined>((resolve) => {
+    const bgProc = spawn('ffmpeg', transcodeArgs, { stdio: 'ignore' });
+    bgProc.on('close', (code) => {
+      activePreviewTranscodes.delete(project.id);
+      const latest = store.getProject(project.id);
+      if (code === 0 && fs.existsSync(previewTmpPath) && fs.statSync(previewTmpPath).size > 0) {
+        try {
+          fs.renameSync(previewTmpPath, previewPath);
+          const readyUrl = `${previewUrl}?t=${Date.now()}`;
+          if (latest) {
+            latest.sourceUrl = readyUrl;
+            latest.browserProxyStatus = 'ready';
+            store.upsertProject(latest);
+          }
+          resolve(readyUrl);
+          return;
+        } catch {
+          // fall through
+        }
+      }
+      try {
+        if (fs.existsSync(previewTmpPath)) fs.unlinkSync(previewTmpPath);
+      } catch {
+        // ignore
+      }
+      if (latest) {
+        latest.browserProxyStatus = 'failed';
+        store.upsertProject(latest);
+      }
+      resolve(undefined);
+    });
+    bgProc.on('error', () => {
+      activePreviewTranscodes.delete(project.id);
+      const latest = store.getProject(project.id);
+      if (latest) {
+        latest.browserProxyStatus = 'failed';
+        store.upsertProject(latest);
+      }
+      resolve(undefined);
+    });
+  });
+
+  activePreviewTranscodes.set(project.id, transcodePromise);
+
+  // Wait up to 14 seconds synchronously for short/medium videos so the user gets an instant playable H.264 preview right away!
+  if (waitIfFast) {
+    const fastResult = await Promise.race([
+      transcodePromise,
+      new Promise<undefined>((r) => setTimeout(() => r(undefined), 14000)),
+    ]);
+    if (fastResult) {
+      return { sourceUrl: fastResult, status: 'ready' };
+    }
+  }
+
+  return { sourceUrl: undefined, status: 'transcoding' };
+}
 
 let cachedCaps: Omit<SystemCapabilities, 'geminiConfigured'> | null = null;
 
@@ -603,139 +814,8 @@ async function createServer() {
         console.warn('Thumbnail extraction skipped:', thumbErr);
       }
 
-      // Ensure MKV, MOV, AVI, or non-H.264 (e.g. HEVC/H.265) uploads get a browser-playable MP4 preview
-      // WITHOUT ever blocking /complete past HTTP proxy timeouts or serving unplayable HEVC to <video>.
-      let browserPreviewUrl: string | undefined = `/media/projects/${project.id}/${targetFilename}`;
-      let browserProxyStatus: 'ready' | 'transcoding' | 'failed' = 'ready';
-      const isH264 = meta.codec === 'h264' || meta.codec === 'avc1';
-      const isWebmNative = ext === '.webm' && (meta.codec === 'vp8' || meta.codec === 'vp9' || meta.codec === 'av1');
-      const isDirectlyBrowserPlayable =
-        ((ext === '.mp4' && isH264) || isWebmNative) &&
-        (meta.audioCodec === 'aac' || meta.audioCodec === 'mp3' || meta.audioCodec === 'opus' || meta.audioCodec === 'none');
-      const needsBrowserProxy = !isDirectlyBrowserPlayable;
-
-      if (needsBrowserProxy) {
-        const previewPath = path.join(projectDir, 'preview_browser.mp4');
-        const previewTmpPath = path.join(projectDir, 'preview_browser.tmp.mp4');
-        if (isH264 && meta.fileSize <= 500 * 1024 * 1024) {
-          // Ultra-fast container remux (typically 1-3s)
-          try {
-            await execFileAsync(
-              'ffmpeg',
-              [
-                '-loglevel',
-                'error',
-                '-y',
-                '-i',
-                targetPath,
-                '-c:v',
-                'copy',
-                ...(meta.audioCodec !== 'none' ? ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000'] : ['-an']),
-                '-f',
-                'mp4',
-                '-movflags',
-                '+faststart',
-                previewTmpPath,
-              ],
-              { maxBuffer: 16 * 1024 * 1024, timeout: 25000 }
-            );
-            if (fs.existsSync(previewTmpPath) && fs.statSync(previewTmpPath).size > 0) {
-              fs.renameSync(previewTmpPath, previewPath);
-              browserPreviewUrl = `/media/projects/${project.id}/preview_browser.mp4`;
-              browserProxyStatus = 'ready';
-            }
-          } catch (proxyErr) {
-            try {
-              if (fs.existsSync(previewTmpPath)) fs.unlinkSync(previewTmpPath);
-            } catch {
-              // ignore cleanup error
-            }
-            console.warn('Fast preview remux skipped:', proxyErr);
-          }
-        } else {
-          // Background H.264 proxy transcode for large MKV/MOV/HEVC/ProRes files so upload completes immediately.
-          // Defer browser <video src> until atomic H.264 proxy finishes to prevent "The element has no supported sources."
-          browserPreviewUrl = undefined;
-          browserProxyStatus = 'transcoding';
-          const proxyArgs = isH264
-            ? [
-                '-loglevel',
-                'error',
-                '-y',
-                '-i',
-                targetPath,
-                '-c:v',
-                'copy',
-                ...(meta.audioCodec !== 'none' ? ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000'] : ['-an']),
-                '-f',
-                'mp4',
-                '-movflags',
-                '+faststart',
-                previewTmpPath,
-              ]
-            : [
-                '-loglevel',
-                'error',
-                '-y',
-                '-i',
-                targetPath,
-                '-vf',
-                'scale=min(1280\\,iw):-2',
-                '-c:v',
-                'libx264',
-                '-preset',
-                'veryfast',
-                '-crf',
-                '24',
-                '-pix_fmt',
-                'yuv420p',
-                ...(meta.audioCodec !== 'none' ? ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000'] : ['-an']),
-                '-f',
-                'mp4',
-                '-movflags',
-                '+faststart',
-                previewTmpPath,
-              ];
-          const bgProc = spawn('ffmpeg', proxyArgs, { stdio: 'ignore' });
-          bgProc.on('close', (code) => {
-            const latest = store.getProject(project.id);
-            if (code === 0 && fs.existsSync(previewTmpPath) && fs.statSync(previewTmpPath).size > 0) {
-              try {
-                fs.renameSync(previewTmpPath, previewPath);
-                if (latest) {
-                  latest.sourceUrl = `/media/projects/${project.id}/preview_browser.mp4`;
-                  latest.browserProxyStatus = 'ready';
-                  store.upsertProject(latest);
-                }
-                return;
-              } catch {
-                // fall through to failure state
-              }
-            }
-            try {
-              if (fs.existsSync(previewTmpPath)) fs.unlinkSync(previewTmpPath);
-            } catch {
-              // ignore cleanup
-            }
-            if (latest && !latest.sourceUrl) {
-              latest.browserProxyStatus = 'failed';
-              store.upsertProject(latest);
-            }
-          });
-          bgProc.on('error', () => {
-            const latest = store.getProject(project.id);
-            if (latest && !latest.sourceUrl) {
-              latest.browserProxyStatus = 'failed';
-              store.upsertProject(latest);
-            }
-          });
-        }
-      }
-
       project.sourcePath = targetPath;
       project.storageRef = `local://projects/${project.id}/${targetFilename}`;
-      project.sourceUrl = browserPreviewUrl;
-      project.browserProxyStatus = browserProxyStatus;
       project.originalContainer = ext.replace('.', '').toUpperCase();
       project.thumbnailUrl = hasThumbnail ? `/media/projects/${project.id}/thumb.jpg` : undefined;
       project.fileSize = meta.fileSize;
@@ -744,6 +824,16 @@ async function createServer() {
       project.status = 'uploaded';
       project.errorMessage = undefined;
       project.failedStage = undefined;
+      store.upsertProject(project);
+
+      // Ensure ANY uploaded video format (MP4, MOV, MKV, WebM, AVI, FLV, WMV, 3GP, TS, MTS, MPEG, VOB, HEVC, ProRes, 10-bit, etc.)
+      // gets a universal browser-playable H.264 (yuv420p) + AAC MP4 preview (`preview_browser.mp4`).
+      const previewResult = await ensureBrowserH264Preview(project, {
+        forceTranscode: false,
+        waitIfFast: true,
+      });
+      project.sourceUrl = previewResult.sourceUrl;
+      project.browserProxyStatus = previewResult.status;
       store.upsertProject(project);
 
       // Seamless Upload-to-Processing Handoff when autoAnalyze is enabled
@@ -765,6 +855,37 @@ async function createServer() {
       project.failedStage = 'upload_complete';
       project.errorMessage = safeErr;
       store.upsertProject(project);
+      res.status(500).json({ error: safeErr });
+    }
+  });
+
+  // Ensure or force-render a universal H.264/AAC browser preview MP4 for any uploaded video format
+  app.post('/api/projects/:id/ensure-preview', async (req, res) => {
+    const project = store.getProject(req.params.id);
+    if (!project) return res.status(404).json({ error: 'Project not found.' });
+    if (!project.sourcePath || !fs.existsSync(project.sourcePath)) {
+      return res.status(400).json({ error: 'Source video file is not available on disk.' });
+    }
+    try {
+      const force = Boolean((req.body as { force?: boolean } | undefined)?.force);
+      const result = await ensureBrowserH264Preview(project, {
+        forceTranscode: force,
+        waitIfFast: true,
+      });
+      const updated = store.getProject(project.id) ?? project;
+      res.json({
+        sourceUrl: result.sourceUrl ?? updated.sourceUrl,
+        browserProxyStatus: result.status,
+        project: updated,
+      });
+    } catch (err) {
+      const safeErr = logBackendError({
+        projectId: project.id,
+        stage: 'ensure_h264_preview',
+        httpStatus: 500,
+        route: 'POST /api/projects/:id/ensure-preview',
+        error: err,
+      });
       res.status(500).json({ error: safeErr });
     }
   });

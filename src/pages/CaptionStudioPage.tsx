@@ -949,6 +949,7 @@ export function CaptionStudioPage({
                 currentTime={seekTime}
                 maxHeightClass="max-h-[430px]"
                 chromaPreviewColor={chromaPreviewEnabled ? chromaColor : null}
+                onQuickRenderH264Preview={handleSaveAndRenderSameQuality}
               />
             </div>
 

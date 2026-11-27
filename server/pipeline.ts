@@ -179,6 +179,7 @@ export async function probeVideoFile(filePath: string): Promise<VideoMetadata> {
     streams?: Array<{
       codec_type?: string;
       codec_name?: string;
+      pix_fmt?: string;
       duration?: string;
       width?: number;
       height?: number;
@@ -224,6 +225,7 @@ export async function probeVideoFile(filePath: string): Promise<VideoMetadata> {
     height: videoStream?.height || 1080,
     fps: Math.min(120, Math.max(10, Number.isFinite(fps) ? fps : 30)),
     codec: videoStream?.codec_name || 'unknown',
+    pixFmt: videoStream?.pix_fmt || undefined,
     audioCodec: audioStream?.codec_name || 'none',
     bitrate: Number.isFinite(rawBitrate) ? rawBitrate : 0,
     fileSize: stat.size,

@@ -10,6 +10,8 @@ import {
   Eye,
   Film,
   Sparkles,
+  Loader2,
+  RefreshCw,
 } from 'lucide-react';
 import type {
   AspectRatio,
@@ -19,6 +21,7 @@ import type {
   TranscriptSegment,
   WordTiming,
 } from '../../shared/types.ts';
+import { api } from '../lib/api.ts';
 import {
   buildCssFilterFromGrading,
   formatTimecode,
@@ -34,6 +37,7 @@ interface ClipPreviewPlayerProps {
   onTimeUpdate?: (clipRelativeSeconds: number) => void;
   onManualFocalChange?: (x: number, y: number) => void;
   onAspectRatioChange?: (nextAspectRatio: AspectRatio, fitMode?: 'contain' | 'cover') => void;
+  onQuickRenderH264Preview?: () => Promise<void> | void;
   maxHeightClass?: string;
   showControls?: boolean;
   showAspectRatioToolbar?: boolean;
@@ -57,6 +61,7 @@ export function ClipPreviewPlayer({
   onTimeUpdate,
   onManualFocalChange,
   onAspectRatioChange,
+  onQuickRenderH264Preview,
   maxHeightClass = 'max-h-[540px]',
   showControls = true,
   showAspectRatioToolbar = true,
@@ -73,6 +78,9 @@ export function ClipPreviewPlayer({
   const [relTime, setRelTime] = useState(0);
   const [isDraggingCrop, setIsDraggingCrop] = useState(false);
   const [mediaError, setMediaError] = useState(false);
+  const [localProxyUrl, setLocalProxyUrl] = useState<string | undefined>(undefined);
+  const [proxyRepairing, setProxyRepairing] = useState(false);
+  const [quickRenderingMp4, setQuickRenderingMp4] = useState(false);
 
   // Interactive Review Aspect Ratio override (defaults to clip's configured aspect ratio, or 'original' when preserving original video)
   const defaultClipAspect: AspectRatio = useMemo(() => {
@@ -92,7 +100,7 @@ export function ClipPreviewPlayer({
         ? 'contain'
         : 'cover'
   );
-  // Allow user to toggle between Live Interactive Caption Review and Rendered Exported MP4 Verification when an export exists
+  // Allow user to toggle between Live Interactive Caption Review and H.264 MP4 Preview Rendered verification
   const [verifyRenderedMp4, setVerifyRenderedMp4] = useState<boolean>(false);
   const [canvasSize, setCanvasSize] = useState<{ width: number; height: number }>({
     width: 340,
@@ -109,6 +117,10 @@ export function ClipPreviewPlayer({
           : 'cover'
     );
   }, [clip.id, defaultClipAspect, clip.preserveOriginalVideo, clip.isFullVideoCaption, clip.motionGraphics.backgroundBlur]);
+
+  useEffect(() => {
+    setLocalProxyUrl(undefined);
+  }, [project.id, project.sourceUrl]);
 
   // Measure actual preview DOM canvas dimensions via ResizeObserver so caption font size, stroke, padding,
   // and vertical MarginV match the FFmpeg ASS renderer (server/renderer.ts -> generateAssSubtitles) 1:1!
@@ -143,11 +155,70 @@ export function ClipPreviewPlayer({
 
   const ratio = getAspectRatioNumeric(reviewAspectRatio, srcWidth, srcHeight);
   const showingRendered = Boolean((previewRendered || verifyRenderedMp4) && clip.renderedVideoUrl);
-  const videoSrc = showingRendered ? clip.renderedVideoUrl : project.sourceUrl;
+  const effectiveSourceUrl = localProxyUrl || project.sourceUrl;
+  const videoSrc = showingRendered ? clip.renderedVideoUrl : effectiveSourceUrl;
 
   useEffect(() => {
     setMediaError(false);
   }, [videoSrc]);
+
+  // Automatically trigger or poll universal H.264 browser preview transcoding if sourceUrl is missing or failed to decode
+  const triggerH264BrowserPreviewRepair = async (force = true) => {
+    if (proxyRepairing || !project.id) return;
+    setProxyRepairing(true);
+    try {
+      const res = await api.ensureBrowserPreview(project.id, force);
+      if (res.sourceUrl) {
+        setLocalProxyUrl(res.sourceUrl);
+        setMediaError(false);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setProxyRepairing(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!showingRendered && (!effectiveSourceUrl || project.browserProxyStatus === 'transcoding')) {
+      const timer = setInterval(async () => {
+        try {
+          const res = await api.ensureBrowserPreview(project.id, false);
+          if (res.sourceUrl && res.browserProxyStatus === 'ready') {
+            setLocalProxyUrl(res.sourceUrl);
+            setMediaError(false);
+          }
+        } catch {
+          // ignore
+        }
+      }, 2500);
+      return () => clearInterval(timer);
+    }
+  }, [project.id, effectiveSourceUrl, project.browserProxyStatus, showingRendered]);
+
+  const handleQuickRenderH264Mp4 = async () => {
+    if (quickRenderingMp4) return;
+    setQuickRenderingMp4(true);
+    try {
+      if (onQuickRenderH264Preview) {
+        await onQuickRenderH264Preview();
+      } else {
+        await api.exportClip(project.id, clip.id, {
+          resolution: clip.preserveOriginalVideo || clip.isFullVideoCaption ? 'original' : '1080p',
+          codec: 'h264',
+          fps: clip.preserveOriginalVideo || clip.isFullVideoCaption ? 'original' : 30,
+          quality: 'excellent',
+          embedCaptions: true,
+          includeMusic: !clip.preserveOriginalVideo && !clip.isFullVideoCaption,
+        });
+      }
+      setVerifyRenderedMp4(true);
+    } catch {
+      // ignore
+    } finally {
+      setQuickRenderingMp4(false);
+    }
+  };
 
   const activeMusicTrack = useMemo(
     () => musicTracks.find((t) => t.id === clip.audioMix.musicTrackId) ?? null,
@@ -575,7 +646,7 @@ export function ClipPreviewPlayer({
             })}
           </div>
 
-          <div className="flex items-center gap-1.5">
+          <div className="flex flex-wrap items-center gap-1.5">
             {isAspectRatioDifferentFromSource && !showingRendered && (
               <div className="inline-flex rounded-md overflow-hidden border border-[#D4AF37]/25 bg-[#0C1510]">
                 <button
@@ -611,27 +682,66 @@ export function ClipPreviewPlayer({
               </div>
             )}
 
-            {clip.renderedVideoUrl && !previewRendered && (
-              <button
-                type="button"
-                onClick={() => setVerifyRenderedMp4((v) => !v)}
-                title="Switch between Live Interactive 1:1 Caption Preview and the actual Rendered Export MP4"
-                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold border transition-colors ${
-                  verifyRenderedMp4
-                    ? 'bg-[#D4AF37]/25 border-[#F5C451] text-[#FEF3C7]'
-                    : 'bg-[#0E1913] border-[#D4AF37]/25 text-zinc-300 hover:text-white'
-                }`}
-              >
-                {verifyRenderedMp4 ? (
-                  <>
-                    <Film className="w-3 h-3 text-[#F5C451]" /> Viewing Exported MP4
-                  </>
+            {/* H.264 MP4 Preview Rendered Switcher & Quick Render Action */}
+            {!previewRendered && (
+              <div className="inline-flex items-center gap-1">
+                {clip.renderedVideoUrl ? (
+                  <div className="inline-flex rounded-md overflow-hidden border border-[#D4AF37]/30 bg-[#0C1510]">
+                    <button
+                      type="button"
+                      onClick={() => setVerifyRenderedMp4(false)}
+                      title="Live 60fps interactive caption & motion preview"
+                      className={`inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold transition-colors ${
+                        !verifyRenderedMp4
+                          ? 'bg-[#059669] text-white'
+                          : 'text-zinc-400 hover:text-zinc-200'
+                      }`}
+                    >
+                      <Eye className="w-3 h-3" /> Live 1:1
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setVerifyRenderedMp4(true)}
+                      title="Watch the actual FFmpeg-rendered H.264 MP4 output"
+                      className={`inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-semibold transition-colors ${
+                        verifyRenderedMp4
+                          ? 'bg-[#D4AF37]/30 text-[#FEF3C7]'
+                          : 'text-zinc-400 hover:text-zinc-200'
+                      }`}
+                    >
+                      <Film className="w-3 h-3 text-[#F5C451]" /> H.264 MP4 Rendered
+                    </button>
+                  </div>
                 ) : (
-                  <>
-                    <Eye className="w-3 h-3 text-emerald-400" /> Verify Export MP4
-                  </>
+                  <button
+                    type="button"
+                    disabled={
+                      quickRenderingMp4 ||
+                      clip.renderStatus === 'queued' ||
+                      clip.renderStatus === 'rendering' ||
+                      clip.renderStatus === 'validating'
+                    }
+                    onClick={() => void handleQuickRenderH264Mp4()}
+                    title="Render an H.264 MP4 preview with burned-in captions so you can inspect the exact exported MP4"
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold border border-[#D4AF37]/35 bg-[#0E1913] hover:bg-[#15261D] text-[#FEF3C7] transition-colors disabled:opacity-50"
+                  >
+                    {quickRenderingMp4 ||
+                    clip.renderStatus === 'queued' ||
+                    clip.renderStatus === 'rendering' ||
+                    clip.renderStatus === 'validating' ? (
+                      <>
+                        <Loader2 className="w-3 h-3 animate-spin text-[#F5C451]" />
+                        Rendering H.264 MP4...
+                      </>
+                    ) : (
+                      <>
+                        <Film className="w-3 h-3 text-[#F5C451]" />
+                        Render H.264 MP4 Preview
+                      </>
+                    )}
+                  </button>
                 )}
-              </button>
+              </div>
             )}
           </div>
         </div>
@@ -688,6 +798,9 @@ export function ClipPreviewPlayer({
             onError={() => {
               setIsPlaying(false);
               setMediaError(true);
+              if (!showingRendered) {
+                void triggerH264BrowserPreviewRepair(true);
+              }
             }}
             style={{
               filter: cssFilter,
@@ -713,10 +826,37 @@ export function ClipPreviewPlayer({
               />
             )}
             {!chromaPreviewColor && (
-              <div className="relative z-10 max-w-xs px-3 py-2 rounded-lg bg-black/70 border border-[#D4AF37]/25">
-                {project.browserProxyStatus === 'transcoding' && !showingRendered
-                  ? 'Preparing browser-compatible H.264 preview in background...'
-                  : 'Preview stream unavailable in this browser codec — rendered H.264 MP4 exports will play cleanly.'}
+              <div className="relative z-10 max-w-xs px-3.5 py-3 rounded-lg bg-black/80 border border-[#D4AF37]/30 space-y-2">
+                <div className="flex items-center justify-center gap-1.5 text-emerald-300 font-semibold">
+                  {(project.browserProxyStatus === 'transcoding' || proxyRepairing) && !showingRendered ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-[#F5C451]" />
+                      <span>Rendering Universal H.264 MP4 Preview...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Film className="w-3.5 h-3.5 text-[#F5C451]" />
+                      <span>
+                        {project.originalContainer || 'Source'} ({project.metadata?.codec?.toUpperCase() || 'Video'}) Format
+                      </span>
+                    </>
+                  )}
+                </div>
+                <p className="text-[11px] text-zinc-300 leading-relaxed">
+                  {project.browserProxyStatus === 'transcoding' || proxyRepairing
+                    ? 'Converting this video format into a universal browser-playable H.264/AAC MP4 stream automatically...'
+                    : 'Click below to generate a universal H.264 MP4 browser preview for this format.'}
+                </p>
+                {!proxyRepairing && project.browserProxyStatus !== 'transcoding' && (
+                  <button
+                    type="button"
+                    onClick={() => void triggerH264BrowserPreviewRepair(true)}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-[#059669] hover:bg-[#10B981] text-white font-semibold text-[11px] transition-colors"
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                    Render Universal H.264 Preview Now
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -734,12 +874,12 @@ export function ClipPreviewPlayer({
           </div>
         )}
 
-        {/* 1:1 Export-Matched WYSIWYG Badge */}
+        {/* 1:1 Export-Matched WYSIWYG / H.264 MP4 Preview Rendered Badge */}
         <div className="absolute top-2.5 left-2.5 z-30 pointer-events-none flex items-center gap-1.5">
           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-black/70 backdrop-blur-sm border border-[#10B981]/35 font-mono text-[10px] text-emerald-300">
             <Sparkles className="w-2.5 h-2.5 text-[#F5C451]" />
             {showingRendered
-              ? 'Rendered Export MP4'
+              ? `H.264 MP4 Preview Rendered (${clip.renderedResolution || `${srcWidth}×${srcHeight}`})`
               : `1:1 Export-Matched Preview · ${
                   reviewAspectRatio === 'original' ? `${srcWidth}×${srcHeight}` : reviewAspectRatio
                 }`}

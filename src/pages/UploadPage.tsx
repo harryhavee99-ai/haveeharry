@@ -60,13 +60,21 @@ const VALID_EXTS = [
   '.flv',
   '.ts',
   '.3gp',
+  '.3g2',
   '.wmv',
+  '.asf',
   '.mpeg',
   '.mpg',
   '.mts',
   '.m2ts',
   '.ogv',
+  '.ogg',
   '.vob',
+  '.f4v',
+  '.divx',
+  '.mxf',
+  '.rm',
+  '.rmvb',
 ];
 
 export function UploadPage({ settings, onStartAnalysis, onCreateTranscriptProject }: UploadPageProps) {
@@ -79,6 +87,8 @@ export function UploadPage({ settings, onStartAnalysis, onCreateTranscriptProjec
   const [startingAnalysis, setStartingAnalysis] = useState(false);
   const [generatingSample, setGeneratingSample] = useState(false);
   const [previewError, setPreviewError] = useState(false);
+  const [localPreviewUrl, setLocalPreviewUrl] = useState<string | undefined>(undefined);
+  const [repairingPreview, setRepairingPreview] = useState(false);
 
   // Transcript-to-Animated-Captions Studio state
   const [transcriptTitle, setTranscriptTitle] = useState('SkaDoosh Animated Captions');
@@ -128,7 +138,43 @@ export function UploadPage({ settings, onStartAnalysis, onCreateTranscriptProjec
 
   useEffect(() => {
     setPreviewError(false);
-  }, [uploadedProject?.sourceUrl]);
+    setLocalPreviewUrl(undefined);
+  }, [uploadedProject?.id, uploadedProject?.sourceUrl]);
+
+  const handleEnsureUploadH264Preview = async (force = true) => {
+    if (!uploadedProject || repairingPreview) return;
+    setRepairingPreview(true);
+    try {
+      const res = await api.ensureBrowserPreview(uploadedProject.id, force);
+      if (res.sourceUrl) {
+        setLocalPreviewUrl(res.sourceUrl);
+        setPreviewError(false);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setRepairingPreview(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!uploadedProject) return;
+    const effectiveUrl = localPreviewUrl || uploadedProject.sourceUrl;
+    if (!effectiveUrl || uploadedProject.browserProxyStatus === 'transcoding') {
+      const timer = setInterval(async () => {
+        try {
+          const res = await api.ensureBrowserPreview(uploadedProject.id, false);
+          if (res.sourceUrl && res.browserProxyStatus === 'ready') {
+            setLocalPreviewUrl(res.sourceUrl);
+            setPreviewError(false);
+          }
+        } catch {
+          // ignore
+        }
+      }, 2500);
+      return () => clearInterval(timer);
+    }
+  }, [uploadedProject, localPreviewUrl]);
 
   const validateAndStartUpload = (file: File) => {
     setLocalError(null);
@@ -137,7 +183,7 @@ export function UploadPage({ settings, onStartAnalysis, onCreateTranscriptProjec
     const lower = file.name.toLowerCase();
     const valid = VALID_EXTS.some((ext) => lower.endsWith(ext));
     if (!valid) {
-      setLocalError('Unsupported file format. Please upload MP4, MOV, MKV, WebM, M4V, AVI, 3GP, WMV, or MPEG video files.');
+      setLocalError('Unsupported file format. Please upload MP4, MOV, MKV, WebM, M4V, AVI, FLV, TS, 3GP, WMV, MPEG, MTS, VOB, or MXF video files.');
       return;
     }
     if (file.size <= 0) {
@@ -544,14 +590,17 @@ export function UploadPage({ settings, onStartAnalysis, onCreateTranscriptProjec
                     isVerticalView ? 'max-w-[330px] max-h-[520px]' : 'max-w-full max-h-[480px]'
                   } bg-black rounded-lg overflow-hidden border border-white/[0.12] shadow-xl`}
                 >
-                  {uploadedProject.sourceUrl && !previewError ? (
+                  {(localPreviewUrl || uploadedProject.sourceUrl) && !previewError ? (
                     <video
-                      src={uploadedProject.sourceUrl}
+                      src={localPreviewUrl || uploadedProject.sourceUrl}
                       poster={uploadedProject.thumbnailUrl}
                       controls
                       playsInline
                       preload="metadata"
-                      onError={() => setPreviewError(true)}
+                      onError={() => {
+                        setPreviewError(true);
+                        void handleEnsureUploadH264Preview(true);
+                      }}
                       className="w-full h-full object-contain"
                     />
                   ) : (
@@ -563,10 +612,37 @@ export function UploadPage({ settings, onStartAnalysis, onCreateTranscriptProjec
                           className="absolute inset-0 w-full h-full object-contain opacity-45"
                         />
                       )}
-                      <div className="relative z-10 px-4 py-2.5 rounded-lg bg-black/75 border border-[#D4AF37]/25 text-xs text-zinc-200 max-w-md">
-                        {uploadedProject.browserProxyStatus === 'transcoding'
-                          ? 'Preparing H.264 browser preview in background — you can start AI analysis immediately.'
-                          : 'Video uploaded and verified by FFprobe. Rendered MP4 clips will play in universal H.264/AAC.'}
+                      <div className="relative z-10 px-4 py-3 rounded-lg bg-black/80 border border-[#D4AF37]/30 text-xs text-zinc-200 max-w-md space-y-2">
+                        <div className="flex items-center justify-center gap-1.5 font-semibold text-emerald-300">
+                          {uploadedProject.browserProxyStatus === 'transcoding' || repairingPreview ? (
+                            <>
+                              <Loader2 className="w-3.5 h-3.5 animate-spin text-[#F5C451]" />
+                              <span>Rendering Universal H.264 MP4 Preview...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Film className="w-3.5 h-3.5 text-[#F5C451]" />
+                              <span>
+                                {uploadedProject.originalContainer || 'Source'} ({uploadedProject.metadata?.codec?.toUpperCase() || 'Video'}) Format
+                              </span>
+                            </>
+                          )}
+                        </div>
+                        <p className="text-[11px] text-zinc-300">
+                          {uploadedProject.browserProxyStatus === 'transcoding' || repairingPreview
+                            ? 'Converting this video format into a universal browser-playable H.264/AAC MP4 preview — you can start AI analysis immediately.'
+                            : 'Click below to render a universal H.264 MP4 browser preview for this format.'}
+                        </p>
+                        {!repairingPreview && uploadedProject.browserProxyStatus !== 'transcoding' && (
+                          <button
+                            type="button"
+                            onClick={() => void handleEnsureUploadH264Preview(true)}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-[#059669] hover:bg-[#10B981] text-white font-semibold text-[11px]"
+                          >
+                            <Film className="w-3 h-3" />
+                            Render Universal H.264 Preview Now
+                          </button>
+                        )}
                       </div>
                     </div>
                   )}

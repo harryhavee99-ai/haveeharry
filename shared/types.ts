@@ -356,6 +356,7 @@ export interface VideoMetadata {
   height: number;
   fps: number;
   codec: string;
+  pixFmt?: string;
   audioCodec: string;
   bitrate: number;
   fileSize: number;
